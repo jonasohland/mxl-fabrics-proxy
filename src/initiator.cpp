@@ -1,0 +1,99 @@
+#include "initiator.hpp"
+#include "fabrics.hpp"
+#include "util.hpp"
+#include <spdlog/spdlog.h>
+
+namespace mxl::proxy {
+void Initiator::run(Config config, utils::ExitSignal sig) {
+    spdlog::info("worker running as initiator");
+    Initiator{std::move(config)}.run(sig);
+}
+
+Initiator::Initiator(Config config)
+    : _mxl(config.domain), _fabrics(_mxl), _config(config) {
+}
+
+void Initiator::run(utils::ExitSignal sig) {
+    auto reader = openReader();
+    auto initiator = createInitiator(reader);
+    auto targetInfo = ::mxl::fabrics::TargetInfo::parse(_config.targetInfo);
+    initiator.addTarget(targetInfo);
+    connect(initiator, sig);
+    transferGrains(std::move(reader), std::move(initiator), sig);
+}
+
+::mxl::DiscreteFlowReader Initiator::openReader() {
+    auto flowReader = _mxl.openFlow(_config.flowId);
+    if (!std::holds_alternative<DiscreteFlowReader>(flowReader)) {
+        throw ::mxl::Exception{MXL_ERR_INVALID_ARG,
+                               "request flow is not a discrete flow"};
+    }
+
+    return std::get<DiscreteFlowReader>(std::move(flowReader));
+}
+
+::mxl::fabrics::DiscreteFlowInitiator
+Initiator::createInitiator(DiscreteFlowReader& reader) {
+    return _fabrics.createInitiator(reader, {
+                                                .node = _config.node,
+                                                .service = _config.service,
+                                                .provider = _config.provider,
+                                            });
+}
+
+void Initiator::connect(::mxl::fabrics::DiscreteFlowInitiator& initiator,
+                        utils::ExitSignal sig) {
+    spdlog::info("waiting to connect...");
+    for (;;) {
+        if (sig.shouldExit()) {
+            return;
+        }
+        if (initiator.makeProgress(std::chrono::milliseconds(500))) {
+            continue;
+        }
+
+        spdlog::info("connected");
+        return;
+    }
+}
+
+void Initiator::transferGrains(::mxl::DiscreteFlowReader reader,
+                               ::mxl::fabrics::DiscreteFlowInitiator initiator,
+                               utils::ExitSignal sig) {
+    std::uint64_t index = 0;
+    for (;;) {
+        try {
+            if (sig.shouldExit()) {
+                return;
+            }
+
+            auto grainAccess =
+                reader.getGrain(index, std::chrono::milliseconds(100));
+            spdlog::debug("transmitting grain index={} fromSlice={} toSlice={}",
+                          index, 0, grainAccess.validSlices());
+            if (!initiator.transfer(index, 0, grainAccess.validSlices())) {
+                spdlog::warn("grain at index={} discarded because initiator is "
+                             "not ready",
+                             index);
+            }
+            if (_config.provider == MXL_FABRICS_PROVIDER_EFA) {
+                while (initiator.makeProgressNonBlocking()) {
+                }
+            } else {
+                while (
+                    initiator.makeProgress(std::chrono::milliseconds(1000))) {
+                    spdlog::warn("grain still not transmitted after timeout");
+                }
+            }
+            ++index;
+        } catch (::mxl::Exception const& ex) {
+            if (ex.isTooEarly() || ex.isTooLate()) {
+                index = reader.getHeadIndex();
+                continue;
+            }
+
+            throw ex;
+        }
+    }
+}
+} // namespace mxl::proxy
