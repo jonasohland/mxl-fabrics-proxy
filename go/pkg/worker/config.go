@@ -1,6 +1,7 @@
 package worker
 
 type Config struct {
+	MetricsSocket  string `json:"metrics_socket"`
 	ProxyID        string `json:"proxy_id"`
 	Node           string `json:"node"`
 	Service        string `json:"service"`

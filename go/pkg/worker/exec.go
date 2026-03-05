@@ -125,7 +125,6 @@ func (w *ProxyWorker) run(ctx context.Context, wg *sync.WaitGroup) {
 
 		select {
 		case <-ctx.Done():
-			w.log.Info("stopping")
 			w.cancel()
 			w.wg.Wait()
 			return
@@ -150,6 +149,8 @@ func (w *ProxyWorker) restart() error {
 	if w.config.Service == "" {
 		w.config.Service = strconv.Itoa(rand.Intn(20000) + 20000)
 	}
+
+	w.config.MetricsSocket = filepath.Join(workdir, "metrics.sock")
 
 	fd, err := os.OpenFile(filepath.Join(workdir, "config.json"), os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0600)
 	if err != nil {
@@ -203,7 +204,7 @@ func (w *ProxyWorker) runWorker() {
 	}
 
 	pid := w.cmd.Process.Pid
-	w.log.Info("worker started", "pid", pid)
+	w.log.Debug("worker started", "pid", pid)
 
 	if err := w.cmd.Wait(); err != nil {
 		if !errors.Is(err, context.Canceled) {
@@ -211,7 +212,7 @@ func (w *ProxyWorker) runWorker() {
 		}
 	}
 
-	w.log.Info("worker stopped", "pid", pid)
+	w.log.Debug("worker stopped", "pid", pid)
 }
 
 func (w *ProxyWorker) translateLogs() {

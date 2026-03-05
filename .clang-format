@@ -203,7 +203,7 @@ ObjCSpaceAfterProperty: false
 ObjCSpaceBeforeProtocolList: true
 OneLineFormatOffRegex: ""
 PPIndentWidth: -1
-PackConstructorInitializers: BinPack
+PackConstructorInitializers: Never
 PenaltyBreakAssignment: 2
 PenaltyBreakBeforeFirstCallParameter: 19
 PenaltyBreakBeforeMemberAccess: 150

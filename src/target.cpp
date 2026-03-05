@@ -1,5 +1,6 @@
 #include "target.hpp"
 #include <fstream>
+#include <mxl/time.h>
 #include <spdlog/spdlog.h>
 #include <system_error>
 
@@ -20,12 +21,14 @@ void writeFile(std::filesystem::path const& path, std::string const& contents) {
 
 namespace mxl::proxy {
 void Target::run(Config config, utils::ExitSignal sig) {
-    spdlog::info("worker running as target");
     Target{std::move(config)}.run(sig);
 }
 
 Target::Target(Config config)
-    : _mxl(config.domain), _fabrics(_mxl), _config(config) {
+    : _mxl(config.domain),
+      _fabrics(_mxl),
+      _config(config),
+      _metrics(config.metricsSocket) {
 }
 
 void Target::run(utils::ExitSignal sig) {
@@ -57,16 +60,24 @@ void Target::transferGrains(::mxl::DiscreteFlowWriter writer,
                             utils::ExitSignal sig) {
     for (;;) {
         auto index = readNextGrain(target, sig);
+        auto rxTime = ::mxlGetTime();
         if (sig.shouldExit()) {
             return;
         }
+        std::uint64_t grainSize = 0;
         {
             auto access = writer.openGrain(index);
+            grainSize = access.size();
             spdlog::debug(
                 "comitting grain validSlices={} totalSlices={} index={}",
                 access.validSlices(), access.totalSlices(), index);
             // committed when access object it dropped
         }
+
+        auto rate = writer.getRate();
+        auto thisIndexTS = ::mxlIndexToTimestamp(&rate, index);
+        auto latency = rxTime - thisIndexTS;
+        _metrics.observe(grainSize, grainSize + 4096, 1, latency);
     }
 }
 

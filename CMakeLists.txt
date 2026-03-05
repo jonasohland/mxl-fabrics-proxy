@@ -28,6 +28,8 @@ target_sources(mxl-fabrics-proxy-worker
         "src/initiator.cpp"
         "src/target.cpp"
         "src/util.cpp"
+        "src/metrics.cpp"
+        "src/summary.cpp"
 )
 
 target_compile_features(mxl-fabrics-proxy-worker

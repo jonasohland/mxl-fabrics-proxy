@@ -2,6 +2,7 @@
 
 #include "config.hpp"
 #include "fabrics.hpp"
+#include "metrics.hpp"
 #include "mxl.hpp"
 #include "util.hpp"
 
@@ -30,6 +31,7 @@ class Target {
   private:
     ::mxl::Instance _mxl;
     ::mxl::fabrics::Instance _fabrics;
+    Metrics _metrics;
     Config _config;
 };
 } // namespace mxl::proxy

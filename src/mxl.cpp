@@ -9,11 +9,14 @@
 namespace mxl {
 
 Exception::Exception(::mxlStatus status, char const* msg)
-    : _status(status), _msg(msg) {
+    : _status(status),
+      _msg(msg) {
 }
 
 Exception::Exception(::mxlStatus status, std::string msg)
-    : _status(status), _msg(""), _formatted(std::move(msg)) {
+    : _status(status),
+      _msg(""),
+      _formatted(std::move(msg)) {
 }
 
 char const* Exception::what() const noexcept {
@@ -173,11 +176,14 @@ Instance::createFlow(std::string const& flowDef) const {
 DiscreteFlowReader::DiscreteFlowReader(::mxlFlowReader reader,
                                        ::mxlFlowConfigInfo info,
                                        Instance instance)
-    : _reader(reader), _instance(std::move(instance)) {
+    : _reader(reader),
+      _configInfo(info),
+      _instance(std::move(instance)) {
 }
 
 DiscreteFlowReader::DiscreteFlowReader(DiscreteFlowReader&& other)
-    : _reader(nullptr), _configInfo(other._configInfo),
+    : _reader(nullptr),
+      _configInfo(other._configInfo),
       _instance(std::move(other._instance)) {
     std::swap(_reader, other._reader);
 }
@@ -197,6 +203,10 @@ std::uint64_t DiscreteFlowReader::getHeadIndex() const {
     mxl(::mxlFlowReaderGetRuntimeInfo, "failed to get flow info", _reader,
         &info);
     return info.headIndex;
+}
+
+::mxlRational DiscreteFlowReader::getRate() const {
+    return _configInfo.common.grainRate;
 }
 
 DiscreteFlowReader::Access
@@ -241,7 +251,8 @@ DiscreteFlowReader::getGrainSlicesNonBlocking(std::uint64_t index,
 
 DiscreteFlowReader::Access::Access(::mxlGrainInfo info,
                                    const std::uint8_t* payload)
-    : _info(info), _payload(payload) {
+    : _info(info),
+      _payload(payload) {
 }
 
 std::size_t DiscreteFlowReader::Access::Access::size() const noexcept {
@@ -265,7 +276,9 @@ std::uint16_t DiscreteFlowReader::Access::validSlices() const noexcept {
 ContinuousFlowReader::ContinuousFlowReader(::mxlFlowReader reader,
                                            ::mxlFlowConfigInfo info,
                                            Instance instance)
-    : _reader(reader), _configInfo(info), _instance(std::move(instance)) {
+    : _reader(reader),
+      _configInfo(info),
+      _instance(std::move(instance)) {
 }
 
 ContinuousFlowReader::~ContinuousFlowReader() {
@@ -279,11 +292,14 @@ ContinuousFlowReader::~ContinuousFlowReader() {
 DiscreteFlowWriter::DiscreteFlowWriter(::mxlFlowWriter writer,
                                        ::mxlFlowConfigInfo info,
                                        Instance instance)
-    : _writer(writer), _info(info), _instance(std::move(instance)) {
+    : _writer(writer),
+      _info(info),
+      _instance(std::move(instance)) {
 }
 
 DiscreteFlowWriter::DiscreteFlowWriter(DiscreteFlowWriter&& other)
-    : _writer(nullptr), _info(other._info),
+    : _writer(nullptr),
+      _info(other._info),
       _instance(std::move(other._instance)) {
     std::swap(_writer, other._writer);
 }
@@ -306,6 +322,10 @@ DiscreteFlowWriter::Access DiscreteFlowWriter::openGrain(std::uint64_t index) {
     return Access{*this, grainInfo, payload};
 }
 
+::mxlRational DiscreteFlowWriter::getRate() const noexcept {
+    return _info.common.grainRate;
+}
+
 void DiscreteFlowWriter::commit(::mxlGrainInfo const& info) {
     mxl(::mxlFlowWriterCommitGrain, "failed to commit grain", _writer, &info);
 }
@@ -316,7 +336,9 @@ void DiscreteFlowWriter::cancel() {
 
 DiscreteFlowWriter::Access::Access(DiscreteFlowWriter& writer,
                                    ::mxlGrainInfo info, std::uint8_t* payload)
-    : _writer(writer), _info(info), _payload(payload) {
+    : _writer(writer),
+      _info(info),
+      _payload(payload) {
 }
 
 DiscreteFlowWriter::Access::~Access() noexcept(false) {

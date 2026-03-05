@@ -133,6 +133,9 @@ class DiscreteFlowReader {
     /** Get the current head index of the flow */
     [[nodiscard]] std::uint64_t getHeadIndex() const;
 
+    /** Get the edit rate configured for the flow */
+    [[nodiscard]] ::mxlRational getRate() const;
+
     /** Get a grain. Blocks until the full grain (all slices) is available. */
     [[nodiscard]] Access getGrain(std::uint64_t index,
                                   std::chrono::nanoseconds timeout);
@@ -184,7 +187,7 @@ class DiscreteFlowWriter {
 
     class Access {
       public:
-        Access(const Access&) = default;
+        Access(const Access&) = delete;
         Access(Access&&) = delete;
         Access& operator=(const Access&) = delete;
         Access& operator=(Access&&) = delete;
@@ -228,6 +231,8 @@ class DiscreteFlowWriter {
     };
 
     [[nodiscard]] Access openGrain(std::uint64_t index);
+
+    [[nodiscard]] ::mxlRational getRate() const noexcept;
 
   private:
     friend class Instance;

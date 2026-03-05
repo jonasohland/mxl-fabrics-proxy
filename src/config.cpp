@@ -28,6 +28,7 @@ namespace mxl::proxy {
 Config Config::read(nlohmann::json config) {
     Config out{};
 
+    out.metricsSocket = getString(config, "metrics_socket");
     out.node = getString(config, "node");
     out.service = getString(config, "service");
     out.targetInfo = getString(config, "target_info");

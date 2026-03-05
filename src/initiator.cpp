@@ -1,16 +1,20 @@
 #include "initiator.hpp"
 #include "fabrics.hpp"
 #include "util.hpp"
+#include <chrono>
+#include <mxl/time.h>
 #include <spdlog/spdlog.h>
 
 namespace mxl::proxy {
 void Initiator::run(Config config, utils::ExitSignal sig) {
-    spdlog::info("worker running as initiator");
     Initiator{std::move(config)}.run(sig);
 }
 
 Initiator::Initiator(Config config)
-    : _mxl(config.domain), _fabrics(_mxl), _config(config) {
+    : _mxl(config.domain),
+      _fabrics(_mxl),
+      _config(config),
+      _metrics(config.metricsSocket) {
 }
 
 void Initiator::run(utils::ExitSignal sig) {
@@ -69,6 +73,7 @@ void Initiator::transferGrains(::mxl::DiscreteFlowReader reader,
 
             auto grainAccess =
                 reader.getGrain(index, std::chrono::milliseconds(100));
+            auto inputTs = ::mxlGetTime();
             spdlog::debug("transmitting grain index={} fromSlice={} toSlice={}",
                           index, 0, grainAccess.validSlices());
             if (!initiator.transfer(index, 0, grainAccess.validSlices())) {
@@ -85,6 +90,13 @@ void Initiator::transferGrains(::mxl::DiscreteFlowReader reader,
                     spdlog::warn("grain still not transmitted after timeout");
                 }
             }
+
+            auto rate = reader.getRate();
+            auto epochTs = ::mxlIndexToTimestamp(&rate, index);
+            auto latency = inputTs - epochTs;
+            auto latencyNS = std::chrono::nanoseconds(latency);
+            auto grainSize = grainAccess.size();
+            _metrics.observe(grainSize, grainSize + 4096, 1, latency);
             ++index;
         } catch (::mxl::Exception const& ex) {
             if (ex.isTooEarly() || ex.isTooLate()) {
