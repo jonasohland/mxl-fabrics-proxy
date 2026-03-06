@@ -62,6 +62,7 @@ func GetVersions() (Versions, error) {
 }
 
 type ProxyWorker struct {
+	mu  sync.Mutex
 	wg  sync.WaitGroup
 	log *slog.Logger
 
@@ -71,13 +72,11 @@ type ProxyWorker struct {
 	ctx        context.Context
 	cancel     context.CancelFunc
 	terminated chan any
-	cmd        *exec.Cmd
-	stdout     io.ReadCloser
-	stderr     *bytes.Buffer
 }
 
 func NewWorker(config Config) *ProxyWorker {
 	return &ProxyWorker{
+		mu:  sync.Mutex{},
 		wg:  sync.WaitGroup{},
 		log: slog.With("proxy-id", config.ProxyID, "module", "proxy"),
 
@@ -87,9 +86,6 @@ func NewWorker(config Config) *ProxyWorker {
 		ctx:        nil,
 		cancel:     nil,
 		terminated: nil,
-		cmd:        nil,
-		stdout:     nil,
-		stderr:     nil,
 	}
 }
 
@@ -99,12 +95,22 @@ func (w *ProxyWorker) Start(ctx context.Context, wg *sync.WaitGroup) {
 }
 
 func (w *ProxyWorker) GetTargetInfo() (string, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
 	buf, err := os.ReadFile(filepath.Join(w.workdir, "target-info.json"))
 	if err != nil {
 		return "", err
 	}
 
 	return string(buf), nil
+}
+
+func (w *ProxyWorker) GetMetricsSocket() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	return w.config.MetricsSocket
 }
 
 func (w *ProxyWorker) run(ctx context.Context, wg *sync.WaitGroup) {
@@ -125,18 +131,19 @@ func (w *ProxyWorker) run(ctx context.Context, wg *sync.WaitGroup) {
 
 		select {
 		case <-ctx.Done():
-			w.cancel()
-			w.wg.Wait()
+			w.terminate()
 			return
 		case <-w.terminated:
-			w.cancel()
-			w.wg.Wait()
+			w.terminate()
 		}
 	}
 
 }
 
 func (w *ProxyWorker) restart() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
 	w.log.Info("restarting proxy worker")
 
 	workdir, err := os.MkdirTemp(os.TempDir(), "mxl-fabrics-proxy-worker-")
@@ -164,9 +171,11 @@ func (w *ProxyWorker) restart() error {
 
 	ctx, cancel := context.WithCancel(context.Background())
 
-	w.cmd = exec.CommandContext(ctx, "mxl-fabrics-proxy-worker", filepath.Join(workdir, "config.json"))
-	stderr := bytes.NewBuffer(nil)
-	stdout, err := w.cmd.StdoutPipe()
+	cmd := exec.CommandContext(ctx, "mxl-fabrics-proxy-worker", filepath.Join(workdir, "config.json"))
+	cmd.WaitDelay = 5 * time.Second
+	cmd.Cancel = func() error { return cmd.Process.Signal(syscall.SIGTERM) }
+
+	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		cancel()
 		return err
@@ -177,36 +186,37 @@ func (w *ProxyWorker) restart() error {
 	w.workdir = workdir
 	w.terminated = make(chan any)
 
-	w.stdout = stdout
-	w.stderr = stderr
-
-	w.cmd.Stderr = stderr
-	w.cmd.WaitDelay = 5 * time.Second
-	w.cmd.Cancel = func() error { return w.cmd.Process.Signal(syscall.SIGTERM) }
-
 	w.wg.Add(2)
-	go w.runWorker()
-	go w.translateLogs()
+	go w.runWorker(cmd)
+	go w.translateLogs(stdout)
 
 	return nil
 }
 
-func (w *ProxyWorker) runWorker() {
+func (w *ProxyWorker) terminate() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	w.cancel()
+	w.wg.Wait()
+}
+
+func (w *ProxyWorker) runWorker(cmd *exec.Cmd) {
 	defer w.wg.Done()
 	defer func() {
 		_ = os.RemoveAll(w.workdir)
 		close(w.terminated)
 	}()
 
-	if err := w.cmd.Start(); err != nil {
+	if err := cmd.Start(); err != nil {
 		w.log.Error("exec error", "error", err)
 		return
 	}
 
-	pid := w.cmd.Process.Pid
+	pid := cmd.Process.Pid
 	w.log.Debug("worker started", "pid", pid)
 
-	if err := w.cmd.Wait(); err != nil {
+	if err := cmd.Wait(); err != nil {
 		if !errors.Is(err, context.Canceled) {
 			w.log.Error("exec error", "error", err)
 		}
@@ -215,10 +225,10 @@ func (w *ProxyWorker) runWorker() {
 	w.log.Debug("worker stopped", "pid", pid)
 }
 
-func (w *ProxyWorker) translateLogs() {
+func (w *ProxyWorker) translateLogs(in io.Reader) {
 	defer w.wg.Done()
 
-	scanner := bufio.NewScanner(w.stdout)
+	scanner := bufio.NewScanner(in)
 	for {
 		if !scanner.Scan() {
 			return

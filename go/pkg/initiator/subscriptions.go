@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/jonasohland/mxl-fabrics-proxy/go/pkg/common"
+	"github.com/jonasohland/mxl-fabrics-proxy/go/pkg/metrics"
 	"github.com/jonasohland/mxl-fabrics-proxy/go/pkg/server"
 	"github.com/jonasohland/mxl-fabrics-proxy/go/pkg/worker"
 )
@@ -23,10 +24,11 @@ type Subscription struct {
 	worker  *worker.ProxyWorker
 
 	config        worker.Config
+	metrics       *metrics.Metrics
 	lastKeepAlive time.Time
 }
 
-func NewSubscription(config worker.Config) *Subscription {
+func NewSubscription(config worker.Config, metrics *metrics.Metrics) *Subscription {
 	ctx, cancel := context.WithCancel(context.Background())
 	worker := worker.NewWorker(config)
 
@@ -39,10 +41,12 @@ func NewSubscription(config worker.Config) *Subscription {
 		worker:  worker,
 
 		config:        config,
+		metrics:       metrics,
 		lastKeepAlive: time.Now(),
 	}
 
 	sub.worker.Start(sub.wctx, sub.wwg)
+	sub.metrics.Add(sub.worker)
 	return sub
 }
 
@@ -57,6 +61,7 @@ func (s *Subscription) Terminate() {
 	s.wwg.Wait()
 	s.wcancel = nil
 	s.wctx = nil
+	s.metrics.Remove(s.worker)
 }
 
 func (s *Subscription) HasTargetInfoChanged(t string) bool {
@@ -67,6 +72,7 @@ type Subscriptions struct {
 	mu            sync.Mutex
 	subscriptions map[string]*Subscription
 	domains       *Domains
+	metrics       *metrics.Metrics
 	config        Config
 }
 
@@ -75,11 +81,12 @@ type Config struct {
 	Service string
 }
 
-func NewSubscriptions(ctx context.Context, wg *sync.WaitGroup, domains *Domains, config Config) *Subscriptions {
+func NewSubscriptions(ctx context.Context, wg *sync.WaitGroup, domains *Domains, metrics *metrics.Metrics, config Config) *Subscriptions {
 	s := &Subscriptions{
 		mu:            sync.Mutex{},
 		subscriptions: make(map[string]*Subscription),
 		domains:       domains,
+		metrics:       metrics,
 		config:        config,
 	}
 
@@ -236,6 +243,7 @@ func (s *Subscriptions) createSuscription(req *common.SubscriptionRequest) (stri
 	}
 
 	config := worker.Config{
+		Target:         false,
 		ProxyID:        cookie,
 		Node:           s.config.Node,
 		Service:        s.config.Service,
@@ -246,7 +254,7 @@ func (s *Subscriptions) createSuscription(req *common.SubscriptionRequest) (stri
 		FlowID:         id,
 	}
 
-	s.subscriptions[cookie] = NewSubscription(config)
+	s.subscriptions[cookie] = NewSubscription(config, s.metrics)
 	slog.Info("subscription created", "id", cookie, "domain", domain, "flow-id", id, "node", s.config.Node, "service", s.config.Service)
 	return cookie, nil
 }

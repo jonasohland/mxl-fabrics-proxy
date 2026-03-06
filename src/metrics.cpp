@@ -70,11 +70,13 @@ Metrics::~Metrics() {
 }
 
 void Metrics::observe(std::uint64_t bytes, std::uint64_t payloadBytes,
-                      std::uint64_t grains, std::uint64_t latencyIn) {
+                      std::uint64_t grains, std::uint64_t skipped,
+                      std::uint64_t latencyIn) {
     std::lock_guard lock{_m};
     _totalBytes.add(bytes);
     _totalPayload.add(payloadBytes);
     _totalGrains.add(grains);
+    _skipped.add(skipped);
     _latency.add(latencyIn);
     _latencySummary.observe(latencyIn);
 }

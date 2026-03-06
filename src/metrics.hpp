@@ -15,7 +15,8 @@ class Metrics {
     ~Metrics();
 
     void observe(std::uint64_t bytes, std::uint64_t payloadBytes,
-                 std::uint64_t grains, std::uint64_t latencyIn);
+                 std::uint64_t grains, std::uint64_t skipped,
+                 std::uint64_t latencyIn);
 
   private:
     struct Session {
@@ -39,7 +40,8 @@ class Metrics {
     Counter _totalPayload = makeCounter("totalPayload");
     Counter _totalBytes = makeCounter("totalBytes");
     Counter _totalGrains = makeCounter("totalGrains");
-    Counter _latency = makeCounter("lantecy");
+    Counter _latency = makeCounter("latency");
+    Counter _skipped = makeCounter("skipped");
     Summary _latencySummary =
         makeSummary("latency", {0.01, 0.1, 0.5, 0.9, 0.99});
 

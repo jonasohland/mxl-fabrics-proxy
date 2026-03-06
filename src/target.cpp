@@ -77,7 +77,7 @@ void Target::transferGrains(::mxl::DiscreteFlowWriter writer,
         auto rate = writer.getRate();
         auto thisIndexTS = ::mxlIndexToTimestamp(&rate, index);
         auto latency = rxTime - thisIndexTS;
-        _metrics.observe(grainSize, grainSize + 4096, 1, latency);
+        _metrics.observe(grainSize, grainSize + 4096, 1, 0, latency);
     }
 }
 

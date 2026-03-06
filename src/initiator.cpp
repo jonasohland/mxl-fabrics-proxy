@@ -96,7 +96,7 @@ void Initiator::transferGrains(::mxl::DiscreteFlowReader reader,
             auto latency = inputTs - epochTs;
             auto latencyNS = std::chrono::nanoseconds(latency);
             auto grainSize = grainAccess.size();
-            _metrics.observe(grainSize, grainSize + 4096, 1, latency);
+            _metrics.observe(grainSize, grainSize + 4096, 1, 0, latency);
             ++index;
         } catch (::mxl::Exception const& ex) {
             if (ex.isTooEarly() || ex.isTooLate()) {

@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/jonasohland/mxl-fabrics-proxy/go/pkg/common"
+	"github.com/jonasohland/mxl-fabrics-proxy/go/pkg/metrics"
 	"github.com/jonasohland/mxl-fabrics-proxy/go/pkg/server"
 	"github.com/jonasohland/mxl-fabrics-proxy/go/pkg/worker"
 )
@@ -25,16 +26,17 @@ type Config struct {
 }
 
 type Targets struct {
-	ctx context.Context
-	wg  *sync.WaitGroup
+	ctx     context.Context
+	wg      *sync.WaitGroup
+	metrics *metrics.Metrics
 
 	config Config
 
 	targets []*Target
 }
 
-func NewTargets(ctx context.Context, wg *sync.WaitGroup, config Config) *Targets {
-	return &Targets{ctx: ctx, wg: wg, config: config, targets: nil}
+func NewTargets(ctx context.Context, wg *sync.WaitGroup, metrics *metrics.Metrics, config Config) *Targets {
+	return &Targets{ctx: ctx, wg: wg, metrics: metrics, config: config, targets: nil}
 }
 
 func (t *Targets) Create(localDomain string, remoteFlows string) error {
@@ -63,12 +65,13 @@ func (t *Targets) Create(localDomain string, remoteFlows string) error {
 
 func (t *Targets) create(localDomain string, remoteAuthority string, remoteDomain string, id string) error {
 	t.targets = append(t.targets,
-		NewTarget(t.ctx, t.wg, t.config, localDomain, remoteAuthority, remoteDomain, id))
+		NewTarget(t.ctx, t.wg, t.metrics, t.config, localDomain, remoteAuthority, remoteDomain, id))
 	return nil
 }
 
 type Target struct {
-	client *http.Client
+	client  *http.Client
+	metrics *metrics.Metrics
 
 	config       Config
 	localDomain  string
@@ -87,11 +90,13 @@ type Target struct {
 	worker  *worker.ProxyWorker
 }
 
-func NewTarget(ctx context.Context, wg *sync.WaitGroup, config Config, localDomain, authority, remoteDomain, id string) *Target {
+func NewTarget(ctx context.Context, wg *sync.WaitGroup, metrics *metrics.Metrics, config Config,
+	localDomain, authority, remoteDomain, id string) *Target {
 	t := &Target{
 		client: &http.Client{
 			Timeout: 5 * time.Second,
 		},
+		metrics: metrics,
 
 		config:       config,
 		localDomain:  localDomain,
@@ -166,15 +171,18 @@ func (t *Target) startWorker() error {
 	t.wcancel = wcancel
 	t.worker = worker.NewWorker(
 		worker.Config{
+			Target:         true,
 			ProxyID:        t.proxyID,
 			Node:           t.config.Node,
 			Service:        t.config.Service,
 			Provider:       t.config.Provider,
 			Domain:         t.localDomain,
 			FlowDefinition: t.flowDefinition,
+			FlowID:         t.flowID,
 		})
 
 	t.worker.Start(t.wctx, &t.wwg)
+	t.metrics.Add(t.worker)
 
 	return nil
 }
@@ -278,6 +286,7 @@ func (t *Target) cleanup() {
 	}
 
 	t.wcancel()
+	t.metrics.Remove(t.worker)
 	t.wwg.Wait()
 }
 

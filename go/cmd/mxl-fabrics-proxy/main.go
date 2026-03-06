@@ -15,6 +15,7 @@ import (
 	"github.com/alecthomas/kong"
 	"github.com/dpotapov/slogpfx"
 	"github.com/jonasohland/mxl-fabrics-proxy/go/pkg/initiator"
+	"github.com/jonasohland/mxl-fabrics-proxy/go/pkg/metrics"
 	"github.com/jonasohland/mxl-fabrics-proxy/go/pkg/server"
 	"github.com/jonasohland/mxl-fabrics-proxy/go/pkg/target"
 	"github.com/jonasohland/mxl-fabrics-proxy/go/pkg/worker"
@@ -22,8 +23,7 @@ import (
 )
 
 type CommandServe struct {
-	DomainURL     []string `arg:"" help:"Domains that should be served by this initiator"`
-	ListenAddress string   `short:"l" help:"Listen on this address for target requests" default:"127.0.0.1:2283"`
+	DomainURL []string `arg:"" help:"Domains that should be served by this initiator"`
 }
 
 type CommandSubscribe struct {
@@ -32,26 +32,29 @@ type CommandSubscribe struct {
 }
 
 type Options struct {
-	LogLevel  string           `help:"Set the log level" enum:"debug,info,warn,error" default:"info"`
-	Node      string           `help:"Local node address" default:"127.0.0.1"`
-	Service   string           `help:"Local service address"`
-	Serve     CommandServe     `cmd:"" help:"Serve flows in a domain to one or more subscribers"`
-	Subscribe CommandSubscribe `cmd:"" help:"Subscribe to one or more flows from a server"`
+	LogLevel      string           `help:"Set the log level" enum:"debug,info,warn,error" default:"info"`
+	Node          string           `help:"Local node address" default:"127.0.0.1"`
+	Service       string           `help:"Local service address"`
+	Serve         CommandServe     `cmd:"" help:"Serve flows in a domain to one or more subscribers"`
+	Subscribe     CommandSubscribe `cmd:"" help:"Subscribe to one or more flows from a server"`
+	ListenAddress string           `short:"l" help:"Listen on this address for requests"`
 }
 
 type Context struct {
-	Ctx     context.Context
-	Wg      *sync.WaitGroup
-	Node    string
-	Service string
+	Ctx           context.Context
+	Wg            *sync.WaitGroup
+	Node          string
+	Service       string
+	ListenAddress string
 }
 
 func (o *Options) ToContext(ctx context.Context, wg *sync.WaitGroup) *Context {
 	return &Context{
-		Ctx:     ctx,
-		Wg:      wg,
-		Node:    o.Node,
-		Service: o.Service,
+		Ctx:           ctx,
+		Wg:            wg,
+		Node:          o.Node,
+		Service:       o.Service,
+		ListenAddress: o.ListenAddress,
 	}
 }
 
@@ -72,13 +75,20 @@ func createLogger() *slog.Logger {
 }
 
 func (c *CommandServe) Run(ctx *Context) error {
+	if ctx.ListenAddress == "" {
+		ctx.ListenAddress = "127.0.0.1:2283"
+	}
+
 	server := server.NewServer(ctx.Wg, ctx.Ctx)
 
 	domains := initiator.NewDomains()
 	server.Mux(domains)
 
+	metrics := metrics.NewMetrics()
+	server.Mux(metrics)
+
 	subscriptions := initiator.NewSubscriptions(
-		ctx.Ctx, ctx.Wg, domains,
+		ctx.Ctx, ctx.Wg, domains, metrics,
 		initiator.Config{Node: ctx.Node, Service: ctx.Service})
 
 	server.Mux(subscriptions)
@@ -89,7 +99,7 @@ func (c *CommandServe) Run(ctx *Context) error {
 		}
 	}
 
-	if err := server.StartListening(c.ListenAddress, nil); err != nil {
+	if err := server.StartListening(ctx.ListenAddress, nil); err != nil {
 		return err
 	}
 
@@ -97,7 +107,17 @@ func (c *CommandServe) Run(ctx *Context) error {
 }
 
 func (c *CommandSubscribe) Run(ctx *Context) error {
-	targets := target.NewTargets(ctx.Ctx, ctx.Wg, target.Config{Node: ctx.Node, Service: ctx.Service, Provider: c.Provider})
+	if ctx.ListenAddress == "" {
+		ctx.ListenAddress = "127.0.0.1:2284"
+	}
+
+	server := server.NewServer(ctx.Wg, ctx.Ctx)
+
+	metrics := metrics.NewMetrics()
+	server.Mux(metrics)
+
+	targets := target.NewTargets(ctx.Ctx, ctx.Wg, metrics,
+		target.Config{Node: ctx.Node, Service: ctx.Service, Provider: c.Provider})
 
 	for _, url := range c.Subscription {
 		parts := strings.SplitN(url, "@", 2)
@@ -108,6 +128,10 @@ func (c *CommandSubscribe) Run(ctx *Context) error {
 		if err := targets.Create(parts[0], parts[1]); err != nil {
 			return err
 		}
+	}
+
+	if err := server.StartListening(ctx.ListenAddress, nil); err != nil {
+		return err
 	}
 
 	return nil

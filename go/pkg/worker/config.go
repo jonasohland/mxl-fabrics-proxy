@@ -1,6 +1,7 @@
 package worker
 
 type Config struct {
+	Target         bool   `json:"target"`
 	MetricsSocket  string `json:"metrics_socket"`
 	ProxyID        string `json:"proxy_id"`
 	Node           string `json:"node"`
@@ -13,9 +14,9 @@ type Config struct {
 }
 
 func (c *Config) IsInitiator() bool {
-	return c.FlowID != ""
+	return !c.Target
 }
 
 func (c *Config) IsTarget() bool {
-	return c.FlowDefinition != ""
+	return c.Target
 }

@@ -11,6 +11,7 @@ struct Config {
         return read(nlohmann::json::parse(std::forward<Input>(in)));
     }
 
+    bool target;
     std::string metricsSocket;
     std::string node;
     std::string service;

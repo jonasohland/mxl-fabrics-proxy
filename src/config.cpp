@@ -22,12 +22,20 @@ std::string getString(nlohmann::json const& v, std::string_view key,
     return std::string{def};
 }
 
+bool getBool(nlohmann::json const& v, std::string_view key) {
+    if (auto it = v.find(key); it != v.end() && it->is_boolean()) {
+        return it->get<bool>();
+    }
+    return false;
+}
+
 } // namespace
 
 namespace mxl::proxy {
 Config Config::read(nlohmann::json config) {
     Config out{};
 
+    out.target = getBool(config, "target");
     out.metricsSocket = getString(config, "metrics_socket");
     out.node = getString(config, "node");
     out.service = getString(config, "service");
@@ -41,26 +49,15 @@ Config Config::read(nlohmann::json config) {
                "failed to parse provider string", out.providerStr.c_str(),
                &out.provider);
 
-    if (out.flowId.empty() && out.flowDef.empty()) {
-        throw Exception{MXL_ERR_INVALID_ARG,
-                        "one of 'flow_id' or 'flow_def' must be specified"};
-    }
-
-    if ((!out.flowId.empty()) && (!out.flowDef.empty())) {
-        throw Exception{
-            MXL_ERR_INVALID_ARG,
-            "only one of 'flow_id' or 'flow_def' must be specified"};
-    }
-
     return out;
 }
 
 bool Config::isTarget() const noexcept {
-    return !flowDef.empty();
+    return target;
 }
 
 bool Config::isInitiator() const noexcept {
-    return !flowId.empty();
+    return !target;
 }
 
 } // namespace mxl::proxy
