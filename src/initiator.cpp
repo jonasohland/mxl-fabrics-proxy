@@ -55,8 +55,16 @@ void Initiator::connect(::mxl::fabrics::DiscreteFlowInitiator& initiator,
         if (sig.shouldExit()) {
             return;
         }
-        if (initiator.makeProgress(std::chrono::milliseconds(500))) {
-            continue;
+
+        if (_config.provider == MXL_FABRICS_PROVIDER_EFA &&
+            !_config.efaUseWait) {
+            if (initiator.makeProgressNonBlocking()) {
+                continue;
+            }
+        } else {
+            if (initiator.makeProgress(std::chrono::milliseconds(500))) {
+                continue;
+            }
         }
 
         spdlog::info("connected");
@@ -87,11 +95,17 @@ void Initiator::transferGrains(::mxl::DiscreteFlowReader reader,
             if (_config.provider == MXL_FABRICS_PROVIDER_EFA &&
                 !_config.efaUseWait) {
                 while (initiator.makeProgressNonBlocking()) {
+                    if (sig.shouldExit()) {
+                        return;
+                    }
                 }
             } else {
                 while (
                     initiator.makeProgress(std::chrono::milliseconds(1000))) {
                     spdlog::warn("grain still not transmitted after timeout");
+                    if (sig.shouldExit()) {
+                        return;
+                    }
                 }
             }
 
