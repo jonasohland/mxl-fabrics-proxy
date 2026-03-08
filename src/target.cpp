@@ -32,6 +32,9 @@ Target::Target(Config config)
 }
 
 void Target::run(utils::ExitSignal sig) {
+    if (_config.provider == MXL_FABRICS_PROVIDER_EFA && _config.efaUseWait) {
+        spdlog::info("using efa provider with blocking completion queue reads");
+    }
     auto writer = createWriter();
     auto [target, targetInfo] = createTarget(writer);
     writeFile(_config.targetInfo, targetInfo.toString());
