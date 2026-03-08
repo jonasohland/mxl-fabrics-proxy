@@ -18,9 +18,6 @@ Initiator::Initiator(Config config)
 }
 
 void Initiator::run(utils::ExitSignal sig) {
-    if (_config.provider == MXL_FABRICS_PROVIDER_EFA && _config.efaUseWait) {
-        spdlog::info("using efa provider with blocking completion queue reads");
-    }
     auto reader = openReader();
     auto initiator = createInitiator(reader);
     auto targetInfo = ::mxl::fabrics::TargetInfo::parse(_config.targetInfo);

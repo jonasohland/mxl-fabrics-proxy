@@ -173,7 +173,6 @@ func (w *ProxyWorker) restart() error {
 	}
 	defer func() { _ = fd.Close() }()
 
-	slog.Info("efa wait mode", "use-wait", w.config.EFAUseWait)
 	if err := json.NewEncoder(fd).Encode(&w.config); err != nil {
 		return err
 	}
