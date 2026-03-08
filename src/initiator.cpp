@@ -81,8 +81,8 @@ void Initiator::transferGrains(::mxl::DiscreteFlowReader reader,
                              "not ready",
                              index);
             }
-            if (_config.provider == MXL_FABRICS_PROVIDER_EFA ||
-                _config.efaUseWait) {
+            if (_config.provider == MXL_FABRICS_PROVIDER_EFA &&
+                !_config.efaUseWait) {
                 while (initiator.makeProgressNonBlocking()) {
                 }
             } else {

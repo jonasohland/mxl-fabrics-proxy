@@ -97,8 +97,8 @@ std::uint64_t Target::readNextGrain(::mxl::fabrics::DiscreteFlowTarget& target,
         if (sig.shouldExit()) {
             return 0;
         }
-        if (_config.provider == MXL_FABRICS_PROVIDER_EFA ||
-            _config.efaUseWait) {
+        if (_config.provider == MXL_FABRICS_PROVIDER_EFA &&
+            !_config.efaUseWait) {
             res = target.readGrainNonBlocking();
         } else {
             res = target.readGrain(std::chrono::milliseconds(500));
