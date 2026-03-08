@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -66,8 +67,9 @@ type ProxyWorker struct {
 	wg  sync.WaitGroup
 	log *slog.Logger
 
-	config  Config
-	workdir string
+	config   Config
+	workdir  string
+	restarts atomic.Uint64
 
 	ctx        context.Context
 	cancel     context.CancelFunc
@@ -80,9 +82,10 @@ func NewWorker(config Config) *ProxyWorker {
 		wg:  sync.WaitGroup{},
 		log: slog.With("proxy-id", config.ProxyID, "module", "proxy"),
 
-		config: config,
+		config:   config,
+		workdir:  "",
+		restarts: atomic.Uint64{},
 
-		workdir:    "",
 		ctx:        nil,
 		cancel:     nil,
 		terminated: nil,
@@ -113,6 +116,10 @@ func (w *ProxyWorker) GetMetricsSocket() string {
 	return w.config.MetricsSocket
 }
 
+func (w *ProxyWorker) NumRestarts() uint64 {
+	return w.restarts.Load()
+}
+
 func (w *ProxyWorker) run(ctx context.Context, wg *sync.WaitGroup) {
 	wait := time.Duration(0)
 	defer wg.Done()
@@ -134,6 +141,7 @@ func (w *ProxyWorker) run(ctx context.Context, wg *sync.WaitGroup) {
 			w.terminate()
 			return
 		case <-w.terminated:
+			w.restarts.Add(1)
 			w.terminate()
 		}
 	}

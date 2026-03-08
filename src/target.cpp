@@ -74,26 +74,42 @@ void Target::transferGrains(::mxl::DiscreteFlowWriter writer,
             // committed when access object it dropped
         }
 
+        std::uint64_t skipped = 0;
+        if (_lastIndex != 0) {
+            skipped = index - (_lastIndex + 1);
+        }
+
+        _lastIndex = index;
+
         auto rate = writer.getRate();
         auto thisIndexTS = ::mxlIndexToTimestamp(&rate, index);
         auto latency = rxTime - thisIndexTS;
-        _metrics.observe(grainSize, grainSize + 4096, 1, 0, latency);
+        _metrics.observe(grainSize, grainSize + 4096, 1, skipped, latency);
     }
 }
 
 std::uint64_t Target::readNextGrain(::mxl::fabrics::DiscreteFlowTarget& target,
                                     utils::ExitSignal sig) {
+    std::chrono::system_clock::time_point lastRead =
+        std::chrono::system_clock::now();
     for (;;) {
         std::optional<std::uint64_t> res{std::nullopt};
         if (sig.shouldExit()) {
             return 0;
         }
-        if (_config.provider == MXL_FABRICS_PROVIDER_EFA) {
+        if (_config.provider == MXL_FABRICS_PROVIDER_EFA ||
+            _config.efaUseWait) {
             res = target.readGrainNonBlocking();
         } else {
             res = target.readGrain(std::chrono::milliseconds(500));
         }
         if (!res) {
+            auto waitTime = std::chrono::system_clock::now() - lastRead;
+            if (waitTime > std::chrono::seconds(10)) {
+                throw ::mxl::Exception{MXL_ERR_TIMEOUT,
+                                       "timed out waiting for a grain"};
+            }
+
             continue;
         }
 

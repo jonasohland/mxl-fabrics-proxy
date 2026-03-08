@@ -81,7 +81,8 @@ void Initiator::transferGrains(::mxl::DiscreteFlowReader reader,
                              "not ready",
                              index);
             }
-            if (_config.provider == MXL_FABRICS_PROVIDER_EFA) {
+            if (_config.provider == MXL_FABRICS_PROVIDER_EFA ||
+                _config.efaUseWait) {
                 while (initiator.makeProgressNonBlocking()) {
                 }
             } else {
@@ -91,12 +92,18 @@ void Initiator::transferGrains(::mxl::DiscreteFlowReader reader,
                 }
             }
 
+            std::uint64_t skipped = 0;
+            if (_lastIndex != 0) {
+                skipped = index - (_lastIndex + 1);
+            }
+
+            _lastIndex = index;
+
             auto rate = reader.getRate();
             auto epochTs = ::mxlIndexToTimestamp(&rate, index);
             auto latency = inputTs - epochTs;
-            auto latencyNS = std::chrono::nanoseconds(latency);
             auto grainSize = grainAccess.size();
-            _metrics.observe(grainSize, grainSize + 4096, 1, 0, latency);
+            _metrics.observe(grainSize, grainSize + 4096, 1, skipped, latency);
             ++index;
         } catch (::mxl::Exception const& ex) {
             if (ex.isTooEarly() || ex.isTooLate()) {

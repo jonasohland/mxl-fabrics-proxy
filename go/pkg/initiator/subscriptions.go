@@ -77,8 +77,9 @@ type Subscriptions struct {
 }
 
 type Config struct {
-	Node    string
-	Service string
+	Node       string
+	Service    string
+	EFAUseWait bool
 }
 
 func NewSubscriptions(ctx context.Context, wg *sync.WaitGroup, domains *Domains, metrics *metrics.Metrics, config Config) *Subscriptions {
@@ -252,6 +253,7 @@ func (s *Subscriptions) createSuscription(req *common.SubscriptionRequest) (stri
 		TargetInfo:     req.TargetInfo,
 		FlowDefinition: "",
 		FlowID:         id,
+		EFAUseWait:     s.config.EFAUseWait,
 	}
 
 	s.subscriptions[cookie] = NewSubscription(config, s.metrics)

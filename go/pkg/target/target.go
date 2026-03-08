@@ -20,9 +20,10 @@ import (
 )
 
 type Config struct {
-	Node     string
-	Service  string
-	Provider string
+	Node       string
+	Service    string
+	Provider   string
+	EFAUseWait bool
 }
 
 type Targets struct {
@@ -179,6 +180,7 @@ func (t *Target) startWorker() error {
 			Domain:         t.localDomain,
 			FlowDefinition: t.flowDefinition,
 			FlowID:         t.flowID,
+			EFAUseWait:     t.config.EFAUseWait,
 		})
 
 	t.worker.Start(t.wctx, &t.wwg)

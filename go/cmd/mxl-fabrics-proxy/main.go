@@ -32,12 +32,13 @@ type CommandSubscribe struct {
 }
 
 type Options struct {
-	LogLevel      string           `help:"Set the log level" enum:"debug,info,warn,error" default:"info"`
-	Node          string           `help:"Local node address" default:"127.0.0.1"`
-	Service       string           `help:"Local service address"`
-	Serve         CommandServe     `cmd:"" help:"Serve flows in a domain to one or more subscribers"`
-	Subscribe     CommandSubscribe `cmd:"" help:"Subscribe to one or more flows from a server"`
-	ListenAddress string           `short:"l" help:"Listen on this address for requests"`
+	LogLevel   string           `help:"Set the log level" enum:"debug,info,warn,error" default:"info"`
+	Node       string           `help:"Local node address" default:"127.0.0.1"`
+	Service    string           `help:"Local service address"`
+	Serve      CommandServe     `cmd:"" help:"Serve flows in a domain to one or more subscribers"`
+	Subscribe  CommandSubscribe `cmd:"" help:"Subscribe to one or more flows from a server"`
+	Listen     string           `short:"l" help:"Listen on this address for requests"`
+	EFAUseWait bool             `help:"Use wait completion with EFA provider"`
 }
 
 type Context struct {
@@ -46,6 +47,7 @@ type Context struct {
 	Node          string
 	Service       string
 	ListenAddress string
+	EFAUseWait    bool
 }
 
 func (o *Options) ToContext(ctx context.Context, wg *sync.WaitGroup) *Context {
@@ -54,7 +56,8 @@ func (o *Options) ToContext(ctx context.Context, wg *sync.WaitGroup) *Context {
 		Wg:            wg,
 		Node:          o.Node,
 		Service:       o.Service,
-		ListenAddress: o.ListenAddress,
+		ListenAddress: o.Listen,
+		EFAUseWait:    o.EFAUseWait,
 	}
 }
 
@@ -89,7 +92,7 @@ func (c *CommandServe) Run(ctx *Context) error {
 
 	subscriptions := initiator.NewSubscriptions(
 		ctx.Ctx, ctx.Wg, domains, metrics,
-		initiator.Config{Node: ctx.Node, Service: ctx.Service})
+		initiator.Config{Node: ctx.Node, Service: ctx.Service, EFAUseWait: ctx.EFAUseWait})
 
 	server.Mux(subscriptions)
 
@@ -117,7 +120,7 @@ func (c *CommandSubscribe) Run(ctx *Context) error {
 	server.Mux(metrics)
 
 	targets := target.NewTargets(ctx.Ctx, ctx.Wg, metrics,
-		target.Config{Node: ctx.Node, Service: ctx.Service, Provider: c.Provider})
+		target.Config{Node: ctx.Node, Service: ctx.Service, Provider: c.Provider, EFAUseWait: ctx.EFAUseWait})
 
 	for _, url := range c.Subscription {
 		parts := strings.SplitN(url, "@", 2)

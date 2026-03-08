@@ -187,7 +187,7 @@ std::string Metrics::scrape() const noexcept {
         std::stringstream ss{};
         ss << std::setprecision(std::numeric_limits<double>::digits10);
         ss << _totalBytes << _totalPayload << _totalGrains << _latency
-           << _latencySummary;
+           << _skipped << _latencySummary;
         return ss.str();
     } catch (std::exception const& ex) {
         return std::format("scrape error: {}", ex.what());

@@ -28,6 +28,9 @@ class Initiator {
                         utils::ExitSignal sig);
 
   private:
+    std::uint64_t _lastIndex = 0;
+
+  private:
     ::mxl::Instance _mxl;
     ::mxl::fabrics::Instance _fabrics;
     Metrics _metrics;

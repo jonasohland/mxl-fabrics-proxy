@@ -44,6 +44,7 @@ Config Config::read(nlohmann::json config) {
     out.flowId = getString(config, "flow_id", "");
     out.domain = getString(config, "domain");
     out.providerStr = getString(config, "provider", "tcp");
+    out.efaUseWait = getBool(config, "efa_use_wait");
 
     ::mxl::mxl(::mxlFabricsProviderFromString,
                "failed to parse provider string", out.providerStr.c_str(),

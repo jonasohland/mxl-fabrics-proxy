@@ -21,6 +21,7 @@ struct Config {
     std::string domain;
     std::string providerStr;
     ::mxlFabricsProvider provider;
+    bool efaUseWait;
 
     [[nodiscard]] bool isInitiator() const noexcept;
     [[nodiscard]] bool isTarget() const noexcept;
