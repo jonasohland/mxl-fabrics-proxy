@@ -38,11 +38,12 @@ func sendLabels(w io.Writer, labels map[string]string) error {
 		if _, err := io.WriteString(w, name+"="+"\""+label+"\""); err != nil {
 			return err
 		}
-		if i != len(labels) {
+		if i != len(labels)-1 {
 			if _, err := io.WriteString(w, ","); err != nil {
 				return err
 			}
 		}
+		i++
 	}
 
 	if _, err := io.WriteString(w, "}"); err != nil {
