@@ -45,4 +45,5 @@ COPY --from=builder /usr/bin/mxl-fabrics-proxy /usr/bin/mxl-fabrics-proxy
 COPY --from=builder /usr/bin/mxl-fabrics-proxy-worker /usr/bin/mxl-fabrics-proxy-worker
 
 USER mxl:mxl
+ENV GOMAXPROCS=1
 ENTRYPOINT ["/usr/bin/dumb-init", "--", "/usr/bin/mxl-fabrics-proxy"]
