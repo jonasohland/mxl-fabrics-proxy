@@ -96,6 +96,6 @@ func (w *ProxyWorker) GetMetrics(ctx context.Context) (*MetricCollection, error)
 		return nil, scanner.Err()
 	}
 
-	coll.AddCounter("worker-restarts", float64(w.NumRestarts()))
+	coll.AddCounter("workerRestarts", float64(w.NumRestarts()))
 	return coll, nil
 }
