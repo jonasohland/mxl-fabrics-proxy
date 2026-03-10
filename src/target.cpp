@@ -75,11 +75,13 @@ void Target::transferGrains(::mxl::DiscreteFlowWriter writer,
         }
 
         std::uint64_t skipped = 0;
-        if (_lastIndex != 0) {
-            skipped = index - (_lastIndex + 1);
-        }
+        if (_lastIndex < index) {
+            if (_lastIndex != 0) {
+                skipped = index - (_lastIndex + 1);
+            }
 
-        _lastIndex = index;
+            _lastIndex = index;
+        }
 
         auto rate = writer.getRate();
         auto thisIndexTS = ::mxlIndexToTimestamp(&rate, index);

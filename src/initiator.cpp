@@ -107,11 +107,14 @@ void Initiator::transferGrains(::mxl::DiscreteFlowReader reader,
             }
 
             std::uint64_t skipped = 0;
-            if (_lastIndex != 0) {
-                skipped = index - (_lastIndex + 1);
-            }
+            if (_lastIndex < index) {
+                if (_lastIndex != 0) {
+                    std::uint64_t skipped = 0;
+                    skipped = index - (_lastIndex + 1);
+                }
 
-            _lastIndex = index;
+                _lastIndex = index;
+            }
 
             auto rate = reader.getRate();
             auto epochTs = ::mxlIndexToTimestamp(&rate, index);
