@@ -31,7 +31,7 @@ Metrics::Metrics(std::string const& socketPath)
 
     ::sockaddr_un addr{};
     addr.sun_family = AF_UNIX;
-    ::strncpy(addr.sun_path, socketPath.c_str(), socketPath.length());
+    ::strncpy(addr.sun_path, socketPath.c_str(), sizeof addr.sun_path);
 
     if (::bind(_listenFd, reinterpret_cast<::sockaddr*>(&addr), sizeof addr) <
         0) {
@@ -87,7 +87,10 @@ void Metrics::run() {
     for (;;) {
         auto ret = ::epoll_wait(_epollfd, events.data(), events.size(), 1000);
         if (ret < 0) {
-            spdlog::info("epoll err: {}", ::strerror(errno));
+            auto const error = errno;
+            if (error != EBADF) {
+                spdlog::error("epoll err: {}", ::strerror(errno));
+            }
             return;
         }
 

@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"math/rand"
@@ -293,8 +294,9 @@ func parseProxyWorkerLogEntry(entry []byte) (slog.Record, error) {
 	prefixTokens = lo.Without(prefixTokens, "console")
 
 	// parse the time entry
-	logTime, err := time.ParseInLocation("2006-01-03 15:04:05.000", prefixTokens[0], time.Local)
+	logTime, err := time.ParseInLocation("2006-01-02 15:04:05.000", prefixTokens[0], time.Local)
 	if err != nil {
+		fmt.Println(err)
 		return slog.Record{}, err
 	}
 

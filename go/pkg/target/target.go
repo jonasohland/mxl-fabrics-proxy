@@ -19,69 +19,61 @@ import (
 	"github.com/jonasohland/mxl-fabrics-proxy/go/pkg/worker"
 )
 
-type Config struct {
-	Node       string
-	Service    string
-	Provider   string
-	EFAUseWait bool
-}
-
 type Targets struct {
 	ctx     context.Context
-	wg      *sync.WaitGroup
 	metrics *metrics.Metrics
 
-	config Config
-
-	targets []*Target
+	targets map[string]*Target
 }
 
-func NewTargets(ctx context.Context, wg *sync.WaitGroup, metrics *metrics.Metrics, config Config) *Targets {
-	return &Targets{ctx: ctx, wg: wg, metrics: metrics, config: config, targets: nil}
+type TargetConfig struct {
+	LocalDomainPath  string
+	RemoteDomainPath string
+	RemoteHost       string
+	Provider         string
+	Node             string
+	FlowID           string
+
+	ID string
 }
 
-func (t *Targets) Create(localDomain string, remoteFlows string) error {
-	localDomain, err := common.ParseDomainURL(localDomain)
+func NewTargets(ctx context.Context, metrics *metrics.Metrics) *Targets {
+	return &Targets{ctx: ctx, metrics: metrics, targets: map[string]*Target{}}
+}
+
+func (t *Targets) Create(c *TargetConfig) (string, error) {
+	slog.Info("create target", "config", c)
+
+	id, err := common.NewCookie()
 	if err != nil {
-		return err
+		return "", err
 	}
 
-	remoteFlowsURL, err := url.Parse(remoteFlows)
-	if err != nil {
-		return fmt.Errorf("%w: invalid remote flow url: %w", server.ErrInvalidArgument, err)
-	}
+	c.ID = id
 
-	if remoteFlowsURL.Port() == "" {
-		remoteFlowsURL.Host += ":2283"
-	}
-
-	for _, id := range remoteFlowsURL.Query()["id"] {
-		if err := t.create(localDomain, remoteFlowsURL.Host, remoteFlowsURL.Path, id); err != nil {
-			return err
-		}
-	}
-
-	return nil
+	t.targets[id] = NewTarget(t.ctx, t.metrics, c)
+	return id, nil
 }
 
-func (t *Targets) create(localDomain string, remoteAuthority string, remoteDomain string, id string) error {
-	t.targets = append(t.targets,
-		NewTarget(t.ctx, t.wg, t.metrics, t.config, localDomain, remoteAuthority, remoteDomain, id))
-	return nil
+func (t *Targets) Destroy(id string) {
+	target, ok := t.targets[id]
+	if !ok {
+		return
+	}
+
+	target.Stop()
 }
 
 type Target struct {
+	cancel context.CancelFunc
+	wg     sync.WaitGroup
+
 	client  *http.Client
 	metrics *metrics.Metrics
 
-	config       Config
-	localDomain  string
-	remoteDomain string
-	authority    string
-	flowID       string
+	config *TargetConfig
 
 	flowDefinition string
-	proxyID        string
 
 	activeSubscription string
 
@@ -91,22 +83,19 @@ type Target struct {
 	worker  *worker.ProxyWorker
 }
 
-func NewTarget(ctx context.Context, wg *sync.WaitGroup, metrics *metrics.Metrics, config Config,
-	localDomain, authority, remoteDomain, id string) *Target {
+func NewTarget(ctx context.Context, metrics *metrics.Metrics, config *TargetConfig) *Target {
+	tctx, tcancel := context.WithCancel(ctx)
+
 	t := &Target{
-		client: &http.Client{
-			Timeout: 5 * time.Second,
-		},
+		cancel: tcancel,
+		wg:     sync.WaitGroup{},
+
+		client:  &http.Client{Timeout: 5 * time.Second},
 		metrics: metrics,
 
-		config:       config,
-		localDomain:  localDomain,
-		remoteDomain: remoteDomain,
-		authority:    authority,
-		flowID:       id,
+		config: config,
 
 		flowDefinition: "",
-		proxyID:        common.NewCookieMust(),
 
 		wctx:    nil,
 		wcancel: nil,
@@ -114,15 +103,23 @@ func NewTarget(ctx context.Context, wg *sync.WaitGroup, metrics *metrics.Metrics
 		worker:  nil,
 	}
 
-	wg.Add(1)
-	go t.run(ctx, wg)
+	t.wg.Add(1)
+	go t.run(tctx, &t.wg)
 	return t
+}
+
+func (t *Target) Stop() {
+	if t.cancel != nil {
+		t.cancel()
+	}
+
+	t.cancel = nil
+	t.wg.Wait()
 }
 
 func (t *Target) run(ctx context.Context, wg *sync.WaitGroup) {
 	defer wg.Done()
 	defer t.cleanup()
-	slog.Info("running target", "local-domain", t.localDomain, "authority", t.authority, "remote-domain", t.remoteDomain, "remote-flow-id", t.flowID)
 
 	wait := time.Duration(0)
 	for {
@@ -173,14 +170,12 @@ func (t *Target) startWorker() error {
 	t.worker = worker.NewWorker(
 		worker.Config{
 			Target:         true,
-			ProxyID:        t.proxyID,
-			Node:           t.config.Node,
-			Service:        t.config.Service,
+			ProxyID:        t.config.ID,
+			Domain:         t.config.LocalDomainPath,
 			Provider:       t.config.Provider,
-			Domain:         t.localDomain,
+			Node:           t.config.Node,
+			FlowID:         t.config.FlowID,
 			FlowDefinition: t.flowDefinition,
-			FlowID:         t.flowID,
-			EFAUseWait:     t.config.EFAUseWait,
 		})
 
 	t.worker.Start(t.wctx, &t.wwg)
@@ -191,11 +186,15 @@ func (t *Target) startWorker() error {
 
 func (t *Target) getFlowDefinition(ctx context.Context) error {
 	var domainInfo common.DomainInfo
-	if err := t.req(ctx, http.MethodGet, "/v1/flows"+t.remoteDomain, map[string]string{"id": t.flowID}, nil, &domainInfo); err != nil {
+	err := t.req(ctx, http.MethodGet,
+		"/v1/flows"+t.config.RemoteDomainPath,    // path
+		map[string]string{"id": t.config.FlowID}, // query
+		nil, &domainInfo)                         // bodyIn, bodyOut
+	if err != nil {
 		return err
 	}
 
-	flow, ok := domainInfo.Flows[t.flowID]
+	flow, ok := domainInfo.Flows[t.config.FlowID]
 	if !ok {
 		return fmt.Errorf("%w: flow not in domain info", server.ErrNotFound)
 	}
@@ -237,7 +236,7 @@ func (t *Target) createSubscription(ctx context.Context) (string, error) {
 	}
 
 	req := common.SubscriptionRequest{
-		FlowURL:    fmt.Sprintf("mxl://%s?id=%s", t.remoteDomain, t.flowID),
+		FlowURL:    fmt.Sprintf("mxl://%s?id=%s", t.config.RemoteDomainPath, t.config.FlowID),
 		TargetInfo: info,
 		Provider:   t.config.Provider,
 	}
@@ -293,7 +292,7 @@ func (t *Target) cleanup() {
 }
 
 func (t *Target) req(ctx context.Context, method, path string, query map[string]string, in any, out any) error {
-	urlString := fmt.Sprintf("http://%s%s", t.authority, path)
+	urlString := fmt.Sprintf("http://%s%s", t.config.RemoteHost, path)
 	if len(query) > 0 {
 		var qp []string
 		for k, v := range query {

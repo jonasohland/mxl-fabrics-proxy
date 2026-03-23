@@ -13,6 +13,11 @@ cmake-build: cmake-configure
 cmake-install: cmake-build
 	cmake --install build
 
+.PHONY: clean
+clean:
+	make -C build clean
+	rm -f build/mxl-fabrics-proxy
+
 .PHONY: tidy
 tidy:
 	go mod tidy

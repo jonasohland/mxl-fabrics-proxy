@@ -53,6 +53,8 @@ type FlowInfo struct {
 
 type DomainInfo struct {
 	Path  string              `json:"path"`
+	Name  string              `json:"name"`
+	Node  string              `json:"node"`
 	Flows map[string]FlowInfo `json:"flows"`
 }
 

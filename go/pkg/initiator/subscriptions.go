@@ -73,22 +73,14 @@ type Subscriptions struct {
 	subscriptions map[string]*Subscription
 	domains       *Domains
 	metrics       *metrics.Metrics
-	config        Config
 }
 
-type Config struct {
-	Node       string
-	Service    string
-	EFAUseWait bool
-}
-
-func NewSubscriptions(ctx context.Context, wg *sync.WaitGroup, domains *Domains, metrics *metrics.Metrics, config Config) *Subscriptions {
+func NewSubscriptions(ctx context.Context, wg *sync.WaitGroup, domains *Domains, metrics *metrics.Metrics) *Subscriptions {
 	s := &Subscriptions{
 		mu:            sync.Mutex{},
 		subscriptions: make(map[string]*Subscription),
 		domains:       domains,
 		metrics:       metrics,
-		config:        config,
 	}
 
 	wg.Add(1)
@@ -238,6 +230,11 @@ func (s *Subscriptions) createSuscription(req *common.SubscriptionRequest) (stri
 		return "", err
 	}
 
+	info, err := s.domains.Find(domain, id)
+	if err != nil {
+		return "", err
+	}
+
 	cookie, err := common.NewCookie()
 	if err != nil {
 		return "", err
@@ -246,18 +243,18 @@ func (s *Subscriptions) createSuscription(req *common.SubscriptionRequest) (stri
 	config := worker.Config{
 		Target:         false,
 		ProxyID:        cookie,
-		Node:           s.config.Node,
-		Service:        s.config.Service,
+		Node:           info.Node,
+		Service:        "",
 		Provider:       req.Provider,
-		Domain:         domain,
+		Domain:         info.Path,
 		TargetInfo:     req.TargetInfo,
 		FlowDefinition: "",
 		FlowID:         id,
-		EFAUseWait:     s.config.EFAUseWait,
+		EFAUseWait:     true,
 	}
 
 	s.subscriptions[cookie] = NewSubscription(config, s.metrics)
-	slog.Info("subscription created", "id", cookie, "domain", domain, "flow-id", id, "node", s.config.Node, "service", s.config.Service)
+	slog.Info("subscription created", "id", cookie, "domain", domain, "flow-id", id, "node", info.Node)
 	return cookie, nil
 }
 
