@@ -30,7 +30,7 @@ type Subscription struct {
 
 func NewSubscription(config worker.Config, metrics *metrics.Metrics) *Subscription {
 	ctx, cancel := context.WithCancel(context.Background())
-	worker := worker.NewWorker(config)
+	worker := worker.NewWorker(config, 0)
 
 	sub := &Subscription{
 		mu: sync.Mutex{},
@@ -251,6 +251,8 @@ func (s *Subscriptions) createSuscription(req *common.SubscriptionRequest) (stri
 		FlowDefinition: "",
 		FlowID:         id,
 		EFAUseWait:     true,
+
+		Labels: req.Labels,
 	}
 
 	s.subscriptions[cookie] = NewSubscription(config, s.metrics)

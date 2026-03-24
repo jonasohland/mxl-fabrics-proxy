@@ -59,9 +59,10 @@ type DomainInfo struct {
 }
 
 type SubscriptionRequest struct {
-	FlowURL    string `json:"flow_url"`
-	TargetInfo string `json:"target_info"`
-	Provider   string `json:"provider"`
+	FlowURL    string            `json:"flow_url"`
+	TargetInfo string            `json:"target_info"`
+	Provider   string            `json:"provider"`
+	Labels     map[string]string `json:"labels"`
 }
 
 type SubscriptionResponse struct {

@@ -5,7 +5,7 @@ import (
 	"math/big"
 )
 
-const DefaultCookieLen = 32
+const DefaultCookieLen = 12
 
 func NewCookieN(n int) (string, error) {
 	const letters = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"

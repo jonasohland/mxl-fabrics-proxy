@@ -59,7 +59,7 @@ func (d *Domains) Add(domainURL, name, mappedNode, provider string) (string, err
 		name = durl.Path
 	}
 
-	slog.Info("adding domain", "path", durl.Path)
+	slog.Info("adding domain", "path", durl.Path, "name", name, "node", mappedNode, "internal-id", id)
 	d.domains[id] = &Domain{dURL: durl, name: name, node: mappedNode, provider: provider}
 
 	return id, nil

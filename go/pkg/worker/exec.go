@@ -77,8 +77,8 @@ type ProxyWorker struct {
 	terminated chan any
 }
 
-func NewWorker(config Config) *ProxyWorker {
-	return &ProxyWorker{
+func NewWorker(config Config, restarts uint64) *ProxyWorker {
+	w := &ProxyWorker{
 		mu:  sync.Mutex{},
 		wg:  sync.WaitGroup{},
 		log: slog.With("proxy-id", config.ProxyID, "module", "proxy"),
@@ -91,6 +91,8 @@ func NewWorker(config Config) *ProxyWorker {
 		cancel:     nil,
 		terminated: nil,
 	}
+	w.restarts.Add(restarts)
+	return w
 }
 
 func (w *ProxyWorker) Start(ctx context.Context, wg *sync.WaitGroup) {
@@ -248,7 +250,9 @@ func (w *ProxyWorker) translateLogs(in io.Reader) {
 			continue
 		}
 
-		_ = w.log.With("module", "proxy.worker").Handler().Handle(context.Background(), record)
+		if w.log.Handler().Enabled(context.Background(), record.Level) {
+			_ = w.log.With("module", "proxy.worker").Handler().Handle(context.Background(), record)
+		}
 	}
 }
 
@@ -308,7 +312,7 @@ func parseProxyWorkerLogEntry(entry []byte) (slog.Record, error) {
 		case "debug":
 			level = slog.LevelDebug
 		case "info":
-			level = slog.LevelInfo
+			level = slog.LevelDebug
 		case "warning":
 			level = slog.LevelWarn
 		case "error":

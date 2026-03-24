@@ -33,6 +33,7 @@ type TargetConfig struct {
 	Provider         string
 	Node             string
 	FlowID           string
+	Labels           map[string]string
 
 	ID string
 }
@@ -77,10 +78,11 @@ type Target struct {
 
 	activeSubscription string
 
-	wctx    context.Context
-	wcancel context.CancelFunc
-	wwg     sync.WaitGroup
-	worker  *worker.ProxyWorker
+	wctx      context.Context
+	wcancel   context.CancelFunc
+	wwg       sync.WaitGroup
+	worker    *worker.ProxyWorker
+	wrestarts uint64
 }
 
 func NewTarget(ctx context.Context, metrics *metrics.Metrics, config *TargetConfig) *Target {
@@ -97,10 +99,11 @@ func NewTarget(ctx context.Context, metrics *metrics.Metrics, config *TargetConf
 
 		flowDefinition: "",
 
-		wctx:    nil,
-		wcancel: nil,
-		wwg:     sync.WaitGroup{},
-		worker:  nil,
+		wctx:      nil,
+		wcancel:   nil,
+		wwg:       sync.WaitGroup{},
+		worker:    nil,
+		wrestarts: 0,
 	}
 
 	t.wg.Add(1)
@@ -162,6 +165,7 @@ func (t *Target) startWorker() error {
 	if t.worker != nil {
 		t.wcancel()
 		t.wwg.Wait()
+		t.wrestarts = t.worker.NumRestarts()
 	}
 
 	wctx, wcancel := context.WithCancel(context.Background())
@@ -176,7 +180,9 @@ func (t *Target) startWorker() error {
 			Node:           t.config.Node,
 			FlowID:         t.config.FlowID,
 			FlowDefinition: t.flowDefinition,
-		})
+
+			Labels: t.config.Labels,
+		}, t.wrestarts)
 
 	t.worker.Start(t.wctx, &t.wwg)
 	t.metrics.Add(t.worker)
@@ -239,6 +245,7 @@ func (t *Target) createSubscription(ctx context.Context) (string, error) {
 		FlowURL:    fmt.Sprintf("mxl://%s?id=%s", t.config.RemoteDomainPath, t.config.FlowID),
 		TargetInfo: info,
 		Provider:   t.config.Provider,
+		Labels:     t.config.Labels,
 	}
 
 	var res common.SubscriptionResponse
@@ -306,6 +313,7 @@ func (t *Target) req(ctx context.Context, method, path string, query map[string]
 		return err
 	}
 
+	slog.Debug(method, "url", rurl.String())
 	req := &http.Request{
 		Method: method,
 		Header: http.Header{"content-type": []string{"application/json"}},

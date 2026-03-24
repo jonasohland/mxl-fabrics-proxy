@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"net/url"
 	"os"
 	"slices"
@@ -42,12 +43,13 @@ type Remote struct {
 }
 
 type Subscription struct {
-	URL      string   `json:"url"`
-	Remote   string   `json:"remote"`
-	IDs      []string `json:"ids"`
-	ID       string   `json:"id"`
-	Provider string   `json:"provider"`
-	Node     string   `json:"node"`
+	URL      string            `json:"url"`
+	Remote   string            `json:"remote"`
+	IDs      []string          `json:"ids"`
+	ID       string            `json:"id"`
+	Provider string            `json:"provider"`
+	Node     string            `json:"node"`
+	Labels   map[string]string `json:"labels"`
 }
 
 func (s *Subscription) Equal(other Subscription) bool {
@@ -56,7 +58,8 @@ func (s *Subscription) Equal(other Subscription) bool {
 		slices.Equal(s.IDs, other.IDs) &&
 		s.ID == other.ID &&
 		s.Provider == other.Provider &&
-		s.Node == other.Node
+		s.Node == other.Node &&
+		maps.Equal(s.Labels, other.Labels)
 }
 
 func (s *Subscription) ToTargetConfig(localDomain string) (*target.TargetConfig, error) {
@@ -82,6 +85,7 @@ func (s *Subscription) ToTargetConfig(localDomain string) (*target.TargetConfig,
 		Provider:         s.Provider,
 		Node:             s.Node,
 		FlowID:           s.ID,
+		Labels:           s.Labels,
 	}, nil
 }
 
@@ -248,7 +252,6 @@ func (c *Config) normalizeSubscriptionWithRemote(domain string, sub *Subscriptio
 	}
 	if sub.Node == "" {
 		sub.Node = c.resolveNode(domain, remoteName)
-		fmt.Println(sub.Node)
 	}
 
 	if len(sub.IDs) > 0 {
@@ -258,6 +261,7 @@ func (c *Config) normalizeSubscriptionWithRemote(domain string, sub *Subscriptio
 					ID:       id,
 					URL:      remoteDomainURL,
 					Provider: sub.Provider,
+					Labels:   sub.Labels,
 				}
 			}), nil
 	} else {
@@ -266,6 +270,7 @@ func (c *Config) normalizeSubscriptionWithRemote(domain string, sub *Subscriptio
 				URL:      remoteDomainURL,
 				ID:       sub.ID,
 				Provider: sub.Provider,
+				Labels:   sub.Labels,
 			},
 		}, nil
 	}
@@ -288,11 +293,9 @@ func (c *Config) normalizeSubscriptionWithURL(domain string, sub *Subscription) 
 	}
 	if sub.Node == "" {
 		sub.Node = c.resolveNode(domain, "")
-		fmt.Println(sub.Node)
 	}
 
 	var ids []string
-
 	ids = append(ids, durl.Query()["id"]...)
 	ids = append(ids, sub.IDs...)
 	if sub.ID != "" {
@@ -306,6 +309,7 @@ func (c *Config) normalizeSubscriptionWithURL(domain string, sub *Subscription) 
 				ID:       id,
 				Provider: sub.Provider,
 				Node:     sub.Node,
+				Labels:   sub.Labels,
 			}
 		},
 	), nil

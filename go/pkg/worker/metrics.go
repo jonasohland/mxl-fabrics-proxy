@@ -87,6 +87,7 @@ func (w *ProxyWorker) GetMetrics(ctx context.Context) (*MetricCollection, error)
 			"flowID":    w.config.FlowID,
 		},
 	}
+	coll.Labels = lo.Assign(coll.Labels, w.config.Labels)
 
 	scanner := bufio.NewScanner(conn)
 	for scanner.Scan() {

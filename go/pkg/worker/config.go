@@ -12,6 +12,8 @@ type Config struct {
 	FlowDefinition string `json:"flow_def"`
 	FlowID         string `json:"flow_id"`
 	EFAUseWait     bool   `json:"efa_use_wait"`
+
+	Labels map[string]string `json:"labels"`
 }
 
 func (c *Config) IsInitiator() bool {
