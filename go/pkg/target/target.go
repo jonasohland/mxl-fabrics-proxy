@@ -17,6 +17,7 @@ import (
 	"github.com/jonasohland/mxl-fabrics-proxy/go/pkg/metrics"
 	"github.com/jonasohland/mxl-fabrics-proxy/go/pkg/server"
 	"github.com/jonasohland/mxl-fabrics-proxy/go/pkg/worker"
+	"github.com/samber/lo"
 )
 
 type Targets struct {
@@ -211,6 +212,8 @@ func (t *Target) getFlowDefinition(ctx context.Context) error {
 	}
 
 	t.flowDefinition = buf.String()
+	t.config.Labels = lo.Assign(t.config.Labels, flow.FlowDefinition.ToLabels())
+
 	return nil
 }
 

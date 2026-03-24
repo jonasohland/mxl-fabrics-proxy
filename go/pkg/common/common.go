@@ -3,6 +3,7 @@ package common
 import (
 	"fmt"
 	"net/url"
+	"strings"
 
 	"github.com/jonasohland/mxl-fabrics-proxy/go/pkg/server"
 )
@@ -67,6 +68,28 @@ type SubscriptionRequest struct {
 
 type SubscriptionResponse struct {
 	ID string `json:"id"`
+}
+
+func (f *FlowDefinition) ToLabels() map[string]string {
+	out := map[string]string{}
+
+	if f.Description != "" {
+		out["flowDescription"] = f.Description
+	}
+	if f.Label != "" {
+		out["flowLabel"] = f.Label
+	}
+
+	if len(f.Tags.GroupHint) > 0 {
+		parts := strings.Split(f.Tags.GroupHint[0], ":")
+		if len(parts) >= 2 {
+			groupMemberType := parts[len(parts)-1]
+			out["flowGroup"] = strings.Join(parts[:len(parts)-1], "")
+			out["flowGroupMemberType"] = groupMemberType
+		}
+	}
+
+	return out
 }
 
 func ParseFlowURL(flowURL string) (string, []string, error) {
