@@ -81,7 +81,7 @@ void Initiator::transferGrains(::mxl::DiscreteFlowReader reader,
 
             auto grainAccess =
                 reader.getGrain(index, std::chrono::milliseconds(100));
-            auto inputTs = ::mxlGetTime();
+            auto rxTime = ::mxlGetTime();
             spdlog::debug("transmitting grain index={} fromSlice={} toSlice={}",
                           index, 0, grainAccess.validSlices());
             if (!initiator.transfer(index, 0, grainAccess.validSlices())) {
@@ -117,9 +117,12 @@ void Initiator::transferGrains(::mxl::DiscreteFlowReader reader,
             }
 
             auto rate = reader.getRate();
-            auto epochTs = ::mxlIndexToTimestamp(&rate, index);
-            auto latency = inputTs - epochTs;
             auto grainSize = grainAccess.size();
+            auto thisIndexTS = ::mxlIndexToTimestamp(&rate, index);
+            auto latency = std::uint64_t{0};
+            if (rxTime > thisIndexTS) {
+                latency = rxTime - thisIndexTS;
+            }
             _metrics.observe(grainSize, grainSize + 4096, 1, skipped, latency);
             ++index;
         } catch (::mxl::Exception const& ex) {

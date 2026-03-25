@@ -85,7 +85,10 @@ void Target::transferGrains(::mxl::DiscreteFlowWriter writer,
 
         auto rate = writer.getRate();
         auto thisIndexTS = ::mxlIndexToTimestamp(&rate, index);
-        auto latency = rxTime - thisIndexTS;
+        auto latency = std::uint64_t{0};
+        if (rxTime > thisIndexTS) {
+            latency = rxTime - thisIndexTS;
+        }
         _metrics.observe(grainSize, grainSize + 4096, 1, skipped, latency);
     }
 }
