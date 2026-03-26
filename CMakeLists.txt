@@ -7,6 +7,7 @@ find_package(mxl CONFIG REQUIRED COMPONENTS)
 find_package(spdlog CONFIG REQUIRED)
 find_package(nlohmann_json CONFIG REQUIRED)
 pkg_check_modules(libfabric REQUIRED IMPORTED_TARGET libfabric)
+pkg_check_modules(libuuid REQUIRED IMPORTED_TARGET uuid)
 
 add_executable(mxl-fabrics-proxy-worker)
 
@@ -17,6 +18,8 @@ target_link_libraries(
 		mxl::mxl-fabrics
         spdlog::spdlog
         nlohmann_json::nlohmann_json
+        PkgConfig::libfabric
+        PkgConfig::libuuid
 )
 
 target_sources(mxl-fabrics-proxy-worker

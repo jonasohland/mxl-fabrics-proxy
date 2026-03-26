@@ -11,12 +11,12 @@ namespace mxl::proxy {
 
 class Metrics {
   public:
-    Metrics(std::string const& socketPath);
+    Metrics(std::string const& socketPath, bool withNetworkLatency);
     ~Metrics();
 
     void observe(std::uint64_t bytes, std::uint64_t payloadBytes,
                  std::uint64_t grains, std::uint64_t skipped,
-                 std::uint64_t latencyIn);
+                 std::uint64_t sourceLatency, std::uint64_t networkLatency);
 
   private:
     struct Session {
@@ -40,10 +40,14 @@ class Metrics {
     Counter _totalPayload = makeCounter("totalPayload");
     Counter _totalBytes = makeCounter("totalBytes");
     Counter _totalGrains = makeCounter("totalGrains");
-    Counter _latency = makeCounter("latency");
     Counter _skipped = makeCounter("skipped");
-    Summary _latencySummary =
-        makeSummary("latency", {0.01, 0.1, 0.5, 0.9, 0.99});
+    Counter _lastGrainIndex = makeCounter("lastGrainIndex");
+    Summary _sourceLatency =
+        makeSummary("sourceLatency", {0.01, 0.1, 0.5, 0.9, 0.99});
+    Summary _networkLatency =
+        makeSummary("networkLatency", {0.01, 0.1, 0.5, 0.9, 0.99});
+
+    bool _withNetworkLatency;
 
     std::uint64_t _sessionCounter = 0;
     std::map<std::uint64_t, Session> _sessions = {};

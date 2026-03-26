@@ -86,6 +86,9 @@ class Instance {
     [[nodiscard]] std::variant<DiscreteFlowWriter, ContinuousFlowWriter>
     createFlow(std::string const& flowDesc) const;
 
+    [[nodiscard]] std::string
+    getFlowDefinition(std::string const& flowID) const;
+
   private:
     ::mxlInstance raw() noexcept;
 
@@ -119,16 +122,23 @@ class DiscreteFlowReader {
         /** Get the number of valid payload slices in the grain. */
         [[nodiscard]] std::uint16_t validSlices() const noexcept;
 
+        /** (Bad!) Write the tx timestamp in the last 8 bytes of the reserved
+         * section of the grain header */
+        void writeTxTimestamp(std::uint64_t txTimestamp) noexcept;
+
       private:
-        Access(mxlGrainInfo, std::uint8_t const* payload);
+        Access(mxlGrainInfo, std::uint8_t* payload);
 
       private:
         friend class DiscreteFlowReader;
 
       private:
         ::mxlGrainInfo _info;
-        std::uint8_t const* _payload;
+        std::uint8_t* _payload;
     };
+
+    /** Get the flow definition for this flow. */
+    [[nodiscard]] std::string getFlowDefinition() const;
 
     /** Get the current head index of the flow */
     [[nodiscard]] std::uint64_t getHeadIndex() const;
@@ -217,6 +227,13 @@ class DiscreteFlowWriter {
 
         /** Set the number of slices of the payload that are valid */
         void validSlices(std::uint16_t validSlices) noexcept;
+
+        /** (Bad!) Write the tx timestamp to the last 8 bytes of the grain
+         * header */
+        void writeTxTimestamp(std::uint64_t txTime) noexcept;
+
+        /** Read the tx timestamp from the last 8 bytes of the grain header */
+        [[nodiscard]] std::uint64_t readTxTimestamp() const noexcept;
 
       private:
         friend class DiscreteFlowWriter;

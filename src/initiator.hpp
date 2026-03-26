@@ -17,6 +17,8 @@ class Initiator {
     void run(utils::ExitSignal sig);
 
     ::mxl::DiscreteFlowReader openReader();
+    ::mxl::DiscreteFlowWriter
+    openWriter(::mxl::DiscreteFlowReader const& reader);
 
     ::mxl::fabrics::DiscreteFlowInitiator
     createInitiator(::mxl::DiscreteFlowReader&);
@@ -24,10 +26,13 @@ class Initiator {
     void connect(::mxl::fabrics::DiscreteFlowInitiator&, utils::ExitSignal sig);
 
     void transferGrains(::mxl::DiscreteFlowReader,
+                        std::optional<::mxl::DiscreteFlowWriter>,
                         ::mxl::fabrics::DiscreteFlowInitiator,
                         utils::ExitSignal sig);
 
   private:
+    [[nodiscard]] bool measurePreciseNetworkLatency() const noexcept;
+
     std::uint64_t _lastIndex = 0;
 
   private:

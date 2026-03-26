@@ -10,7 +10,8 @@ RUN apt-get update && \
         pkg-config \
         libspdlog-dev \
         picojson-dev \
-        nlohmann-json3-dev
+        nlohmann-json3-dev \
+        uuid-dev
 
 RUN curl -LO https://go.dev/dl/go1.26.1.linux-amd64.tar.gz && \
     tar -C /usr/local -xzf go1.26.1.linux-amd64.tar.gz
@@ -38,6 +39,7 @@ USER 0:0
 RUN apt-get update && \
     apt-get install -y \
         libspdlog1.15 \
+        libuuid1 \
         dumb-init \
         && rm -r /var/lib/apt/lists/* 
 

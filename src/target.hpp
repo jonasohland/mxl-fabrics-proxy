@@ -29,6 +29,8 @@ class Target {
                                 utils::ExitSignal);
 
   private:
+    [[nodiscard]] bool measurePreciseNetworkLatency() const noexcept;
+
     std::uint64_t _lastIndex = 0;
 
   private:

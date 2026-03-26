@@ -15,8 +15,9 @@
 
 namespace mxl::proxy {
 
-Metrics::Metrics(std::string const& socketPath)
-    : _socketPath(socketPath) {
+Metrics::Metrics(std::string const& socketPath, bool withNetworkLatency)
+    : _socketPath(socketPath),
+      _withNetworkLatency(withNetworkLatency) {
     _epollfd = ::epoll_create1(EPOLL_CLOEXEC);
     if (_epollfd < 0) {
         throw std::system_error{errno, std::generic_category(),
@@ -71,14 +72,15 @@ Metrics::~Metrics() {
 
 void Metrics::observe(std::uint64_t bytes, std::uint64_t payloadBytes,
                       std::uint64_t grains, std::uint64_t skipped,
-                      std::uint64_t latencyIn) {
+                      std::uint64_t sourceLatency,
+                      std::uint64_t networkLatency) {
     std::lock_guard lock{_m};
     _totalBytes.add(bytes);
     _totalPayload.add(payloadBytes);
     _totalGrains.add(grains);
     _skipped.add(skipped);
-    _latency.add(latencyIn);
-    _latencySummary.observe(latencyIn);
+    _sourceLatency.observe(sourceLatency);
+    _networkLatency.observe(networkLatency);
 }
 
 void Metrics::run() {
@@ -189,8 +191,11 @@ std::string Metrics::scrape() const noexcept {
     try {
         std::stringstream ss{};
         ss << std::setprecision(std::numeric_limits<double>::digits10);
-        ss << _totalBytes << _totalPayload << _totalGrains << _latency
-           << _skipped << _latencySummary;
+        ss << _totalBytes << _totalPayload << _totalGrains << _skipped
+           << _sourceLatency;
+        if (_withNetworkLatency) {
+            ss << _networkLatency;
+        }
         return ss.str();
     } catch (std::exception const& ex) {
         return std::format("scrape error: {}", ex.what());

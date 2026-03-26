@@ -28,7 +28,11 @@ Target::Target(Config config)
     : _mxl(config.domain),
       _fabrics(_mxl),
       _config(config),
-      _metrics(config.metricsSocket) {
+      _metrics(config.metricsSocket, !config.noPreciseNetworkLatency) {
+}
+
+bool Target::measurePreciseNetworkLatency() const noexcept {
+    return !_config.noPreciseNetworkLatency;
 }
 
 void Target::run(utils::ExitSignal sig) {
@@ -59,18 +63,28 @@ void Target::transferGrains(::mxl::DiscreteFlowWriter writer,
                             ::mxl::fabrics::DiscreteFlowTarget target,
                             utils::ExitSignal sig) {
     for (;;) {
+        auto txTime = std::uint64_t{0};
+        auto sourceLatency = std::uint64_t{0};
+        auto networkLatency = std::uint64_t{0};
+        auto grainSize = std::uint64_t{0};
+
+        // start reading the next grain
         auto index = readNextGrain(target, sig);
         auto rxTime = ::mxlGetTime();
         if (sig.shouldExit()) {
             return;
         }
-        std::uint64_t grainSize = 0;
         {
             auto access = writer.openGrain(index);
             grainSize = access.size();
             spdlog::debug(
                 "comitting grain validSlices={} totalSlices={} index={}",
                 access.validSlices(), access.totalSlices(), index);
+
+            // read the tx timestamp from the grain header if enabled
+            if (measurePreciseNetworkLatency()) {
+                txTime = access.readTxTimestamp();
+            }
             // committed when access object it dropped
         }
 
@@ -83,13 +97,20 @@ void Target::transferGrains(::mxl::DiscreteFlowWriter writer,
             _lastIndex = index;
         }
 
+        // calculate the source latency
         auto rate = writer.getRate();
-        auto thisIndexTS = ::mxlIndexToTimestamp(&rate, index);
-        auto latency = std::uint64_t{0};
-        if (rxTime > thisIndexTS) {
-            latency = rxTime - thisIndexTS;
+        auto grainTime = ::mxlIndexToTimestamp(&rate, index);
+        if (rxTime > grainTime) {
+            sourceLatency = rxTime - grainTime;
         }
-        _metrics.observe(grainSize, grainSize + 4096, 1, skipped, latency);
+
+        // calculate the network latency
+        if (measurePreciseNetworkLatency() && (rxTime > txTime)) {
+            networkLatency = rxTime - txTime;
+        }
+
+        _metrics.observe(grainSize, grainSize + 4096, 1, skipped, sourceLatency,
+                         networkLatency);
     }
 }
 
@@ -102,12 +123,7 @@ std::uint64_t Target::readNextGrain(::mxl::fabrics::DiscreteFlowTarget& target,
         if (sig.shouldExit()) {
             return 0;
         }
-        if (_config.provider == MXL_FABRICS_PROVIDER_EFA &&
-            !_config.efaUseWait) {
-            res = target.readGrainNonBlocking();
-        } else {
-            res = target.readGrain(std::chrono::milliseconds(500));
-        }
+        res = target.readGrain(std::chrono::milliseconds(500));
         if (!res) {
             auto waitTime = std::chrono::system_clock::now() - lastRead;
             if (waitTime > std::chrono::seconds(10)) {

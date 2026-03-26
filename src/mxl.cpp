@@ -4,7 +4,9 @@
 #include <mxl/flowinfo.h>
 #include <mxl/mxl.h>
 #include <mxl/time.h>
+#include <spdlog/spdlog.h>
 #include <stdexcept>
+#include <uuid/uuid.h>
 
 namespace mxl {
 
@@ -167,6 +169,20 @@ Instance::createFlow(std::string const& flowDef) const {
     return DiscreteFlowWriter{writer, info, *this};
 }
 
+std::string Instance::getFlowDefinition(std::string const& flowID) const {
+    std::size_t bufferSize = 0;
+    auto res =
+        ::mxlGetFlowDef(_inner->instance, flowID.c_str(), nullptr, &bufferSize);
+    if (res != MXL_ERR_INVALID_ARG) {
+        throw Exception(res, "failed to get flow description buffer length");
+    }
+    auto buffer = std::string(bufferSize, ' ');
+    mxl(::mxlGetFlowDef, "failed to get flow description", _inner->instance,
+        flowID.c_str(), buffer.data(), &bufferSize);
+    buffer.resize(bufferSize);
+    return buffer;
+}
+
 ::mxlInstance Instance::raw() noexcept {
     return _inner->instance;
 }
@@ -196,6 +212,13 @@ DiscreteFlowReader::~DiscreteFlowReader() {
 
 ::mxlFlowReader DiscreteFlowReader::raw() {
     return _reader;
+}
+
+std::string DiscreteFlowReader::getFlowDefinition() const {
+    auto flowID = std::string(37, '\0');
+    uuid_unparse_lower(_configInfo.common.id, flowID.data());
+    flowID.resize(36);
+    return _instance.getFlowDefinition(flowID);
 }
 
 std::uint64_t DiscreteFlowReader::getHeadIndex() const {
@@ -249,8 +272,7 @@ DiscreteFlowReader::getGrainSlicesNonBlocking(std::uint64_t index,
     return {info, payload};
 }
 
-DiscreteFlowReader::Access::Access(::mxlGrainInfo info,
-                                   const std::uint8_t* payload)
+DiscreteFlowReader::Access::Access(::mxlGrainInfo info, std::uint8_t* payload)
     : _info(info),
       _payload(payload) {
 }
@@ -380,6 +402,14 @@ std::uint16_t DiscreteFlowWriter::Access::validSlices() const noexcept {
 void DiscreteFlowWriter::Access::validSlices(
     std::uint16_t validSlices) noexcept {
     _info.validSlices = validSlices;
+}
+
+void DiscreteFlowWriter::Access::writeTxTimestamp(std::uint64_t ts) noexcept {
+    *reinterpret_cast<std::uint64_t*>(_payload - sizeof(std::uint64_t)) = ts;
+}
+
+std::uint64_t DiscreteFlowWriter::Access::readTxTimestamp() const noexcept {
+    return *reinterpret_cast<std::uint64_t*>(_payload - sizeof(std::uint64_t));
 }
 
 } // namespace mxl
