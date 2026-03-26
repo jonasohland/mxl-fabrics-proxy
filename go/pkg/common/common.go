@@ -60,10 +60,11 @@ type DomainInfo struct {
 }
 
 type SubscriptionRequest struct {
-	FlowURL    string            `json:"flow_url"`
-	TargetInfo string            `json:"target_info"`
-	Provider   string            `json:"provider"`
-	Labels     map[string]string `json:"labels"`
+	FlowURL         string            `json:"flow_url"`
+	TargetInfo      string            `json:"target_info"`
+	Provider        string            `json:"provider"`
+	Labels          map[string]string `json:"labels"`
+	NoNetLatMeasure bool              `json:"no_network_latency_measurement"`
 }
 
 type SubscriptionResponse struct {

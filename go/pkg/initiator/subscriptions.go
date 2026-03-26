@@ -241,16 +241,17 @@ func (s *Subscriptions) createSuscription(req *common.SubscriptionRequest) (stri
 	}
 
 	config := worker.Config{
-		Target:         false,
-		ProxyID:        cookie,
-		Node:           info.Node,
-		Service:        "",
-		Provider:       req.Provider,
-		Domain:         info.Path,
-		TargetInfo:     req.TargetInfo,
-		FlowDefinition: "",
-		FlowID:         id,
-		EFAUseWait:     true,
+		Target:          false,
+		ProxyID:         cookie,
+		Node:            info.Node,
+		Service:         "",
+		Provider:        req.Provider,
+		Domain:          info.Path,
+		TargetInfo:      req.TargetInfo,
+		FlowDefinition:  "",
+		FlowID:          id,
+		EFAUseWait:      true,
+		NoNetLatMeasure: req.NoNetLatMeasure,
 
 		Labels: req.Labels,
 	}

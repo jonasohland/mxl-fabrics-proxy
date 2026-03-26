@@ -21,7 +21,7 @@ struct Config {
     std::string domain;
     std::string providerStr;
     ::mxlFabricsProvider provider;
-    bool noPreciseNetworkLatency;
+    bool noNetworkLatencyMeasurement;
 
     [[nodiscard]] bool isInitiator() const noexcept;
     [[nodiscard]] bool isTarget() const noexcept;

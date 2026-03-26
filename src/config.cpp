@@ -44,7 +44,8 @@ Config Config::read(nlohmann::json config) {
     out.flowId = getString(config, "flow_id", "");
     out.domain = getString(config, "domain");
     out.providerStr = getString(config, "provider", "tcp");
-    out.noPreciseNetworkLatency = getBool(config, "no_precise_network_latency");
+    out.noNetworkLatencyMeasurement =
+        getBool(config, "no_network_latency_measurement");
 
     ::mxl::mxl(::mxlFabricsProviderFromString,
                "failed to parse provider string", out.providerStr.c_str(),

@@ -43,13 +43,14 @@ type Remote struct {
 }
 
 type Subscription struct {
-	URL      string            `json:"url"`
-	Remote   string            `json:"remote"`
-	IDs      []string          `json:"ids"`
-	ID       string            `json:"id"`
-	Provider string            `json:"provider"`
-	Node     string            `json:"node"`
-	Labels   map[string]string `json:"labels"`
+	URL             string            `json:"url"`
+	Remote          string            `json:"remote"`
+	IDs             []string          `json:"ids"`
+	ID              string            `json:"id"`
+	Provider        string            `json:"provider"`
+	Node            string            `json:"node"`
+	Labels          map[string]string `json:"labels"`
+	NoNetLatMeasure bool              `json:"no_network_latency_measurement"`
 }
 
 func (s *Subscription) Equal(other Subscription) bool {
@@ -86,12 +87,14 @@ func (s *Subscription) ToTargetConfig(localDomain string) (*target.TargetConfig,
 		Node:             s.Node,
 		FlowID:           s.ID,
 		Labels:           s.Labels,
+		NoNetLatMeasure:  s.NoNetLatMeasure,
 	}, nil
 }
 
 type Defaults struct {
-	Node     string `json:"node"`
-	Provider string `json:"provider"`
+	Node            string `json:"node"`
+	Provider        string `json:"provider"`
+	NoNetLatMeasure bool   `json:"no_network_latency_measurement"`
 }
 
 type state struct {
@@ -258,19 +261,21 @@ func (c *Config) normalizeSubscriptionWithRemote(domain string, sub *Subscriptio
 		return lo.Map(sub.IDs,
 			func(id string, _ int) Subscription {
 				return Subscription{
-					ID:       id,
-					URL:      remoteDomainURL,
-					Provider: sub.Provider,
-					Labels:   sub.Labels,
+					ID:              id,
+					URL:             remoteDomainURL,
+					Provider:        sub.Provider,
+					Labels:          sub.Labels,
+					NoNetLatMeasure: sub.NoNetLatMeasure || c.Defaults.NoNetLatMeasure,
 				}
 			}), nil
 	} else {
 		return []Subscription{
 			{
-				URL:      remoteDomainURL,
-				ID:       sub.ID,
-				Provider: sub.Provider,
-				Labels:   sub.Labels,
+				URL:             remoteDomainURL,
+				ID:              sub.ID,
+				Provider:        sub.Provider,
+				Labels:          sub.Labels,
+				NoNetLatMeasure: sub.NoNetLatMeasure || c.Defaults.NoNetLatMeasure,
 			},
 		}, nil
 	}
@@ -305,11 +310,12 @@ func (c *Config) normalizeSubscriptionWithURL(domain string, sub *Subscription) 
 	return lo.Map(lo.Uniq(ids),
 		func(id string, _ int) Subscription {
 			return Subscription{
-				URL:      sanitizedURL,
-				ID:       id,
-				Provider: sub.Provider,
-				Node:     sub.Node,
-				Labels:   sub.Labels,
+				URL:             sanitizedURL,
+				ID:              id,
+				Provider:        sub.Provider,
+				Node:            sub.Node,
+				Labels:          sub.Labels,
+				NoNetLatMeasure: sub.NoNetLatMeasure || c.Defaults.NoNetLatMeasure,
 			}
 		},
 	), nil
@@ -396,6 +402,8 @@ func (c *Config) merge(other *Config) {
 
 		c.Defaults.Provider = other.Defaults.Provider
 	}
+
+	c.Defaults.NoNetLatMeasure = c.Defaults.NoNetLatMeasure || other.Defaults.NoNetLatMeasure
 
 	for name, domain := range other.Domains {
 		_, ok := c.Domains[name]

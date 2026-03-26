@@ -18,7 +18,7 @@ Initiator::Initiator(Config config)
 }
 
 bool Initiator::measurePreciseNetworkLatency() const noexcept {
-    return !_config.noPreciseNetworkLatency;
+    return !_config.noNetworkLatencyMeasurement;
 }
 
 void Initiator::run(utils::ExitSignal sig) {

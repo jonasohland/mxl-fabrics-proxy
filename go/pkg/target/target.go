@@ -34,6 +34,7 @@ type TargetConfig struct {
 	Provider         string
 	Node             string
 	FlowID           string
+	NoNetLatMeasure  bool
 	Labels           map[string]string
 
 	ID string
@@ -174,13 +175,14 @@ func (t *Target) startWorker() error {
 	t.wcancel = wcancel
 	t.worker = worker.NewWorker(
 		worker.Config{
-			Target:         true,
-			ProxyID:        t.config.ID,
-			Domain:         t.config.LocalDomainPath,
-			Provider:       t.config.Provider,
-			Node:           t.config.Node,
-			FlowID:         t.config.FlowID,
-			FlowDefinition: t.flowDefinition,
+			Target:          true,
+			ProxyID:         t.config.ID,
+			Domain:          t.config.LocalDomainPath,
+			Provider:        t.config.Provider,
+			Node:            t.config.Node,
+			FlowID:          t.config.FlowID,
+			FlowDefinition:  t.flowDefinition,
+			NoNetLatMeasure: t.config.NoNetLatMeasure,
 
 			Labels: t.config.Labels,
 		}, t.wrestarts)
@@ -245,10 +247,11 @@ func (t *Target) createSubscription(ctx context.Context) (string, error) {
 	}
 
 	req := common.SubscriptionRequest{
-		FlowURL:    fmt.Sprintf("mxl://%s?id=%s", t.config.RemoteDomainPath, t.config.FlowID),
-		TargetInfo: info,
-		Provider:   t.config.Provider,
-		Labels:     t.config.Labels,
+		FlowURL:         fmt.Sprintf("mxl://%s?id=%s", t.config.RemoteDomainPath, t.config.FlowID),
+		TargetInfo:      info,
+		Provider:        t.config.Provider,
+		Labels:          t.config.Labels,
+		NoNetLatMeasure: t.config.NoNetLatMeasure,
 	}
 
 	var res common.SubscriptionResponse

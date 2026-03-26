@@ -28,11 +28,11 @@ Target::Target(Config config)
     : _mxl(config.domain),
       _fabrics(_mxl),
       _config(config),
-      _metrics(config.metricsSocket, !config.noPreciseNetworkLatency) {
+      _metrics(config.metricsSocket, !config.noNetworkLatencyMeasurement) {
 }
 
 bool Target::measurePreciseNetworkLatency() const noexcept {
-    return !_config.noPreciseNetworkLatency;
+    return !_config.noNetworkLatencyMeasurement;
 }
 
 void Target::run(utils::ExitSignal sig) {
