@@ -65,6 +65,7 @@ type SubscriptionRequest struct {
 	Provider        string            `json:"provider"`
 	Labels          map[string]string `json:"labels"`
 	NoNetLatMeasure bool              `json:"no_network_latency_measurement"`
+	SchedPrio       *int              `json:"sched_prio"`
 }
 
 type SubscriptionResponse struct {

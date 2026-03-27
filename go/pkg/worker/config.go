@@ -13,6 +13,7 @@ type Config struct {
 	FlowID          string `json:"flow_id"`
 	EFAUseWait      bool   `json:"efa_use_wait"`
 	NoNetLatMeasure bool   `json:"no_network_latency_measurement"`
+	SchedPrio       *int   `json:"sched_prio"`
 
 	Labels map[string]string `json:"labels"`
 }

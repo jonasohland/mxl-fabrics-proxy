@@ -252,6 +252,7 @@ func (s *Subscriptions) createSuscription(req *common.SubscriptionRequest) (stri
 		FlowID:          id,
 		EFAUseWait:      true,
 		NoNetLatMeasure: req.NoNetLatMeasure,
+		SchedPrio:       req.SchedPrio,
 
 		Labels: req.Labels,
 	}

@@ -1,4 +1,5 @@
 #include "target.hpp"
+#include "rt.hpp"
 #include <fstream>
 #include <mxl/time.h>
 #include <spdlog/spdlog.h>
@@ -39,6 +40,7 @@ void Target::run(utils::ExitSignal sig) {
     auto writer = createWriter();
     auto [target, targetInfo] = createTarget(writer);
     writeFile(_config.targetInfo, targetInfo.toString());
+    auto _ = ScopedRTScheduling{_config.schedPrio};
     transferGrains(std::move(writer), std::move(target), sig);
 }
 

@@ -6,6 +6,14 @@
 
 namespace {
 
+int getInt(nlohmann::json const& v, std::string_view key, int def) {
+    if (auto it = v.find(key); it != v.end() && it->is_number()) {
+        return it->get<int>();
+    }
+
+    return def;
+}
+
 std::string getString(nlohmann::json const& v, std::string_view key) {
     if (auto it = v.find(key); it != v.end() && it->is_string()) {
         return it->get<std::string>();
@@ -46,6 +54,8 @@ Config Config::read(nlohmann::json config) {
     out.providerStr = getString(config, "provider", "tcp");
     out.noNetworkLatencyMeasurement =
         getBool(config, "no_network_latency_measurement");
+    out.schedPrio =
+        getInt(config, "sched_prio", std::numeric_limits<int>::min());
 
     ::mxl::mxl(::mxlFabricsProviderFromString,
                "failed to parse provider string", out.providerStr.c_str(),

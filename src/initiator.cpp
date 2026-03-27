@@ -1,5 +1,6 @@
 #include "initiator.hpp"
 #include "fabrics.hpp"
+#include "rt.hpp"
 #include "util.hpp"
 #include <chrono>
 #include <mxl/time.h>
@@ -32,6 +33,7 @@ void Initiator::run(utils::ExitSignal sig) {
     auto targetInfo = ::mxl::fabrics::TargetInfo::parse(_config.targetInfo);
     initiator.addTarget(targetInfo);
     connect(initiator, sig);
+    auto _ = ScopedRTScheduling{_config.schedPrio};
     transferGrains(std::move(reader), std::move(writer), std::move(initiator),
                    sig);
 }

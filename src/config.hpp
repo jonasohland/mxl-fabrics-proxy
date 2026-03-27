@@ -22,6 +22,7 @@ struct Config {
     std::string providerStr;
     ::mxlFabricsProvider provider;
     bool noNetworkLatencyMeasurement;
+    int schedPrio;
 
     [[nodiscard]] bool isInitiator() const noexcept;
     [[nodiscard]] bool isTarget() const noexcept;

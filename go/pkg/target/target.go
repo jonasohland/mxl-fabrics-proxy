@@ -36,6 +36,7 @@ type TargetConfig struct {
 	FlowID           string
 	NoNetLatMeasure  bool
 	Labels           map[string]string
+	SchedPrio        *int
 
 	ID string
 }
@@ -183,6 +184,7 @@ func (t *Target) startWorker() error {
 			FlowID:          t.config.FlowID,
 			FlowDefinition:  t.flowDefinition,
 			NoNetLatMeasure: t.config.NoNetLatMeasure,
+			SchedPrio:       t.config.SchedPrio,
 
 			Labels: t.config.Labels,
 		}, t.wrestarts)
@@ -252,6 +254,7 @@ func (t *Target) createSubscription(ctx context.Context) (string, error) {
 		Provider:        t.config.Provider,
 		Labels:          t.config.Labels,
 		NoNetLatMeasure: t.config.NoNetLatMeasure,
+		SchedPrio:       t.config.SchedPrio,
 	}
 
 	var res common.SubscriptionResponse

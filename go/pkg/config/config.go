@@ -51,6 +51,7 @@ type Subscription struct {
 	Node            string            `json:"node"`
 	Labels          map[string]string `json:"labels"`
 	NoNetLatMeasure bool              `json:"no_network_latency_measurement"`
+	SchedPrio       *int              `json:"sched_prio"`
 }
 
 func (s *Subscription) Equal(other Subscription) bool {
@@ -88,6 +89,7 @@ func (s *Subscription) ToTargetConfig(localDomain string) (*target.TargetConfig,
 		FlowID:           s.ID,
 		Labels:           s.Labels,
 		NoNetLatMeasure:  s.NoNetLatMeasure,
+		SchedPrio:        s.SchedPrio,
 	}, nil
 }
 
@@ -95,6 +97,7 @@ type Defaults struct {
 	Node            string `json:"node"`
 	Provider        string `json:"provider"`
 	NoNetLatMeasure bool   `json:"no_network_latency_measurement"`
+	SchedPrio       *int   `json:"sched_prio"`
 }
 
 type state struct {
@@ -227,6 +230,14 @@ func (c *Config) normalizeSubscription(domain string, sub *Subscription) ([]Subs
 	}
 }
 
+func (c *Config) orDefaultSchedPrio(v *int) *int {
+	if v == nil && c.Defaults.SchedPrio != nil {
+		return c.Defaults.SchedPrio
+	}
+
+	return v
+}
+
 func (c *Config) normalizeSubscriptionWithRemote(domain string, sub *Subscription) ([]Subscription, error) {
 	if sub.URL != "" {
 		return nil, fmt.Errorf("%w: cannot have both url and remote field", ErrInvalidSubscription)
@@ -266,6 +277,7 @@ func (c *Config) normalizeSubscriptionWithRemote(domain string, sub *Subscriptio
 					Provider:        sub.Provider,
 					Labels:          sub.Labels,
 					NoNetLatMeasure: sub.NoNetLatMeasure || c.Defaults.NoNetLatMeasure,
+					SchedPrio:       c.orDefaultSchedPrio(sub.SchedPrio),
 				}
 			}), nil
 	} else {
@@ -276,6 +288,7 @@ func (c *Config) normalizeSubscriptionWithRemote(domain string, sub *Subscriptio
 				Provider:        sub.Provider,
 				Labels:          sub.Labels,
 				NoNetLatMeasure: sub.NoNetLatMeasure || c.Defaults.NoNetLatMeasure,
+				SchedPrio:       c.orDefaultSchedPrio(sub.SchedPrio),
 			},
 		}, nil
 	}
@@ -316,6 +329,7 @@ func (c *Config) normalizeSubscriptionWithURL(domain string, sub *Subscription) 
 				Node:            sub.Node,
 				Labels:          sub.Labels,
 				NoNetLatMeasure: sub.NoNetLatMeasure || c.Defaults.NoNetLatMeasure,
+				SchedPrio:       c.orDefaultSchedPrio(sub.SchedPrio),
 			}
 		},
 	), nil
@@ -425,6 +439,10 @@ func (c *Config) merge(other *Config) {
 
 	for localDomain, subscriptions := range other.Subscriptions {
 		c.Subscriptions[localDomain] = append(c.Subscriptions[localDomain], subscriptions...)
+	}
+
+	if other.Defaults.SchedPrio != nil {
+		c.Defaults.SchedPrio = other.Defaults.SchedPrio
 	}
 }
 
