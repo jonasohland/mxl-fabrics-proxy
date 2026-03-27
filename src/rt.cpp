@@ -13,11 +13,7 @@ ScopedRTScheduling::ScopedRTScheduling(int prio) {
         return;
     }
 
-    auto min = ::sched_get_priority_max(SCHED_FIFO);
-    auto max = ::sched_get_priority_min(SCHED_FIFO);
-    auto prioClamped = std::clamp(prio, min, max);
     auto param = ::sched_param{};
-
     _policyBefore = ::sched_getscheduler(0);
     if (_policyBefore < 0) {
         auto const error = errno;
@@ -33,7 +29,7 @@ ScopedRTScheduling::ScopedRTScheduling(int prio) {
 
     _prioBefore = param.sched_priority;
 
-    param.sched_priority = prioClamped;
+    param.sched_priority = prio;
     if (::sched_setscheduler(0, SCHED_FIFO, &param) < 0) {
         auto const error = errno;
         throw std::system_error{error, std::generic_category(),
