@@ -90,6 +90,7 @@ void Initiator::transferGrains(::mxl::DiscreteFlowReader reader,
                                ::mxl::fabrics::DiscreteFlowInitiator initiator,
                                utils::ExitSignal sig) {
     std::uint64_t index = 0;
+    auto lastSuccessfullGrainRead = std::chrono::steady_clock::now();
     for (;;) {
         try {
             if (sig.shouldExit()) {
@@ -98,6 +99,7 @@ void Initiator::transferGrains(::mxl::DiscreteFlowReader reader,
 
             auto grainAccess =
                 reader.getGrain(index, std::chrono::milliseconds(100));
+            lastSuccessfullGrainRead = std::chrono::steady_clock::now();
             auto rxTime = ::mxlGetTime();
             if (measurePreciseNetworkLatency()) {
                 auto writeAccess = writer->openGrain(index);
@@ -143,8 +145,16 @@ void Initiator::transferGrains(::mxl::DiscreteFlowReader reader,
                              sourceLatency, 0);
             ++index;
         } catch (::mxl::Exception const& ex) {
+            auto timeSinceLastGrainRead =
+                std::chrono::steady_clock::now() - lastSuccessfullGrainRead;
+            if (timeSinceLastGrainRead > std::chrono::seconds(10)) {
+                throw Exception{MXL_ERR_TIMEOUT,
+                                "timed out waiting for a grain to be published "
+                                "to the flow"};
+            }
+
             if (ex.isTooEarly() || ex.isTooLate()) {
-                index = reader.getHeadIndex();
+                index = reader.getHeadIndex() + 1;
                 continue;
             }
 

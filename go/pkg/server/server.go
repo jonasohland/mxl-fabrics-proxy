@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/json"
@@ -9,6 +10,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -136,6 +138,9 @@ func Error(w http.ResponseWriter, err error) {
 }
 
 func Response[T any](w http.ResponseWriter, t *T) {
+	buf := bytes.NewBuffer(nil)
+	_ = json.NewEncoder(buf).Encode(t)
+	w.Header().Add("Content-Length", strconv.Itoa(buf.Len()))
 	w.WriteHeader(http.StatusOK)
-	_ = json.NewEncoder(w).Encode(t)
+	_, _ = w.Write(buf.Bytes())
 }

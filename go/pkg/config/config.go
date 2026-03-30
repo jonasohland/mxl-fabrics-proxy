@@ -61,7 +61,10 @@ func (s *Subscription) Equal(other Subscription) bool {
 		s.ID == other.ID &&
 		s.Provider == other.Provider &&
 		s.Node == other.Node &&
-		maps.Equal(s.Labels, other.Labels)
+		maps.Equal(s.Labels, other.Labels) &&
+		s.NoNetLatMeasure == other.NoNetLatMeasure &&
+		((s.SchedPrio == nil && other.SchedPrio == nil) ||
+			s.SchedPrio != nil && other.SchedPrio != nil && *s.SchedPrio == *other.SchedPrio)
 }
 
 func (s *Subscription) ToTargetConfig(localDomain string) (*target.TargetConfig, error) {

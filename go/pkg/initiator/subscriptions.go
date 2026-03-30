@@ -133,6 +133,7 @@ func (s *Subscriptions) Mux(mux *http.ServeMux) {
 }
 
 func (s *Subscriptions) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	defer func() { _ = r.Body.Close() }()
 	parseRequest := func() (*common.SubscriptionRequest, error) {
 		var req common.SubscriptionRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -197,7 +198,7 @@ func (s *Subscriptions) Remove(id string) error {
 
 	_, ok := s.subscriptions[id]
 	if !ok {
-		return server.ErrNotFound
+		return nil
 	}
 
 	slog.Info("delete subscription", "id", id)

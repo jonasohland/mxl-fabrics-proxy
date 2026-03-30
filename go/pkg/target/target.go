@@ -330,6 +330,7 @@ func (t *Target) req(ctx context.Context, method, path string, query map[string]
 	}
 
 	req = req.WithContext(ctx)
+	req.Close = true
 
 	if in != nil {
 		buf := bytes.NewBuffer(nil)
