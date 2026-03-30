@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -169,6 +170,10 @@ func (t *Target) startWorker() error {
 		t.wcancel()
 		t.wwg.Wait()
 		t.wrestarts = t.worker.NumRestarts()
+	}
+
+	if err := os.MkdirAll(t.config.LocalDomainPath, 0755); err != nil {
+		slog.Warn("failed to create local domain path", "error", err, "path", t.config.LocalDomainPath)
 	}
 
 	wctx, wcancel := context.WithCancel(context.Background())
