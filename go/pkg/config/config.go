@@ -249,13 +249,16 @@ func (c *Config) orDefaultSchedPrio(v *int) *int {
 	return v
 }
 
-func (c *Config) getLabels(domainName string, remoteName string) map[string]string {
+func (c *Config) getLabels(domainURL string, remoteName string) map[string]string {
 	labels := c.Defaults.Labels
 
-	domain, ok := c.Domains[domainName]
-	if ok {
-		labels = lo.Assign(labels, domain.Labels)
+	for _, domain := range c.Domains {
+		if domain.URL == domainURL {
+			labels = lo.Assign(labels, domain.Labels)
+			break
+		}
 	}
+
 	remoteObj, ok := c.Remotes[remoteName]
 	if ok {
 		labels = lo.Assign(labels, remoteObj.Labels)
