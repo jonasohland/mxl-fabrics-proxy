@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -22,6 +23,7 @@ import (
 )
 
 type Targets struct {
+	mu      sync.Mutex
 	ctx     context.Context
 	metrics *metrics.Metrics
 
@@ -38,16 +40,29 @@ type TargetConfig struct {
 	NoNetLatMeasure  bool
 	Labels           map[string]string
 	SchedPrio        *int
+	Tracing          bool
 
 	ID string
 }
 
+type RequestError struct {
+	Method  string
+	URL     string
+	Code    int
+	Message string
+}
+
+func (r *RequestError) Error() string {
+	return fmt.Sprintf("request failed: %s %s: (code %d): %s", r.Method, r.URL, r.Code, r.Message)
+}
+
 func NewTargets(ctx context.Context, metrics *metrics.Metrics) *Targets {
-	return &Targets{ctx: ctx, metrics: metrics, targets: map[string]*Target{}}
+	return &Targets{mu: sync.Mutex{}, ctx: ctx, metrics: metrics, targets: map[string]*Target{}}
 }
 
 func (t *Targets) Create(c *TargetConfig) (string, error) {
-	slog.Info("create target", "config", c)
+	t.mu.Lock()
+	defer t.mu.Unlock()
 
 	id, err := common.NewCookie()
 	if err != nil {
@@ -61,17 +76,29 @@ func (t *Targets) Create(c *TargetConfig) (string, error) {
 }
 
 func (t *Targets) Destroy(id string) {
+	target := t.remove(id)
+	if target != nil {
+		target.Stop()
+	}
+}
+
+func (t *Targets) remove(id string) *Target {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
 	target, ok := t.targets[id]
 	if !ok {
-		return
+		return nil
 	}
 
-	target.Stop()
+	delete(t.targets, id)
+	return target
 }
 
 type Target struct {
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
+	log    *slog.Logger
 
 	client  *http.Client
 	metrics *metrics.Metrics
@@ -92,9 +119,22 @@ type Target struct {
 func NewTarget(ctx context.Context, metrics *metrics.Metrics, config *TargetConfig) *Target {
 	tctx, tcancel := context.WithCancel(ctx)
 
+	logger := slog.With("module", "in")
+	if config.Tracing {
+		for k, v := range config.Labels {
+			logger = logger.With(k, v)
+		}
+	}
+
+	logger = logger.With("flow-id", config.FlowID,
+		"local-domain", config.LocalDomainPath,
+		"remote-domain", config.RemoteDomainPath,
+		"remote-host", config.RemoteHost)
+
 	t := &Target{
 		cancel: tcancel,
 		wg:     sync.WaitGroup{},
+		log:    logger,
 
 		client:  &http.Client{Timeout: 5 * time.Second},
 		metrics: metrics,
@@ -128,6 +168,8 @@ func (t *Target) run(ctx context.Context, wg *sync.WaitGroup) {
 	defer wg.Done()
 	defer t.cleanup()
 
+	t.log.Info("target created")
+
 	wait := time.Duration(0)
 	for {
 		select {
@@ -140,12 +182,17 @@ func (t *Target) run(ctx context.Context, wg *sync.WaitGroup) {
 		t.cleanup()
 
 		if err := t.getFlowDefinition(ctx); err != nil {
-			slog.Error("failed to get flow definition", "error", err)
+			reqErr, ok := errors.AsType[*RequestError](err)
+			if ok && reqErr.Code == http.StatusNotFound {
+				continue
+			}
+
+			t.log.Error("failed to get flow definition", "error", err)
 			continue
 		}
 
 		if err := t.startWorker(); err != nil {
-			slog.Error("failed to create subscription", "error", err)
+			t.log.Error("failed to create subscription", "error", err)
 			continue
 		}
 
@@ -156,11 +203,10 @@ func (t *Target) run(ctx context.Context, wg *sync.WaitGroup) {
 		}
 
 		t.activeSubscription = subscriptionID
-
-		slog.Info("subscription created", "subscription-id", subscriptionID)
+		t.log.Info("subscription created", "subscription-id", subscriptionID)
 
 		if err := t.keepAlive(ctx, subscriptionID); err != nil {
-			slog.Error("keep alive failed", "error", err)
+			t.log.Error("keep alive failed", "error", err)
 		}
 	}
 }
@@ -173,7 +219,7 @@ func (t *Target) startWorker() error {
 	}
 
 	if err := os.MkdirAll(t.config.LocalDomainPath, 0755); err != nil {
-		slog.Warn("failed to create local domain path", "error", err, "path", t.config.LocalDomainPath)
+		t.log.Warn("failed to create local domain path", "error", err, "path", t.config.LocalDomainPath)
 	}
 
 	wctx, wcancel := context.WithCancel(context.Background())
@@ -192,7 +238,7 @@ func (t *Target) startWorker() error {
 			SchedPrio:       t.config.SchedPrio,
 
 			Labels: t.config.Labels,
-		}, t.wrestarts)
+		}, t.wrestarts, t.log)
 
 	t.worker.Start(t.wctx, &t.wwg)
 	t.metrics.Add(t.worker)
@@ -222,6 +268,12 @@ func (t *Target) getFlowDefinition(ctx context.Context) error {
 
 	t.flowDefinition = buf.String()
 	t.config.Labels = lo.Assign(t.config.Labels, flow.FlowDefinition.ToLabels())
+
+	if t.config.Tracing {
+		for k, v := range flow.FlowDefinition.ToLabels() {
+			t.log = t.log.With(k, v)
+		}
+	}
 
 	return nil
 }
@@ -303,7 +355,7 @@ func (t *Target) cleanup() {
 		defer cancel()
 
 		if err := t.req(ctx, http.MethodDelete, "/v1/subscriptions/"+t.activeSubscription, nil, nil, nil); err != nil {
-			slog.Error("failed to delete active subscription", "error", err)
+			t.log.Warn("failed to delete active subscription", "error", err)
 		}
 	}
 
@@ -327,7 +379,7 @@ func (t *Target) req(ctx context.Context, method, path string, query map[string]
 		return err
 	}
 
-	slog.Debug(method, "url", rurl.String())
+	t.log.Debug(method, "url", rurl.String())
 	req := &http.Request{
 		Method: method,
 		Header: http.Header{"content-type": []string{"application/json"}},
@@ -365,5 +417,5 @@ func (t *Target) req(ctx context.Context, method, path string, query map[string]
 
 	var msg server.Message
 	_ = json.NewDecoder(response.Body).Decode(&msg)
-	return fmt.Errorf("request failed: (code: %d): %s", response.StatusCode, msg.Message)
+	return &RequestError{Method: method, URL: rurl.String(), Code: msg.Code, Message: msg.Message}
 }

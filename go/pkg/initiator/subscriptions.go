@@ -16,7 +16,8 @@ import (
 )
 
 type Subscription struct {
-	mu sync.Mutex
+	mu  sync.Mutex
+	log *slog.Logger
 
 	wwg     *sync.WaitGroup
 	wctx    context.Context
@@ -28,12 +29,13 @@ type Subscription struct {
 	lastKeepAlive time.Time
 }
 
-func NewSubscription(config worker.Config, metrics *metrics.Metrics) *Subscription {
+func NewSubscription(config worker.Config, metrics *metrics.Metrics, log *slog.Logger) *Subscription {
 	ctx, cancel := context.WithCancel(context.Background())
-	worker := worker.NewWorker(config, 0)
+	worker := worker.NewWorker(config, 0, log)
 
 	sub := &Subscription{
-		mu: sync.Mutex{},
+		mu:  sync.Mutex{},
+		log: log,
 
 		wwg:     &sync.WaitGroup{},
 		wctx:    ctx,
@@ -54,6 +56,8 @@ func (s *Subscription) Terminate() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	s.metrics.Remove(s.worker)
+
 	if s.wcancel != nil {
 		s.wcancel()
 	}
@@ -61,7 +65,6 @@ func (s *Subscription) Terminate() {
 	s.wwg.Wait()
 	s.wcancel = nil
 	s.wctx = nil
-	s.metrics.Remove(s.worker)
 }
 
 func (s *Subscription) HasTargetInfoChanged(t string) bool {
@@ -73,14 +76,18 @@ type Subscriptions struct {
 	subscriptions map[string]*Subscription
 	domains       *Domains
 	metrics       *metrics.Metrics
+	cleanupJobs   sync.WaitGroup
+	tracing       bool
 }
 
-func NewSubscriptions(ctx context.Context, wg *sync.WaitGroup, domains *Domains, metrics *metrics.Metrics) *Subscriptions {
+func NewSubscriptions(ctx context.Context, wg *sync.WaitGroup, domains *Domains, metrics *metrics.Metrics, tracing bool) *Subscriptions {
 	s := &Subscriptions{
 		mu:            sync.Mutex{},
 		subscriptions: make(map[string]*Subscription),
 		domains:       domains,
 		metrics:       metrics,
+		cleanupJobs:   sync.WaitGroup{},
+		tracing:       tracing,
 	}
 
 	wg.Add(1)
@@ -91,6 +98,7 @@ func NewSubscriptions(ctx context.Context, wg *sync.WaitGroup, domains *Domains,
 
 func (s *Subscriptions) run(ctx context.Context, wg *sync.WaitGroup) {
 	defer wg.Done()
+	defer s.cleanupJobs.Wait()
 	defer s.shutdown()
 
 	for {
@@ -110,13 +118,13 @@ func (s *Subscriptions) cleanup() {
 
 	for id, sub := range s.subscriptions {
 		if time.Since(sub.lastKeepAlive) > 20*time.Second {
-			slog.Warn("terminating inactive subscription",
-				"id", id, "flow-id", sub.config.FlowID, "domain", sub.config.Domain)
+			sub.log.Warn("terminating inactive subscription")
 
 			s.removeSubscription(id)
 		}
 	}
 }
+
 func (s *Subscriptions) shutdown() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -196,12 +204,12 @@ func (s *Subscriptions) Remove(id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	_, ok := s.subscriptions[id]
+	sub, ok := s.subscriptions[id]
 	if !ok {
 		return nil
 	}
 
-	slog.Info("delete subscription", "id", id)
+	sub.log.Info("delete subscription", "id", id)
 	s.removeSubscription(id)
 	return nil
 }
@@ -216,7 +224,7 @@ func (s *Subscriptions) KeepAlive(id string, req *common.SubscriptionRequest) er
 	}
 
 	if sub.HasTargetInfoChanged(req.TargetInfo) {
-		slog.Warn("target info has changed, terminating subscription", "id", id)
+		sub.log.Warn("target info has changed, terminating subscription", "id", id)
 		s.removeSubscription(id)
 		return fmt.Errorf("%w: target info has changed", server.ErrInvalidArgument)
 	}
@@ -258,8 +266,15 @@ func (s *Subscriptions) createSuscription(req *common.SubscriptionRequest) (stri
 		Labels: req.Labels,
 	}
 
-	s.subscriptions[cookie] = NewSubscription(config, s.metrics)
-	slog.Info("subscription created", "id", cookie, "domain", domain, "flow-id", id, "node", info.Node)
+	log := slog.With("module", "out", "flow-id", id, "local-domain", info.Path)
+	if s.tracing {
+		for k, v := range req.Labels {
+			log = log.With(k, v)
+		}
+	}
+
+	log.Info("subscription created", "node", info.Node)
+	s.subscriptions[cookie] = NewSubscription(config, s.metrics, log)
 	return cookie, nil
 }
 
@@ -269,6 +284,6 @@ func (s *Subscriptions) removeSubscription(id string) {
 		return
 	}
 
-	sub.Terminate()
+	s.cleanupJobs.Go(func() { sub.Terminate() })
 	delete(s.subscriptions, id)
 }

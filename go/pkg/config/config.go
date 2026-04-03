@@ -26,9 +26,10 @@ var (
 )
 
 type DomainMapping struct {
-	URL      string `json:"url"`
-	Node     string `json:"node"`
-	Provider string `json:"provider"`
+	URL      string            `json:"url"`
+	Node     string            `json:"node"`
+	Provider string            `json:"provider"`
+	Labels   map[string]string `json:"labels"`
 }
 
 func (d *DomainMapping) Equal(other DomainMapping) bool {
@@ -40,6 +41,7 @@ type Remote struct {
 	Provider string            `json:"provider"`
 	Node     string            `json:"node"`
 	Domains  map[string]string `json:"domains"`
+	Labels   map[string]string `json:"labels"`
 }
 
 type Subscription struct {
@@ -52,6 +54,8 @@ type Subscription struct {
 	Labels          map[string]string `json:"labels"`
 	NoNetLatMeasure bool              `json:"no_network_latency_measurement"`
 	SchedPrio       *int              `json:"sched_prio"`
+
+	localDomain string
 }
 
 func (s *Subscription) Equal(other Subscription) bool {
@@ -64,10 +68,11 @@ func (s *Subscription) Equal(other Subscription) bool {
 		maps.Equal(s.Labels, other.Labels) &&
 		s.NoNetLatMeasure == other.NoNetLatMeasure &&
 		((s.SchedPrio == nil && other.SchedPrio == nil) ||
-			s.SchedPrio != nil && other.SchedPrio != nil && *s.SchedPrio == *other.SchedPrio)
+			s.SchedPrio != nil && other.SchedPrio != nil && *s.SchedPrio == *other.SchedPrio) &&
+		s.localDomain == other.localDomain
 }
 
-func (s *Subscription) ToTargetConfig(localDomain string) (*target.TargetConfig, error) {
+func (s *Subscription) ToTargetConfig(localDomain string, tracing bool) (*target.TargetConfig, error) {
 	durl, err := url.Parse(localDomain)
 	if err != nil {
 		return nil, err
@@ -93,14 +98,16 @@ func (s *Subscription) ToTargetConfig(localDomain string) (*target.TargetConfig,
 		Labels:           s.Labels,
 		NoNetLatMeasure:  s.NoNetLatMeasure,
 		SchedPrio:        s.SchedPrio,
+		Tracing:          tracing,
 	}, nil
 }
 
 type Defaults struct {
-	Node            string `json:"node"`
-	Provider        string `json:"provider"`
-	NoNetLatMeasure bool   `json:"no_network_latency_measurement"`
-	SchedPrio       *int   `json:"sched_prio"`
+	Node            string            `json:"node"`
+	Provider        string            `json:"provider"`
+	NoNetLatMeasure bool              `json:"no_network_latency_measurement"`
+	SchedPrio       *int              `json:"sched_prio"`
+	Labels          map[string]string `json:"labels"`
 }
 
 type state struct {
@@ -226,6 +233,7 @@ func (c *Config) resolveNode(localDomain string, remote string) string {
 }
 
 func (c *Config) normalizeSubscription(domain string, sub *Subscription) ([]Subscription, error) {
+	sub.localDomain = domain
 	if sub.Remote != "" {
 		return c.normalizeSubscriptionWithRemote(domain, sub)
 	} else {
@@ -239,6 +247,21 @@ func (c *Config) orDefaultSchedPrio(v *int) *int {
 	}
 
 	return v
+}
+
+func (c *Config) getLabels(domainName string, remoteName string) map[string]string {
+	labels := c.Defaults.Labels
+
+	domain, ok := c.Domains[domainName]
+	if ok {
+		labels = lo.Assign(labels, domain.Labels)
+	}
+	remoteObj, ok := c.Remotes[remoteName]
+	if ok {
+		labels = lo.Assign(labels, remoteObj.Labels)
+	}
+
+	return labels
 }
 
 func (c *Config) normalizeSubscriptionWithRemote(domain string, sub *Subscription) ([]Subscription, error) {
@@ -271,30 +294,25 @@ func (c *Config) normalizeSubscriptionWithRemote(domain string, sub *Subscriptio
 		sub.Node = c.resolveNode(domain, remoteName)
 	}
 
-	if len(sub.IDs) > 0 {
-		return lo.Map(sub.IDs,
-			func(id string, _ int) Subscription {
-				return Subscription{
-					ID:              id,
-					URL:             remoteDomainURL,
-					Provider:        sub.Provider,
-					Labels:          sub.Labels,
-					NoNetLatMeasure: sub.NoNetLatMeasure || c.Defaults.NoNetLatMeasure,
-					SchedPrio:       c.orDefaultSchedPrio(sub.SchedPrio),
-				}
-			}), nil
-	} else {
-		return []Subscription{
-			{
+	ids := sub.IDs
+	if sub.ID != "" {
+		ids = append(ids, sub.ID)
+	}
+
+	return lo.Map(ids,
+		func(id string, _ int) Subscription {
+			return Subscription{
 				URL:             remoteDomainURL,
-				ID:              sub.ID,
+				ID:              id,
 				Provider:        sub.Provider,
-				Labels:          sub.Labels,
+				Node:            sub.Node,
+				Labels:          lo.Assign(c.getLabels(domain, remoteName), sub.Labels),
 				NoNetLatMeasure: sub.NoNetLatMeasure || c.Defaults.NoNetLatMeasure,
 				SchedPrio:       c.orDefaultSchedPrio(sub.SchedPrio),
-			},
-		}, nil
-	}
+
+				localDomain: sub.localDomain,
+			}
+		}), nil
 }
 
 func (c *Config) normalizeSubscriptionWithURL(domain string, sub *Subscription) ([]Subscription, error) {
@@ -330,9 +348,11 @@ func (c *Config) normalizeSubscriptionWithURL(domain string, sub *Subscription) 
 				ID:              id,
 				Provider:        sub.Provider,
 				Node:            sub.Node,
-				Labels:          sub.Labels,
+				Labels:          lo.Assign(c.getLabels(domain, ""), sub.Labels),
 				NoNetLatMeasure: sub.NoNetLatMeasure || c.Defaults.NoNetLatMeasure,
 				SchedPrio:       c.orDefaultSchedPrio(sub.SchedPrio),
+
+				localDomain: sub.localDomain,
 			}
 		},
 	), nil
@@ -404,6 +424,7 @@ func (c *Config) merge(other *Config) {
 	if c.Remotes == nil {
 		c.Remotes = map[string]Remote{}
 	}
+	c.Defaults.Labels = lo.Assign(c.Defaults.Labels, other.Defaults.Labels)
 
 	if other.Defaults.Node != "" {
 		if c.Defaults.Node != "" && c.Defaults.Node != other.Defaults.Node {

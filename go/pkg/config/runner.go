@@ -18,8 +18,9 @@ import (
 type Runner struct {
 	mu sync.Mutex
 
-	cfg   *Config
-	state state
+	cfg     *Config
+	tracing bool
+	state   state
 
 	paths []string
 
@@ -38,11 +39,12 @@ func (r *Runner) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
 	server.Response(w, &server.Message{Message: "configuration reloaded", Code: http.StatusOK})
 }
 
-func NewRunner(cfg *Config, paths []string, domains *initiator.Domains, subs *initiator.Subscriptions, targets *target.Targets) (*Runner, error) {
+func NewRunner(cfg *Config, paths []string, tracing bool, domains *initiator.Domains, subs *initiator.Subscriptions, targets *target.Targets) (*Runner, error) {
 	r := &Runner{
 		mu: sync.Mutex{},
 
-		cfg: cfg,
+		cfg:     cfg,
+		tracing: tracing,
 		state: state{
 			subs:    map[string]*Subscription{},
 			domains: map[string]*DomainMapping{},
@@ -113,6 +115,7 @@ func (r *Runner) loadFromDisk() (*Config, error) {
 		}
 	}
 
+	next.merge(r.cfg)
 	return next, nil
 }
 
@@ -135,7 +138,7 @@ func (r *Runner) reloadWith(next *Config) error {
 				func(item *Subscription) bool { return item.Equal(subscription) }) {
 
 				// create subscription
-				config, err := subscription.ToTargetConfig(localDomain)
+				config, err := subscription.ToTargetConfig(localDomain, r.tracing)
 				if err != nil {
 					slog.Error("failed to build target config for subscription entry", "error", err)
 					continue
@@ -164,6 +167,8 @@ func (r *Runner) reloadWith(next *Config) error {
 		}
 	}
 
+	destroyJobs := &sync.WaitGroup{}
+	defer destroyJobs.Wait()
 	for id, existingSubscription := range r.state.subs {
 		var found bool
 		for _, subs := range uniqueSubscriptions {
@@ -176,7 +181,7 @@ func (r *Runner) reloadWith(next *Config) error {
 
 		if !found {
 			delete(r.state.subs, id)
-			r.targets.Destroy(id)
+			destroyJobs.Go(func() { r.targets.Destroy(id) })
 		}
 	}
 

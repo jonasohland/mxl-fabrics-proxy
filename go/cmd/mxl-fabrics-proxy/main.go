@@ -30,28 +30,33 @@ type Options struct {
 	Domain        []string          `help:"" short:"d"`
 	DomainMapping map[string]string `help:"" short:"m" long:"map-domain"`
 	Subscribe     []string          `help:"" short:"s"`
+	Tracing       bool              `help:"" short:"t"`
 }
 
-func createLogger() *slog.Logger {
-	return slog.New(
-		slogpfx.NewHandler(
-			tint.NewHandler(
-				os.Stderr,
-				&tint.Options{
-					TimeFormat: time.RFC3339,
+func createLogger(tracing bool) *slog.Logger {
+	if !tracing {
+		return slog.New(
+			slogpfx.NewHandler(
+				tint.NewHandler(
+					os.Stderr,
+					&tint.Options{
+						TimeFormat: time.RFC3339,
+					},
+				),
+				&slogpfx.HandlerOptions{
+					PrefixKeys: []string{"module"},
 				},
 			),
-			&slogpfx.HandlerOptions{
-				PrefixKeys: []string{"module"},
-			},
-		),
-	)
+		)
+	} else {
+		return slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{}))
+	}
 }
 
 func launch(ctx context.Context, wg *sync.WaitGroup, options *Options) error {
 	metrics := metrics.NewMetrics()
 	domains := initiator.NewDomains()
-	subs := initiator.NewSubscriptions(ctx, wg, domains, metrics)
+	subs := initiator.NewSubscriptions(ctx, wg, domains, metrics, options.Tracing)
 	targets := target.NewTargets(ctx, metrics)
 
 	cfg := &config.Config{}
@@ -74,7 +79,7 @@ func launch(ctx context.Context, wg *sync.WaitGroup, options *Options) error {
 		}
 	}
 
-	runner, err := config.NewRunner(cfg, options.Config, domains, subs, targets)
+	runner, err := config.NewRunner(cfg, options.Config, options.Tracing, domains, subs, targets)
 	if err != nil {
 		return err
 	}
@@ -97,7 +102,7 @@ func main() {
 	var options Options
 	kong.Parse(&options)
 
-	slog.SetDefault(createLogger())
+	slog.SetDefault(createLogger(options.Tracing))
 
 	versions, err := worker.GetVersions()
 	if err != nil {

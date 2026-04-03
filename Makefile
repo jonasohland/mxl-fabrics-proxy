@@ -7,7 +7,7 @@ cmake-configure:
 
 .PHONY: cmake-build
 cmake-build: cmake-configure
-	cmake --build build
+	cmake --build build -j
 
 .PHONY: cmake-install
 cmake-install: cmake-build
@@ -25,3 +25,6 @@ tidy:
 .PHONY: proxy
 proxy:
 	go build -o build/mxl-fabrics-proxy ./go/cmd/mxl-fabrics-proxy
+
+.PHONY: install
+install: cmake-install

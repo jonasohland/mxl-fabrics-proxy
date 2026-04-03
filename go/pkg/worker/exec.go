@@ -77,11 +77,11 @@ type ProxyWorker struct {
 	terminated chan any
 }
 
-func NewWorker(config Config, restarts uint64) *ProxyWorker {
+func NewWorker(config Config, restarts uint64, logger *slog.Logger) *ProxyWorker {
 	w := &ProxyWorker{
 		mu:  sync.Mutex{},
 		wg:  sync.WaitGroup{},
-		log: slog.With("proxy-id", config.ProxyID, "module", "proxy"),
+		log: logger,
 
 		config:   config,
 		workdir:  "",
@@ -251,7 +251,11 @@ func (w *ProxyWorker) translateLogs(in io.Reader) {
 		}
 
 		if w.log.Handler().Enabled(context.Background(), record.Level) {
-			_ = w.log.With("module", "proxy.worker").Handler().Handle(context.Background(), record)
+			_ = lo.TernaryF(
+				w.config.IsTarget(),
+				func() *slog.Logger { return w.log.With("module", "in.worker") },
+				func() *slog.Logger { return w.log.With("module", "out.worker") },
+			).Handler().Handle(context.Background(), record)
 		}
 	}
 }
