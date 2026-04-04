@@ -261,6 +261,7 @@ func (w *ProxyWorker) observeFlow() {
 	flow, err := mxl.OpenFlow(w.config.Domain, w.config.FlowID)
 	if err != nil {
 		w.log.Error("failed to open flow", "error", err)
+		return
 	}
 	defer flow.Close()
 
