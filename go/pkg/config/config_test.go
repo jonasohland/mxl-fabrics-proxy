@@ -1,6 +1,8 @@
 package config_test
 
 import (
+	"encoding/json"
+	"fmt"
 	"testing"
 
 	"github.com/jonasohland/mxl-fabrics-proxy/go/pkg/config"
@@ -73,4 +75,11 @@ func TestConfigNormalize(t *testing.T) {
 
 	require.NoError(t, cfg.Normalize())
 	_, _ = pretty.Println(cfg)
+}
+
+func TestEncodeString(t *testing.T) {
+	s := "\"\""
+	buf, err := json.Marshal(&s)
+	require.NoError(t, err)
+	fmt.Println(string(buf))
 }

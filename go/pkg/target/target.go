@@ -17,6 +17,7 @@ import (
 
 	"github.com/jonasohland/mxl-fabrics-proxy/go/pkg/common"
 	"github.com/jonasohland/mxl-fabrics-proxy/go/pkg/metrics"
+	"github.com/jonasohland/mxl-fabrics-proxy/go/pkg/mxl"
 	"github.com/jonasohland/mxl-fabrics-proxy/go/pkg/server"
 	"github.com/jonasohland/mxl-fabrics-proxy/go/pkg/worker"
 	"github.com/samber/lo"
@@ -105,9 +106,12 @@ type Target struct {
 
 	config *TargetConfig
 
-	flowDefinition string
+	flowDefBuf string
+	flowDef    *common.FlowDefinition
 
 	activeSubscription string
+
+	fst *mxl.StateTracker
 
 	wctx      context.Context
 	wcancel   context.CancelFunc
@@ -141,7 +145,10 @@ func NewTarget(ctx context.Context, metrics *metrics.Metrics, config *TargetConf
 
 		config: config,
 
-		flowDefinition: "",
+		flowDefBuf: "",
+		flowDef:    nil,
+
+		fst: nil,
 
 		wctx:      nil,
 		wcancel:   nil,
@@ -205,7 +212,7 @@ func (t *Target) run(ctx context.Context, wg *sync.WaitGroup) {
 		t.activeSubscription = subscriptionID
 		t.log.Info("subscription created", "subscription-id", subscriptionID)
 
-		if err := t.keepAlive(ctx, subscriptionID); err != nil {
+		if err := t.runActive(ctx, subscriptionID); err != nil {
 			t.log.Error("keep alive failed", "error", err)
 		}
 	}
@@ -233,7 +240,7 @@ func (t *Target) startWorker() error {
 			Provider:        t.config.Provider,
 			Node:            t.config.Node,
 			FlowID:          t.config.FlowID,
-			FlowDefinition:  t.flowDefinition,
+			FlowDefinition:  t.flowDefBuf,
 			NoNetLatMeasure: t.config.NoNetLatMeasure,
 			SchedPrio:       t.config.SchedPrio,
 
@@ -246,31 +253,43 @@ func (t *Target) startWorker() error {
 	return nil
 }
 
-func (t *Target) getFlowDefinition(ctx context.Context) error {
+func (t *Target) getRemoteFlowDef(ctx context.Context) (*common.FlowDefinition, error) {
 	var domainInfo common.DomainInfo
 	err := t.req(ctx, http.MethodGet,
 		"/v1/flows"+t.config.RemoteDomainPath,    // path
 		map[string]string{"id": t.config.FlowID}, // query
 		nil, &domainInfo)                         // bodyIn, bodyOut
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	flow, ok := domainInfo.Flows[t.config.FlowID]
 	if !ok {
-		return fmt.Errorf("%w: flow not in domain info", server.ErrNotFound)
+		return nil, fmt.Errorf("%w: flow not in domain info", server.ErrNotFound)
 	}
 
-	buf := bytes.NewBuffer(nil)
-	if err := json.NewEncoder(buf).Encode(&flow.FlowDefinition); err != nil {
+	return &flow.FlowDefinition, nil
+}
+
+func (t *Target) getFlowDefinition(ctx context.Context) error {
+	flowDef, err := t.getRemoteFlowDef(ctx)
+	if err != nil {
 		return err
 	}
 
-	t.flowDefinition = buf.String()
-	t.config.Labels = lo.Assign(t.config.Labels, flow.FlowDefinition.ToLabels())
+	buf := bytes.NewBuffer(nil)
+	if err := json.NewEncoder(buf).Encode(flowDef); err != nil {
+		return err
+	}
+
+	labels := flowDef.ToLabels()
+
+	t.flowDefBuf = buf.String()
+	t.flowDef = flowDef
+	t.config.Labels = lo.Assign(t.config.Labels, labels)
 
 	if t.config.Tracing {
-		for k, v := range flow.FlowDefinition.ToLabels() {
+		for k, v := range labels {
 			t.log = t.log.With(k, v)
 		}
 	}
@@ -322,27 +341,44 @@ func (t *Target) createSubscription(ctx context.Context) (string, error) {
 	return res.ID, nil
 }
 
-func (t *Target) keepAlive(ctx context.Context, subID string) error {
+func (t *Target) runActive(ctx context.Context, subID string) error {
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(10 * time.Second):
+		case <-time.After(9 * time.Second):
 		}
 
-		info, err := t.getTargetInfo(ctx)
-		if err != nil {
-			return err
-		}
-
-		req := &common.SubscriptionRequest{
-			TargetInfo: info,
-		}
-
-		if err := t.req(ctx, http.MethodPatch, "/v1/subscriptions/"+subID, nil, req, nil); err != nil {
+		if err := t.keepAlive(ctx, subID); err != nil {
 			return err
 		}
 	}
+}
+
+func (t *Target) keepAlive(ctx context.Context, subID string) error {
+	info, err := t.getTargetInfo(ctx)
+	if err != nil {
+		return err
+	}
+
+	req := &common.SubscriptionRequest{
+		TargetInfo: info,
+	}
+
+	if err := t.req(ctx, http.MethodPatch, "/v1/subscriptions/"+subID, nil, req, nil); err != nil {
+		return err
+	}
+
+	currentDef, err := t.getRemoteFlowDef(ctx)
+	if err != nil {
+		t.log.Warn("failed to get remote flow definition")
+	} else {
+		if !currentDef.Equal(t.flowDef) {
+			return errors.New("remote flow definition has changed")
+		}
+	}
+
+	return nil
 }
 
 func (t *Target) cleanup() {

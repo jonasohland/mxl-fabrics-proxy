@@ -97,6 +97,14 @@ func (w *ProxyWorker) GetMetrics(ctx context.Context) (*MetricCollection, error)
 		return nil, scanner.Err()
 	}
 
-	coll.AddCounter("workerRestarts", float64(w.NumRestarts()))
+	coll.AddCounter("mxl_worker_restarts", float64(w.NumRestarts()))
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.fst != nil {
+		coll.AddCounter("mxl_writer_active", float64(lo.Ternary(w.fst.IsActive(), 1, 0)))
+		coll.AddCounter("mxl_reader_active", float64(lo.Ternary(w.fst.HasReader(), 1, 0)))
+	}
+
 	return coll, nil
 }

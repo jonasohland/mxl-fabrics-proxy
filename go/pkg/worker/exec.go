@@ -20,6 +20,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/jonasohland/mxl-fabrics-proxy/go/pkg/mxl"
 	"github.com/samber/lo"
 )
 
@@ -71,6 +72,8 @@ type ProxyWorker struct {
 	config   Config
 	workdir  string
 	restarts atomic.Uint64
+
+	fst *mxl.StateTracker
 
 	ctx        context.Context
 	cancel     context.CancelFunc
@@ -197,8 +200,9 @@ func (w *ProxyWorker) restart() error {
 	w.workdir = workdir
 	w.terminated = make(chan any)
 
-	w.wg.Add(2)
+	w.wg.Add(3)
 	go w.runWorker(cmd)
+	go w.runFlowObservation()
 	go w.translateLogs(stdout)
 
 	return nil
@@ -234,6 +238,39 @@ func (w *ProxyWorker) runWorker(cmd *exec.Cmd) {
 	}
 
 	w.log.Debug("worker stopped", "pid", pid)
+}
+
+func (w *ProxyWorker) runFlowObservation() {
+	defer w.wg.Done()
+
+	for {
+		select {
+		case <-w.ctx.Done():
+			return
+		case <-time.After(3 * time.Second):
+		}
+
+		w.observeFlow()
+	}
+}
+
+func (w *ProxyWorker) observeFlow() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	flow, err := mxl.OpenFlow(w.config.Domain, w.config.FlowID)
+	if err != nil {
+		w.log.Error("failed to open flow", "error", err)
+	}
+	defer flow.Close()
+
+	if w.fst == nil {
+		w.fst = &mxl.StateTracker{}
+	}
+
+	if err := w.fst.Observe(flow); err != nil {
+		w.log.Error("failed to observe flow", "error", err)
+	}
 }
 
 func (w *ProxyWorker) translateLogs(in io.Reader) {

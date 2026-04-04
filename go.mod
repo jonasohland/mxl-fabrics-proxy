@@ -10,12 +10,12 @@ require (
 	github.com/lmittmann/tint v1.1.3
 	github.com/samber/lo v1.53.0
 	github.com/stretchr/testify v1.8.4
+	golang.org/x/exp v0.0.0-20260312153236-7ab1446f8b90
 	sigs.k8s.io/yaml v1.6.0
 )
 
 require (
 	github.com/davecgh/go-spew v1.1.1 // indirect
-	github.com/google/go-cmp v0.6.0 // indirect
 	github.com/kr/text v0.2.0 // indirect
 	github.com/pmezard/go-difflib v1.0.0 // indirect
 	github.com/rogpeppe/go-internal v1.9.0 // indirect

@@ -3,6 +3,7 @@ package metrics
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
@@ -35,7 +36,12 @@ func sendLabels(w io.Writer, labels map[string]string) error {
 
 	i := 0
 	for name, label := range labels {
-		if _, err := io.WriteString(w, name+"="+"\""+label+"\""); err != nil {
+		labelBuf, err := json.Marshal(&label)
+		if err != nil {
+			continue
+		}
+
+		if _, err := io.WriteString(w, name+"="+string(labelBuf)); err != nil {
 			return err
 		}
 		if i != len(labels)-1 {

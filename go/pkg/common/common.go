@@ -3,6 +3,7 @@ package common
 import (
 	"fmt"
 	"net/url"
+	"reflect"
 	"strings"
 
 	"github.com/jonasohland/mxl-fabrics-proxy/go/pkg/server"
@@ -92,6 +93,10 @@ func (f *FlowDefinition) ToLabels() map[string]string {
 	}
 
 	return out
+}
+
+func (f *FlowDefinition) Equal(other *FlowDefinition) bool {
+	return reflect.DeepEqual(f, other)
 }
 
 func ParseFlowURL(flowURL string) (string, []string, error) {

@@ -37,15 +37,15 @@ class Metrics {
     std::thread _listenThread;
 
     mutable std::mutex _m{};
-    Counter _totalPayload = makeCounter("totalPayload");
-    Counter _totalBytes = makeCounter("totalBytes");
-    Counter _totalGrains = makeCounter("totalGrains");
-    Counter _skipped = makeCounter("skipped");
-    Counter _lastGrainIndex = makeCounter("lastGrainIndex");
+    Counter _totalPayload = makeCounter("mxl_total_payload_octets");
+    Counter _totalBytes = makeCounter("mxl_total_octets");
+    Counter _totalGrains = makeCounter("mxl_total_grains");
+    Counter _skipped = makeCounter("mxl_grains_skipped");
+    Counter _lastGrainIndex = makeCounter("mxl_last_grain_index");
     Summary _sourceLatency =
-        makeSummary("sourceLatency", {0.01, 0.1, 0.5, 0.9, 0.99});
+        makeSummary("mxl_source_latency", {0.01, 0.1, 0.5, 0.9, 0.99});
     Summary _networkLatency =
-        makeSummary("networkLatency", {0.01, 0.1, 0.5, 0.9, 0.99});
+        makeSummary("mxl_network_latency", {0.01, 0.1, 0.5, 0.9, 0.99});
 
     bool _withNetworkLatency;
 
