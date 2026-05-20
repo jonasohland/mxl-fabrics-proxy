@@ -23,9 +23,8 @@ import (
 type Options struct {
 	LogLevel      string            `help:"Set the log level" enum:"debug,info,warn,error" default:"info"`
 	Node          string            `help:"Local node address" default:"127.0.0.1"`
-	Service       string            `help:"Local service address"`
+	Provider      string            `help:"Default provider to use"`
 	Listen        string            `short:"l" help:"Listen on this address for requests" default:"127.0.0.1:2283"`
-	EFAUseWait    bool              `help:"Use wait completion with EFA provider"`
 	Config        []string          `help:"Configuration file to load"`
 	Domain        []string          `help:"" short:"d"`
 	DomainMapping map[string]string `help:"" short:"m" long:"map-domain"`
@@ -59,7 +58,12 @@ func launch(ctx context.Context, wg *sync.WaitGroup, options *Options) error {
 	subs := initiator.NewSubscriptions(ctx, wg, domains, metrics, options.Tracing)
 	targets := target.NewTargets(ctx, metrics)
 
-	cfg := &config.Config{}
+	cfg := &config.Config{
+		Defaults: config.Defaults{
+			Node:     options.Node,
+			Provider: options.Provider,
+		},
+	}
 
 	for _, domain := range options.Domain {
 		if err := cfg.AddDomainFromString(domain); err != nil {

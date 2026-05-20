@@ -363,6 +363,7 @@ func (c *Config) normalizeSubscriptionWithURL(domain string, sub *Subscription) 
 
 func (c *Config) AddDomainFromString(domainURL string) error {
 	name := strings.ReplaceAll(strings.TrimPrefix(domainURL, "mxl://"), "/", "-")
+	name, _ = strings.CutPrefix(name, "-")
 	return c.AddDomainMappingFromString(name, domainURL)
 }
 
@@ -374,6 +375,9 @@ func (c *Config) AddDomainMappingFromString(name, domainURL string) error {
 
 	sanitizedURL := "mxl://" + durl.Host + durl.Path
 
+	if c.Domains == nil {
+		c.Domains = map[string]DomainMapping{}
+	}
 	c.Domains[name] = DomainMapping{
 		URL:      sanitizedURL,
 		Node:     durl.Query().Get("node"),
@@ -401,6 +405,10 @@ func (c *Config) AddRequestFromString(req string) error {
 	provider := c.resolveProvider(localDomain, "")
 	if rurl.Query().Get("provider") != "" {
 		provider = rurl.Query().Get("provider")
+	}
+
+	if c.Subscriptions == nil {
+		c.Subscriptions = map[string][]Subscription{}
 	}
 
 	for _, id := range rurl.Query()["id"] {
