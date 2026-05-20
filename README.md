@@ -82,6 +82,25 @@ mxl-fabrics-proxy [flags]
 | `--map-domain`          | `-m`  | —                    | Domain alias mapping |
 | `--subscribe`           | `-s`  | —                    | Add subscription (repeatable) |
 
+Example of a domain mapping on the command line:
+```sh
+-m domain-1=/dev/shm/domain-1
+```
+
+Example of a subscription on the command line:
+```sh
+# <local-domain-mapped-name>@<remote-flow-url>
+-s "domain-1@mxl://remote-engine.dc1.company.net?id=5592a23b-0974-45bb-9388-89ea81c42537&provider=verbs"
+```
+
+Complete example looping back a flow from /dev/shm/mxl0 to /dev/shm/mxl1
+```sh
+mxl-fabrics-proxy --node 127.0.0.1 \
+    -m mxl0=/dev/shm/mxl0 \
+    -m mxl1=/dev/shm/mxl1 \
+    -s "mxl1@mxl://127.0.0.1/dev/shm/mxl0?id=5592a23b-0974-45bb-9388-89ea81c42537&provider=tcp"
+```
+
 ### Configuration File (`config.yaml`)
 
 The configuration file supports three main sections (plus an optional `remotes` section for advanced aliasing):
