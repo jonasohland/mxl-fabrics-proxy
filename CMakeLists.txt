@@ -13,9 +13,8 @@ add_executable(mxl-fabrics-proxy-worker)
 
 target_link_libraries(
 	mxl-fabrics-proxy-worker PRIVATE 
-		mxl::mxl
-        mxl::mxl-common
-		mxl::mxl-fabrics
+	mxl::mxl
+	mxl::mxl-fabrics
         spdlog::spdlog
         nlohmann_json::nlohmann_json
         PkgConfig::libfabric

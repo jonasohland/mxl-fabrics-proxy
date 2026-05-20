@@ -12,6 +12,7 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <system_error>
+#include <unistd.h>
 
 namespace mxl::proxy {
 
