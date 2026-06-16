@@ -178,13 +178,26 @@ class DiscreteFlowReader {
 
 class ContinuousFlowReader {
   public:
+    ContinuousFlowReader(ContinuousFlowReader&&);
     ~ContinuousFlowReader();
+
+    [[nodiscard]] std::uint64_t getHeadIndex() const;
+    [[nodiscard]] ::mxlRational getRate() const noexcept;
+    [[nodiscard]] std::string getFlowDefinition() const;
+    [[nodiscard]] std::uint32_t getChannelCount() const noexcept;
+    [[nodiscard]] std::uint32_t getBatchSize() const noexcept;
+
+    [[nodiscard]] ::mxlWrappedMultiBufferSlice
+    getSamplesNonBlocking(std::uint64_t headIndex, std::size_t count);
 
   private:
     ContinuousFlowReader(::mxlFlowReader, ::mxlFlowConfigInfo, Instance);
+    [[nodiscard]] ::mxlFlowReader raw() noexcept;
 
   private:
     friend class Instance;
+    friend class fabrics::Instance;
+
     ::mxlFlowReader _reader;
     ::mxlFlowConfigInfo _configInfo;
     Instance _instance;
@@ -268,6 +281,48 @@ class DiscreteFlowWriter {
     Instance _instance;
 };
 
-class ContinuousFlowWriter {};
+class ContinuousFlowWriter {
+  public:
+    ContinuousFlowWriter(ContinuousFlowWriter&&);
+    ~ContinuousFlowWriter();
+
+    class Access {
+      public:
+        Access(const Access&) = delete;
+        Access(Access&&) = delete;
+        Access& operator=(const Access&) = delete;
+        Access& operator=(Access&&) = delete;
+        ~Access() noexcept(false);
+
+        void cancel();
+
+      private:
+        friend class ContinuousFlowWriter;
+        explicit Access(ContinuousFlowWriter&);
+
+        ContinuousFlowWriter& _writer;
+        bool _cancelled = false;
+    };
+
+    [[nodiscard]] Access openSamples(std::uint64_t headIndex, std::size_t count);
+    [[nodiscard]] ::mxlRational getRate() const noexcept;
+    [[nodiscard]] std::string getFlowDefinition() const;
+    [[nodiscard]] std::uint32_t getChannelCount() const noexcept;
+    [[nodiscard]] std::uint32_t getBatchSize() const noexcept;
+
+  private:
+    friend class Instance;
+    friend class fabrics::Instance;
+    friend class Access;
+
+    ContinuousFlowWriter(::mxlFlowWriter, ::mxlFlowConfigInfo, Instance);
+    [[nodiscard]] ::mxlFlowWriter raw() noexcept;
+    void commit();
+    void cancel();
+
+    ::mxlFlowWriter _writer;
+    ::mxlFlowConfigInfo _info;
+    Instance _instance;
+};
 
 } // namespace mxl

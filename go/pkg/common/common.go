@@ -15,7 +15,7 @@ type FlowTags struct {
 
 type Rational struct {
 	Numerator   int `json:"numerator"`
-	Denominator int `json:"denominator"`
+	Denominator int `json:"denominator,omitempty"`
 }
 
 type Component struct {

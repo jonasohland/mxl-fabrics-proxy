@@ -198,6 +198,8 @@ func (t *Target) run(ctx context.Context, wg *sync.WaitGroup) {
 			continue
 		}
 
+		_ = json.NewEncoder(os.Stdout).Encode(t.flowDef)
+
 		if err := t.startWorker(); err != nil {
 			t.log.Error("failed to create subscription", "error", err)
 			continue

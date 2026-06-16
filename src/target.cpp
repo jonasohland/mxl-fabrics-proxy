@@ -37,25 +37,38 @@ bool Target::measurePreciseNetworkLatency() const noexcept {
 }
 
 void Target::run(utils::ExitSignal sig) {
-    auto writer = createWriter();
-    auto [target, targetInfo] = createTarget(writer);
-    writeFile(_config.targetInfo, targetInfo.toString());
-    auto _ = ScopedRTScheduling{_config.schedPrio};
-    transferGrains(std::move(writer), std::move(target), sig);
+    auto writerVariant = createWriter();
+    if (std::holds_alternative<::mxl::DiscreteFlowWriter>(writerVariant)) {
+        auto writer =
+            std::get<::mxl::DiscreteFlowWriter>(std::move(writerVariant));
+        auto [target, targetInfo] = createTarget(writer);
+        writeFile(_config.targetInfo, targetInfo.toString());
+        auto _ = ScopedRTScheduling{_config.schedPrio};
+        transferGrains(std::move(writer), std::move(target), sig);
+    } else {
+        auto writer =
+            std::get<::mxl::ContinuousFlowWriter>(std::move(writerVariant));
+        auto [target, targetInfo] = createTarget(writer);
+        writeFile(_config.targetInfo, targetInfo.toString());
+        auto _ = ScopedRTScheduling{_config.schedPrio};
+        transferSamples(std::move(writer), std::move(target), sig);
+    }
 }
 
-::mxl::DiscreteFlowWriter Target::createWriter() const {
-    auto writer = _mxl.createFlow(_config.flowDef);
-    if (!std::holds_alternative<DiscreteFlowWriter>(writer)) {
-        throw ::mxl::Exception{MXL_ERR_INVALID_ARG,
-                               "flow is not a discrete flow"};
-    }
-
-    return std::get<DiscreteFlowWriter>(std::move(writer));
+std::variant<::mxl::DiscreteFlowWriter, ::mxl::ContinuousFlowWriter>
+Target::createWriter() const {
+    return _mxl.createFlow(_config.flowDef);
 }
 
 std::pair<::mxl::fabrics::DiscreteFlowTarget, ::mxl::fabrics::TargetInfo>
 Target::createTarget(::mxl::DiscreteFlowWriter& writer) {
+    return _fabrics.createTarget(writer, {.node = _config.node,
+                                          .service = _config.service,
+                                          .provider = _config.provider});
+}
+
+std::pair<::mxl::fabrics::ContinuousFlowTarget, ::mxl::fabrics::TargetInfo>
+Target::createTarget(::mxl::ContinuousFlowWriter& writer) {
     return _fabrics.createTarget(writer, {.node = _config.node,
                                           .service = _config.service,
                                           .provider = _config.provider});
@@ -137,6 +150,60 @@ std::uint64_t Target::readNextGrain(::mxl::fabrics::DiscreteFlowTarget& target,
         }
 
         return *res;
+    }
+}
+
+void Target::transferSamples(::mxl::ContinuousFlowWriter writer,
+                             ::mxl::fabrics::ContinuousFlowTarget target,
+                             utils::ExitSignal sig) {
+    for (;;) {
+        auto [headIndex, count] = readNextSamples(target, sig);
+        auto rxTime = ::mxlGetTime();
+        if (sig.shouldExit()) {
+            return;
+        }
+        {
+            auto access = writer.openSamples(headIndex, count);
+            spdlog::debug("committing samples headIndex={} count={}", headIndex,
+                          count);
+            // RAII: access auto-commits on destruction
+        }
+
+        std::uint64_t skipped = 0;
+        if (_lastIndex != 0 && headIndex > _lastIndex) {
+            skipped = headIndex - _lastIndex;
+        }
+        _lastIndex = headIndex + count;
+
+        auto rate = writer.getRate();
+        auto grainTime = ::mxlIndexToTimestamp(&rate, headIndex);
+        auto sourceLatency = std::uint64_t{0};
+        if (rxTime > grainTime) {
+            sourceLatency = rxTime - grainTime;
+        }
+
+        _metrics.observe(count, count, 1, skipped, sourceLatency, 0);
+    }
+}
+
+std::pair<std::uint64_t, std::size_t>
+Target::readNextSamples(::mxl::fabrics::ContinuousFlowTarget& target,
+                        utils::ExitSignal sig) {
+    auto lastRead = std::chrono::system_clock::now();
+    for (;;) {
+        if (sig.shouldExit()) {
+            return {0, 0};
+        }
+        auto result = target.readSamples(std::chrono::milliseconds(500));
+        if (!result) {
+            auto waitTime = std::chrono::system_clock::now() - lastRead;
+            if (waitTime > std::chrono::seconds(10)) {
+                throw ::mxl::Exception{MXL_ERR_TIMEOUT,
+                                       "timed out waiting for samples"};
+            }
+            continue;
+        }
+        return *result;
     }
 }
 

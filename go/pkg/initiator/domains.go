@@ -187,6 +187,9 @@ func (d *Domain) readFlow(id string) (common.FlowInfo, error) {
 	if err := json.NewDecoder(fd).Decode(&out.FlowDefinition); err != nil {
 		return out, err
 	}
+	if out.FlowDefinition.SampleRate != nil && out.FlowDefinition.SampleRate.Numerator == 0 {
+		out.FlowDefinition.SampleRate.Denominator = 1
+	}
 
 	return out, nil
 }

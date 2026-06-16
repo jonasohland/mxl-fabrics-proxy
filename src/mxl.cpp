@@ -1,5 +1,6 @@
 #include "mxl.hpp"
 #include <format>
+#include <mxl/dataformat.h>
 #include <mxl/flow.h>
 #include <mxl/flowinfo.h>
 #include <mxl/mxl.h>
@@ -166,6 +167,9 @@ Instance::createFlow(std::string const& flowDef) const {
     auto created = false;
     mxl(::mxlCreateFlowWriter, "failed to create flow writer", _inner->instance,
         flowDef.c_str(), "", &writer, &info, &created);
+    if (mxlIsContinuousDataFormat(info.common.format)) {
+        return ContinuousFlowWriter{writer, info, *this};
+    }
     return DiscreteFlowWriter{writer, info, *this};
 }
 
@@ -303,11 +307,57 @@ ContinuousFlowReader::ContinuousFlowReader(::mxlFlowReader reader,
       _instance(std::move(instance)) {
 }
 
-ContinuousFlowReader::~ContinuousFlowReader() {
-    _instance.destroy(_reader);
+ContinuousFlowReader::ContinuousFlowReader(ContinuousFlowReader&& other)
+    : _reader(nullptr),
+      _configInfo(other._configInfo),
+      _instance(std::move(other._instance)) {
+    std::swap(_reader, other._reader);
 }
 
-/// TODO implement
+ContinuousFlowReader::~ContinuousFlowReader() {
+    if (_reader) {
+        _instance.destroy(_reader);
+    }
+}
+
+::mxlFlowReader ContinuousFlowReader::raw() noexcept {
+    return _reader;
+}
+
+std::uint64_t ContinuousFlowReader::getHeadIndex() const {
+    ::mxlFlowRuntimeInfo info{};
+    mxl(::mxlFlowReaderGetRuntimeInfo, "failed to get flow runtime info", _reader,
+        &info);
+    return info.headIndex;
+}
+
+::mxlRational ContinuousFlowReader::getRate() const noexcept {
+    return _configInfo.common.grainRate;
+}
+
+std::string ContinuousFlowReader::getFlowDefinition() const {
+    auto flowID = std::string(37, '\0');
+    uuid_unparse_lower(_configInfo.common.id, flowID.data());
+    flowID.resize(36);
+    return _instance.getFlowDefinition(flowID);
+}
+
+std::uint32_t ContinuousFlowReader::getChannelCount() const noexcept {
+    return _configInfo.continuous.channelCount;
+}
+
+std::uint32_t ContinuousFlowReader::getBatchSize() const noexcept {
+    return _configInfo.common.maxSyncBatchSizeHint;
+}
+
+::mxlWrappedMultiBufferSlice
+ContinuousFlowReader::getSamplesNonBlocking(std::uint64_t headIndex,
+                                            std::size_t count) {
+    ::mxlWrappedMultiBufferSlice slice{};
+    mxl(::mxlFlowReaderGetSamplesNonBlocking,
+        "failed to get samples non-blocking", _reader, headIndex, count, &slice);
+    return slice;
+}
 
 /** --------------- Discrete Flow Writer --------------- */
 
@@ -410,6 +460,83 @@ void DiscreteFlowWriter::Access::writeTxTimestamp(std::uint64_t ts) noexcept {
 
 std::uint64_t DiscreteFlowWriter::Access::readTxTimestamp() const noexcept {
     return *reinterpret_cast<std::uint64_t*>(_payload - sizeof(std::uint64_t));
+}
+
+/** --------------- Continuous Flow Writer --------------- */
+
+ContinuousFlowWriter::ContinuousFlowWriter(::mxlFlowWriter writer,
+                                           ::mxlFlowConfigInfo info,
+                                           Instance instance)
+    : _writer(writer),
+      _info(info),
+      _instance(std::move(instance)) {
+}
+
+ContinuousFlowWriter::ContinuousFlowWriter(ContinuousFlowWriter&& other)
+    : _writer(nullptr),
+      _info(other._info),
+      _instance(std::move(other._instance)) {
+    std::swap(_writer, other._writer);
+}
+
+ContinuousFlowWriter::~ContinuousFlowWriter() {
+    if (_writer) {
+        _instance.destroy(_writer);
+    }
+}
+
+::mxlFlowWriter ContinuousFlowWriter::raw() noexcept {
+    return _writer;
+}
+
+::mxlRational ContinuousFlowWriter::getRate() const noexcept {
+    return _info.common.grainRate;
+}
+
+std::string ContinuousFlowWriter::getFlowDefinition() const {
+    auto flowID = std::string(37, '\0');
+    uuid_unparse_lower(_info.common.id, flowID.data());
+    flowID.resize(36);
+    return _instance.getFlowDefinition(flowID);
+}
+
+std::uint32_t ContinuousFlowWriter::getChannelCount() const noexcept {
+    return _info.continuous.channelCount;
+}
+
+std::uint32_t ContinuousFlowWriter::getBatchSize() const noexcept {
+    return _info.common.maxSyncBatchSizeHint;
+}
+
+ContinuousFlowWriter::Access
+ContinuousFlowWriter::openSamples(std::uint64_t headIndex, std::size_t count) {
+    ::mxlMutableWrappedMultiBufferSlice dummy{};
+    mxl(::mxlFlowWriterOpenSamples, "failed to open samples", _writer, headIndex,
+        count, &dummy);
+    return Access{*this};
+}
+
+void ContinuousFlowWriter::commit() {
+    mxl(::mxlFlowWriterCommitSamples, "failed to commit samples", _writer);
+}
+
+void ContinuousFlowWriter::cancel() {
+    mxl(::mxlFlowWriterCancelSamples, "failed to cancel samples", _writer);
+}
+
+ContinuousFlowWriter::Access::Access(ContinuousFlowWriter& writer)
+    : _writer(writer) {
+}
+
+ContinuousFlowWriter::Access::~Access() noexcept(false) {
+    if (!_cancelled) {
+        _writer.commit();
+    }
+}
+
+void ContinuousFlowWriter::Access::cancel() {
+    _cancelled = true;
+    _writer.cancel();
 }
 
 } // namespace mxl
