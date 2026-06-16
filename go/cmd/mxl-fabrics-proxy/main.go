@@ -22,7 +22,7 @@ import (
 
 type Options struct {
 	LogLevel      string            `help:"Set the log level" enum:"debug,info,warn,error" default:"info"`
-	Node          string            `help:"Local node address" default:"127.0.0.1"`
+	Node          string            `help:"Local node address"`
 	Provider      string            `help:"Default provider to use"`
 	Listen        string            `short:"l" help:"Listen on this address for requests" default:"127.0.0.1:2283"`
 	Config        []string          `help:"Configuration file to load"`

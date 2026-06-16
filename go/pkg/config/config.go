@@ -229,7 +229,7 @@ func (c *Config) resolveNode(localDomain string, remote string) string {
 		return c.Defaults.Node
 	}
 
-	return ""
+	return "127.0.0.1"
 }
 
 func (c *Config) normalizeSubscription(domain string, sub *Subscription) ([]Subscription, error) {
