@@ -354,7 +354,7 @@ func parseProxyWorkerLogEntry(entry []byte) (slog.Record, error) {
 		case "debug":
 			level = slog.LevelDebug
 		case "info":
-			level = slog.LevelDebug
+			level = slog.LevelInfo
 		case "warning":
 			level = slog.LevelWarn
 		case "error":

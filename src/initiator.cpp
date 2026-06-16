@@ -190,9 +190,10 @@ void Initiator::transferGrains(::mxl::DiscreteFlowReader reader,
         }
     }
 }
-void Initiator::transferSamples(::mxl::ContinuousFlowReader reader,
-                                ::mxl::fabrics::ContinuousFlowInitiator initiator,
-                                utils::ExitSignal sig) {
+
+void Initiator::transferSamples(
+    ::mxl::ContinuousFlowReader reader,
+    ::mxl::fabrics::ContinuousFlowInitiator initiator, utils::ExitSignal sig) {
     auto headIndex = reader.getHeadIndex();
     auto batchSize = reader.getBatchSize();
     auto rate = reader.getRate();
@@ -226,18 +227,17 @@ void Initiator::transferSamples(::mxl::ContinuousFlowReader reader,
             spdlog::warn("samples at headIndex={} discarded because initiator "
                          "is not ready",
                          headIndex);
-        } else {
-            while (initiator.makeProgress(std::chrono::milliseconds(1000))) {
-                spdlog::warn("samples still not transmitted after timeout");
-                if (sig.shouldExit()) {
-                    return;
-                }
+        }
+        while (initiator.makeProgress(std::chrono::milliseconds(1000))) {
+            spdlog::warn("samples still not transmitted after timeout");
+            if (sig.shouldExit()) {
+                return;
             }
         }
 
         std::uint64_t skipped = 0;
         if (_lastIndex != 0 && headIndex > _lastIndex + batchSize) {
-            skipped = (headIndex - _lastIndex) / batchSize - 1;
+            skipped = (headIndex - _lastIndex);
         }
         _lastIndex = headIndex;
 
