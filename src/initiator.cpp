@@ -206,7 +206,8 @@ void Initiator::transferSamples(
         try {
             // Return value discarded: data is in shared memory; we only call
             // this to verify availability before the RDMA transfer.
-            (void)reader.getSamplesNonBlocking(headIndex, batchSize);
+            (void)reader.getSamples(headIndex, batchSize,
+                                    std::chrono::milliseconds(1000));
         } catch (::mxl::Exception const& ex) {
             if (ex.isTooLate()) {
                 headIndex = reader.getHeadIndex();
@@ -250,7 +251,6 @@ void Initiator::transferSamples(
         _metrics.observe(batchSize, batchSize, 1, skipped, sourceLatency, 0);
 
         headIndex += batchSize;
-        ::mxlSleepForNs(::mxlGetNsUntilIndex(headIndex, &rate));
     }
 }
 

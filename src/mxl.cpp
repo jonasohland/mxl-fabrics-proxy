@@ -326,8 +326,8 @@ ContinuousFlowReader::~ContinuousFlowReader() {
 
 std::uint64_t ContinuousFlowReader::getHeadIndex() const {
     ::mxlFlowRuntimeInfo info{};
-    mxl(::mxlFlowReaderGetRuntimeInfo, "failed to get flow runtime info", _reader,
-        &info);
+    mxl(::mxlFlowReaderGetRuntimeInfo, "failed to get flow runtime info",
+        _reader, &info);
     return info.headIndex;
 }
 
@@ -355,7 +355,17 @@ ContinuousFlowReader::getSamplesNonBlocking(std::uint64_t headIndex,
                                             std::size_t count) {
     ::mxlWrappedMultiBufferSlice slice{};
     mxl(::mxlFlowReaderGetSamplesNonBlocking,
-        "failed to get samples non-blocking", _reader, headIndex, count, &slice);
+        "failed to get samples non-blocking", _reader, headIndex, count,
+        &slice);
+    return slice;
+}
+
+::mxlWrappedMultiBufferSlice
+ContinuousFlowReader::getSamples(std::uint64_t headIndex, std::size_t count,
+                                 std::chrono::milliseconds timeout) {
+    ::mxlWrappedMultiBufferSlice slice{};
+    mxl(::mxlFlowReaderGetSamples, "failed to get samples", _reader, headIndex,
+        count, timeout.count(), &slice);
     return slice;
 }
 
@@ -511,8 +521,8 @@ std::uint32_t ContinuousFlowWriter::getBatchSize() const noexcept {
 ContinuousFlowWriter::Access
 ContinuousFlowWriter::openSamples(std::uint64_t headIndex, std::size_t count) {
     ::mxlMutableWrappedMultiBufferSlice dummy{};
-    mxl(::mxlFlowWriterOpenSamples, "failed to open samples", _writer, headIndex,
-        count, &dummy);
+    mxl(::mxlFlowWriterOpenSamples, "failed to open samples", _writer,
+        headIndex, count, &dummy);
     return Access{*this};
 }
 

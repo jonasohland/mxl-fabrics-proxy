@@ -190,6 +190,10 @@ class ContinuousFlowReader {
     [[nodiscard]] ::mxlWrappedMultiBufferSlice
     getSamplesNonBlocking(std::uint64_t headIndex, std::size_t count);
 
+    [[nodiscard]] ::mxlWrappedMultiBufferSlice
+    getSamples(std::uint64_t headIndex, std::size_t count,
+               std::chrono::milliseconds timeout);
+
   private:
     ContinuousFlowReader(::mxlFlowReader, ::mxlFlowConfigInfo, Instance);
     [[nodiscard]] ::mxlFlowReader raw() noexcept;
@@ -304,7 +308,8 @@ class ContinuousFlowWriter {
         bool _cancelled = false;
     };
 
-    [[nodiscard]] Access openSamples(std::uint64_t headIndex, std::size_t count);
+    [[nodiscard]] Access openSamples(std::uint64_t headIndex,
+                                     std::size_t count);
     [[nodiscard]] ::mxlRational getRate() const noexcept;
     [[nodiscard]] std::string getFlowDefinition() const;
     [[nodiscard]] std::uint32_t getChannelCount() const noexcept;
