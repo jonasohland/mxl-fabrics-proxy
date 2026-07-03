@@ -2,7 +2,7 @@
 
 set -e
 
-base_image="jonasohland/mxl:913c917_caps4-fabrics"
+base_image="jonasohland/mxl:2e2ad13-fabrics"
 
 project_dir="$(realpath "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"/..)"
 version="$(git -C "${project_dir}" describe --tags)"
