@@ -8,250 +8,233 @@
 
 namespace mxl::proxy {
 void Initiator::run(Config config, utils::ExitSignal sig) {
-    Initiator{std::move(config)}.run(sig);
+  Initiator{std::move(config)}.run(sig);
 }
 
 Initiator::Initiator(Config config)
-    : _mxl(config.domain),
-      _fabrics(_mxl),
-      _config(config),
-      _metrics(config.metricsSocket, false) {
-}
+    : _mxl(config.domain), _fabrics(_mxl), _config(config),
+      _metrics(config.metricsSocket, false) {}
 
 bool Initiator::measurePreciseNetworkLatency() const noexcept {
-    return !_config.noNetworkLatencyMeasurement;
+  return !_config.noNetworkLatencyMeasurement;
 }
 
 void Initiator::run(utils::ExitSignal sig) {
-    auto flowVariant = _mxl.openFlow(_config.flowId);
-    if (std::holds_alternative<::mxl::DiscreteFlowReader>(flowVariant)) {
-        auto reader =
-            std::get<::mxl::DiscreteFlowReader>(std::move(flowVariant));
-        std::optional<::mxl::DiscreteFlowWriter> writer = std::nullopt;
-        if (measurePreciseNetworkLatency()) {
-            writer.emplace(openWriter(reader));
-        }
-        auto initiator = createInitiator(reader);
-        auto targetInfo = ::mxl::fabrics::TargetInfo::parse(_config.targetInfo);
-        initiator.addTarget(targetInfo);
-        connect(initiator, sig);
-        auto _ = ScopedRTScheduling{_config.schedPrio};
-        transferGrains(std::move(reader), std::move(writer),
-                       std::move(initiator), sig);
-    } else {
-        auto reader =
-            std::get<::mxl::ContinuousFlowReader>(std::move(flowVariant));
-        auto initiator = createInitiator(reader);
-        auto targetInfo = ::mxl::fabrics::TargetInfo::parse(_config.targetInfo);
-        initiator.addTarget(targetInfo);
-        connect(initiator, sig);
-        auto _ = ScopedRTScheduling{_config.schedPrio};
-        transferSamples(std::move(reader), std::move(initiator), sig);
+  auto flowVariant = _mxl.openFlow(_config.flowId);
+  if (std::holds_alternative<::mxl::DiscreteFlowReader>(flowVariant)) {
+    auto reader = std::get<::mxl::DiscreteFlowReader>(std::move(flowVariant));
+    std::optional<::mxl::DiscreteFlowWriter> writer = std::nullopt;
+    if (measurePreciseNetworkLatency()) {
+      writer.emplace(openWriter(reader));
     }
+    auto initiator = createInitiator(reader);
+    auto targetInfo = ::mxl::fabrics::TargetInfo::parse(_config.targetInfo);
+    initiator.addTarget(targetInfo);
+    connect(initiator, sig);
+    auto _ = ScopedRTScheduling{_config.schedPrio};
+    transferGrains(std::move(reader), std::move(writer), std::move(initiator),
+                   sig);
+  } else {
+    auto reader = std::get<::mxl::ContinuousFlowReader>(std::move(flowVariant));
+    auto initiator = createInitiator(reader);
+    auto targetInfo = ::mxl::fabrics::TargetInfo::parse(_config.targetInfo);
+    initiator.addTarget(targetInfo);
+    connect(initiator, sig);
+    auto _ = ScopedRTScheduling{_config.schedPrio};
+    transferSamples(std::move(reader), std::move(initiator), sig);
+  }
 }
 
 ::mxl::DiscreteFlowWriter
-Initiator::openWriter(::mxl::DiscreteFlowReader const& reader) {
-    auto writer = _mxl.createFlow(reader.getFlowDefinition());
-    if (!std::holds_alternative<DiscreteFlowWriter>(writer)) {
-        throw ::mxl::Exception{MXL_ERR_INVALID_ARG,
-                               "request flow is not a discrete flow"};
-    }
+Initiator::openWriter(::mxl::DiscreteFlowReader const &reader) {
+  auto writer = _mxl.createFlow(reader.getFlowDefinition());
+  if (!std::holds_alternative<DiscreteFlowWriter>(writer)) {
+    throw ::mxl::Exception{MXL_ERR_INVALID_ARG,
+                           "request flow is not a discrete flow"};
+  }
 
-    return std::get<DiscreteFlowWriter>(std::move(writer));
+  return std::get<DiscreteFlowWriter>(std::move(writer));
 }
 
 ::mxl::fabrics::DiscreteFlowInitiator
-Initiator::createInitiator(DiscreteFlowReader& reader) {
-    return _fabrics.createInitiator(reader, {
-                                                .node = _config.node,
-                                                .service = _config.service,
-                                                .provider = _config.provider,
-                                            });
+Initiator::createInitiator(DiscreteFlowReader &reader) {
+  return _fabrics.createInitiator(reader, {
+                                              .node = _config.node,
+                                              .service = _config.service,
+                                              .provider = _config.provider,
+                                          });
 }
 
 ::mxl::fabrics::ContinuousFlowInitiator
-Initiator::createInitiator(::mxl::ContinuousFlowReader& reader) {
-    return _fabrics.createInitiator(reader, {
-                                                .node = _config.node,
-                                                .service = _config.service,
-                                                .provider = _config.provider,
-                                            });
+Initiator::createInitiator(::mxl::ContinuousFlowReader &reader) {
+  return _fabrics.createInitiator(reader, {
+                                              .node = _config.node,
+                                              .service = _config.service,
+                                              .provider = _config.provider,
+                                          });
 }
 
-void Initiator::connect(::mxl::fabrics::DiscreteFlowInitiator& initiator,
+void Initiator::connect(::mxl::fabrics::DiscreteFlowInitiator &initiator,
                         utils::ExitSignal sig) {
-    spdlog::info("waiting to connect...");
-    for (;;) {
-        if (sig.shouldExit()) {
-            return;
-        }
-
-        if (initiator.makeProgress(std::chrono::milliseconds(500))) {
-            continue;
-        }
-
-        spdlog::info("connected");
-        return;
+  spdlog::info("waiting to connect...");
+  for (;;) {
+    if (sig.shouldExit()) {
+      return;
     }
+
+    if (initiator.makeProgress(std::chrono::milliseconds(500))) {
+      continue;
+    }
+
+    spdlog::info("connected");
+    return;
+  }
 }
 
-void Initiator::connect(::mxl::fabrics::ContinuousFlowInitiator& initiator,
+void Initiator::connect(::mxl::fabrics::ContinuousFlowInitiator &initiator,
                         utils::ExitSignal sig) {
-    spdlog::info("waiting to connect...");
-    for (;;) {
-        if (sig.shouldExit()) {
-            return;
-        }
-
-        if (initiator.makeProgress(std::chrono::milliseconds(500))) {
-            continue;
-        }
-
-        spdlog::info("connected");
-        return;
+  spdlog::info("waiting to connect...");
+  for (;;) {
+    if (sig.shouldExit()) {
+      return;
     }
+
+    if (initiator.makeProgress(std::chrono::milliseconds(500))) {
+      continue;
+    }
+
+    spdlog::info("connected");
+    return;
+  }
 }
 
 void Initiator::transferGrains(::mxl::DiscreteFlowReader reader,
                                std::optional<::mxl::DiscreteFlowWriter> writer,
                                ::mxl::fabrics::DiscreteFlowInitiator initiator,
                                utils::ExitSignal sig) {
-    std::uint64_t index = 0;
-    auto lastSuccessfullGrainRead = std::chrono::steady_clock::now();
-    for (;;) {
-        try {
-            if (sig.shouldExit()) {
-                return;
-            }
+  std::uint64_t index = 0;
+  auto lastSuccessfullGrainRead = std::chrono::steady_clock::now();
+  for (;;) {
+    try {
+      if (sig.shouldExit()) {
+        return;
+      }
 
-            auto grainAccess =
-                reader.getGrain(index, std::chrono::milliseconds(100));
-            lastSuccessfullGrainRead = std::chrono::steady_clock::now();
-            auto rxTime = ::mxlGetTime();
-            if (measurePreciseNetworkLatency()) {
-                auto writeAccess = writer->openGrain(index);
-                writeAccess.writeTxTimestamp(::mxlGetTime());
-                writeAccess.cancel();
-            }
-            spdlog::debug("transmitting grain index={} fromSlice={} toSlice={}",
-                          index, 0, grainAccess.validSlices());
-            if (!initiator.transfer(index, 0, grainAccess.validSlices())) {
-                spdlog::warn("grain at index={} discarded because initiator is "
-                             "not ready",
-                             index);
-            }
-            while (initiator.makeProgress(std::chrono::milliseconds(1000))) {
-                spdlog::warn("grain still not transmitted after timeout");
-                if (sig.shouldExit()) {
-                    return;
-                }
-            }
-
-            // Calculate the number of skipped grains
-            std::uint64_t skipped = 0;
-            if (_lastIndex < index) {
-                if (_lastIndex != 0) {
-                    std::uint64_t skipped = 0;
-                    skipped = index - (_lastIndex + 1);
-                }
-
-                _lastIndex = index;
-            }
-
-            auto rate = reader.getRate();
-            auto grainSize = grainAccess.size();
-
-            // Calculate the source latency
-            auto grainTime = ::mxlIndexToTimestamp(&rate, index);
-            auto sourceLatency = std::uint64_t{0};
-            if (rxTime > grainTime) {
-                sourceLatency = rxTime - grainTime;
-            }
-
-            _metrics.observe(grainSize, grainSize + 4096, 1, skipped,
-                             sourceLatency, 0);
-            ++index;
-        } catch (::mxl::Exception const& ex) {
-            auto timeSinceLastGrainRead =
-                std::chrono::steady_clock::now() - lastSuccessfullGrainRead;
-            if (timeSinceLastGrainRead > std::chrono::seconds(10)) {
-                throw Exception{MXL_ERR_TIMEOUT,
-                                "timed out waiting for a grain to be published "
-                                "to the flow"};
-            }
-
-            if (ex.isTooEarly() || ex.isTooLate()) {
-                index = reader.getHeadIndex() + 1;
-                continue;
-            }
-
-            throw ex;
+      auto grainAccess = reader.getGrain(index, std::chrono::milliseconds(100));
+      lastSuccessfullGrainRead = std::chrono::steady_clock::now();
+      auto rxTime = ::mxlGetTime();
+      if (measurePreciseNetworkLatency()) {
+        auto writeAccess = writer->openGrain(index);
+        writeAccess.writeTxTimestamp(::mxlGetTime());
+        writeAccess.cancel();
+      }
+      spdlog::debug("transmitting grain index={} fromSlice={} toSlice={}",
+                    index, 0, grainAccess.validSlices());
+      if (!initiator.transfer(index, 0, grainAccess.validSlices())) {
+        spdlog::warn("grain at index={} discarded because initiator is "
+                     "not ready",
+                     index);
+      }
+      while (initiator.makeProgress(std::chrono::milliseconds(1000))) {
+        spdlog::warn("grain still not transmitted after timeout");
+        if (sig.shouldExit()) {
+          return;
         }
+      }
+
+      // Calculate the number of skipped grains
+      std::uint64_t skipped = 0;
+      if (_lastIndex < index) {
+        if (_lastIndex != 0) {
+          std::uint64_t skipped = 0;
+          skipped = index - (_lastIndex + 1);
+        }
+
+        _lastIndex = index;
+      }
+
+      auto rate = reader.getRate();
+      auto grainSize = grainAccess.size();
+
+      // Calculate the source latency
+      auto grainTime = ::mxlIndexToTimestamp(&rate, index);
+      auto sourceLatency = std::uint64_t{0};
+      if (rxTime > grainTime) {
+        sourceLatency = rxTime - grainTime;
+      }
+
+      _metrics.observe(grainSize, grainSize + 4096, 1, skipped, sourceLatency,
+                       0);
+      ++index;
+    } catch (::mxl::Exception const &ex) {
+      auto timeSinceLastGrainRead =
+          std::chrono::steady_clock::now() - lastSuccessfullGrainRead;
+      if (timeSinceLastGrainRead > std::chrono::seconds(10)) {
+        throw Exception{MXL_ERR_TIMEOUT,
+                        "timed out waiting for a grain to be published "
+                        "to the flow"};
+      }
+
+      if (ex.isTooEarly() || ex.isTooLate()) {
+        index = reader.getHeadIndex() + 1;
+        continue;
+      }
+
+      throw ex;
     }
+  }
 }
 
 void Initiator::transferSamples(
     ::mxl::ContinuousFlowReader reader,
     ::mxl::fabrics::ContinuousFlowInitiator initiator, utils::ExitSignal sig) {
-    auto headIndex = reader.getHeadIndex();
-    auto batchSize = reader.getBatchSize();
-    auto rate = reader.getRate();
-
-    for (;;) {
-        if (sig.shouldExit()) {
-            return;
-        }
-
-        try {
-            // Return value discarded: data is in shared memory; we only call
-            // this to verify availability before the RDMA transfer.
-            (void)reader.getSamples(headIndex, batchSize,
-                                    std::chrono::milliseconds(1000));
-        } catch (::mxl::Exception const& ex) {
-            if (ex.isTooLate()) {
-                headIndex = reader.getHeadIndex();
-                continue;
-            }
-            if (ex.isTooEarly()) {
-                ::mxlSleepForNs(::mxlGetNsUntilIndex(headIndex, &rate));
-                continue;
-            }
-            throw;
-        }
-
-        auto rxTime = ::mxlGetTime();
-
-        spdlog::debug("transferring samples headIndex={} count={}", headIndex,
-                      batchSize);
-        if (!initiator.transferSamples(headIndex, batchSize)) {
-            spdlog::warn("samples at headIndex={} discarded because initiator "
-                         "is not ready",
-                         headIndex);
-        }
-        while (initiator.makeProgress(std::chrono::milliseconds(1000))) {
-            spdlog::warn("samples still not transmitted after timeout");
-            if (sig.shouldExit()) {
-                return;
-            }
-        }
-
-        std::uint64_t skipped = 0;
-        if (_lastIndex != 0 && headIndex > _lastIndex + batchSize) {
-            skipped = (headIndex - _lastIndex);
-        }
-        _lastIndex = headIndex;
-
-        auto grainTime = ::mxlIndexToTimestamp(&rate, headIndex);
-        auto sourceLatency = std::uint64_t{0};
-        if (rxTime > grainTime) {
-            sourceLatency = rxTime - grainTime;
-        }
-
-        _metrics.observe(batchSize, batchSize, 1, skipped, sourceLatency, 0);
-
-        headIndex += batchSize;
+  auto lastReadTime = ::mxlGetTime();
+  auto headIndex = reader.getHeadIndex();
+  auto batchSize = reader.getBatchSize();
+  auto rate = reader.getRate();
+  auto interval =
+      static_cast<std::uint64_t>(((static_cast<double>(rate.denominator) /
+                                   static_cast<double>(rate.numerator)) *
+                                  static_cast<double>(batchSize)) *
+                                 std::nano::den);
+  for (;;) {
+    if (sig.shouldExit()) {
+      return;
     }
+
+    try {
+      // Return value discarded: data is in shared memory; we only call
+      // this to verify availability before the RDMA transfer.
+      (void)reader.getSamplesNonBlocking(headIndex, batchSize);
+    } catch (::mxl::Exception const &ex) {
+      if (ex.isTooLate()) {
+        headIndex = reader.getHeadIndex();
+        continue;
+      }
+      if (ex.isTooEarly()) {
+        continue;
+      }
+      throw;
+    }
+    lastReadTime = ::mxlGetTime();
+    auto rxTime = lastReadTime;
+
+    spdlog::debug("transferring samples headIndex={} count={}", headIndex,
+                  batchSize);
+    if (!initiator.transferSamples(headIndex, batchSize)) {
+      spdlog::warn("samples at headIndex={} discarded because initiator "
+                   "is not ready",
+                   headIndex);
+    }
+    while (initiator.makeProgress(std::chrono::milliseconds(1000))) {
+      if (sig.shouldExit()) {
+        return;
+      }
+    }
+
+    headIndex += batchSize;
+    ::mxlSleepUntil(lastReadTime + interval);
+  }
 }
 
 } // namespace mxl::proxy
