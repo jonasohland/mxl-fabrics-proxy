@@ -1,4 +1,4 @@
-ARG BASE_IMAGE="jonasohland/mxl:dea3fcf-fabrics"
+ARG BASE_IMAGE="jonasohland/mxl:v1.1-rc1-fabrics"
 FROM ${BASE_IMAGE} AS builder
 
 USER 0:0
