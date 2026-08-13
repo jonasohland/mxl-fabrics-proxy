@@ -76,6 +76,13 @@ func (t *Targets) Create(c *TargetConfig) (string, error) {
 	return id, nil
 }
 
+func (t *Targets) Count() int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	return len(t.targets)
+}
+
 func (t *Targets) Destroy(id string) {
 	target := t.remove(id)
 	if target != nil {

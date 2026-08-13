@@ -177,6 +177,44 @@ curl -X POST http://localhost:2283/v1/reload
 
 The proxy will atomically apply the new configuration while keeping existing flows running where possible.
 
+### Automatic Reloads (`mxl-fabrics-proxy-reloader`)
+
+The proxy does not watch its configuration files itself. `mxl-fabrics-proxy-reloader`
+is a small companion binary that does: it watches the same files and directories
+you pass to the proxy's `--config` flag and triggers a reload when their contents
+change. It is shipped in the same Docker image, which makes it convenient to run
+as a Kubernetes sidecar next to the proxy container, watching a mounted ConfigMap.
+
+```bash
+mxl-fabrics-proxy-reloader --config /config --server 127.0.0.1:2283
+```
+
+| Flag         | Short | Default          | Description |
+|--------------|-------|------------------|-----------|
+| `--config`   |       | —                | Config file or directory to watch (repeatable), same semantics as the proxy |
+| `--server`   | `-s`  | `127.0.0.1:2283` | Address of the proxy to reload, either `host:port` or a full URL |
+| `--interval` |       | `1s`             | How often the configuration is checked for changes |
+| `--debounce` |       | `2s`             | How long the configuration must stay unchanged before a reload is triggered |
+| `--timeout`  |       | `30s`            | Timeout for a single reload request |
+| `--log-level`|       | `info`           | `debug`, `info`, `warn`, `error` |
+
+Change detection is based on a hash of the contents of every file the proxy would
+load, so it behaves correctly with the atomic symlink swap Kubernetes uses to
+update a mounted ConfigMap. A reload is only triggered once the contents have
+stayed unchanged for the debounce interval, which coalesces multi-file updates
+and rides out reads that race with an update in progress.
+
+A reload is always triggered once at startup. The proxy reads its configuration
+by itself, but there is no ordering guarantee between the two processes — the
+proxy may have started before the current contents were in place — so the
+reloader does not assume the running configuration matches what is on disk. The
+debounce applies to this first reload too, giving a config volume that is still
+being populated time to settle.
+
+If the proxy rejects a configuration, or is not listening yet, the reloader
+retries with an exponential backoff (up to 30s), and retries immediately when
+the files change again.
+
 ## Building from Source
 
 ```bash
@@ -195,11 +233,48 @@ make -j$(nproc)
 The resulting binaries are:
 - `mxl-fabrics-proxy` — main proxy
 - `mxl-fabrics-proxy-worker` — internal worker (launched automatically)
+- `mxl-fabrics-proxy-reloader` — optional config file watcher (see [Automatic Reloads](#automatic-reloads-mxl-fabrics-proxy-reloader))
 
 ## Observability
 
 - **Metrics**: Prometheus endpoint at `http://<listen>/metrics`
+- **Health**: `http://<listen>/healthz` (also served at `/v1/health`)
 - **Tracing**: Enable with `--tracing` or `tracing: true` in config for detailed logfmt output including flow labels and descriptions
+
+### Health Endpoint
+
+```bash
+curl http://localhost:2283/healthz
+```
+
+```json
+{
+  "status": "ok",
+  "uptime_seconds": 3812.4,
+  "proxy_version": "0.0.1",
+  "mxl_version": "1.1.0-rc1",
+  "libfabric_version": "2.6",
+  "domains": 2,
+  "subscriptions": 0,
+  "targets": 4
+}
+```
+
+The endpoint reports whether the proxy process is up and serving. It returns 200
+whenever that is true and does not touch the workers, which makes it cheap enough
+to use as a Kubernetes liveness and readiness probe — unlike `/metrics`, which
+scrapes every worker on each request.
+
+It deliberately does **not** go unhealthy when a transfer is failing. Targets and
+workers retry on their own, and a remote peer being unreachable is not a reason to
+restart this proxy and drop every other flow it carries. Use the metrics
+(`mxl_worker_restarts`, `mxl_writer_active`, `mxl_reader_active`) to alert on
+flow-level problems.
+
+The counts follow the internal naming: `targets` is the number of flows this proxy
+receives (one per entry in the `subscriptions` config section), while
+`subscriptions` is the number of flows it currently sends to remote proxies that
+have subscribed to it.
 
 ## Contributing
 

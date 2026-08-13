@@ -32,6 +32,7 @@ RUN PKG_CONFIG_PATH=/opt/amazon/efa/lib/pkgconfig cmake -B build  \
 RUN make -C build -j$(nproc)
 RUN make -C build install
 RUN /usr/local/go/bin/go build -o /usr/bin/mxl-fabrics-proxy ./go/cmd/mxl-fabrics-proxy
+RUN /usr/local/go/bin/go build -o /usr/bin/mxl-fabrics-proxy-reloader ./go/cmd/mxl-fabrics-proxy-reloader
 
 FROM ${BASE_IMAGE}
 
@@ -45,6 +46,10 @@ RUN apt-get update && \
 
 COPY --from=builder /usr/bin/mxl-fabrics-proxy /usr/bin/mxl-fabrics-proxy
 COPY --from=builder /usr/bin/mxl-fabrics-proxy-worker /usr/bin/mxl-fabrics-proxy-worker
+COPY --from=builder /usr/bin/mxl-fabrics-proxy-reloader /usr/bin/mxl-fabrics-proxy-reloader
+
+COPY ./deployment/scripts/k8s-write-node-address-config-snippet.sh /usr/local/bin/k8s-write-node-address-config-snippet.sh 
+COPY ./deployment/scripts/k8s-entrypoint.sh /usr/local/bin/k8s-entrypoint.sh
 
 USER mxl:mxl
 ENV GOMAXPROCS=1

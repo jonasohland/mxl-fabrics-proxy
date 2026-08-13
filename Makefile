@@ -1,5 +1,5 @@
 .PHONY: all
-all: cmake-configure cmake-build cmake-install tidy proxy
+all: cmake-configure cmake-build cmake-install tidy proxy reloader
 
 .PHONY: cmake-configure
 cmake-configure:
@@ -16,7 +16,7 @@ cmake-install: cmake-build
 .PHONY: clean
 clean:
 	make -C build clean
-	rm -f build/mxl-fabrics-proxy
+	rm -f build/mxl-fabrics-proxy build/mxl-fabrics-proxy-reloader
 
 .PHONY: tidy
 tidy:
@@ -25,6 +25,10 @@ tidy:
 .PHONY: proxy
 proxy:
 	go build -o build/mxl-fabrics-proxy ./go/cmd/mxl-fabrics-proxy
+
+.PHONY: reloader
+reloader:
+	go build -o build/mxl-fabrics-proxy-reloader ./go/cmd/mxl-fabrics-proxy-reloader
 
 .PHONY: install
 install: cmake-install

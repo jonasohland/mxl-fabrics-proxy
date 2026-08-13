@@ -200,6 +200,13 @@ func (s *Subscriptions) Create(req *common.SubscriptionRequest) (string, error) 
 	return s.createSuscription(req)
 }
 
+func (s *Subscriptions) Count() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return len(s.subscriptions)
+}
+
 func (s *Subscriptions) Remove(id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

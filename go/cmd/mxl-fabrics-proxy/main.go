@@ -12,6 +12,7 @@ import (
 	"github.com/alecthomas/kong"
 	"github.com/dpotapov/slogpfx"
 	"github.com/jonasohland/mxl-fabrics-proxy/go/pkg/config"
+	"github.com/jonasohland/mxl-fabrics-proxy/go/pkg/health"
 	"github.com/jonasohland/mxl-fabrics-proxy/go/pkg/initiator"
 	"github.com/jonasohland/mxl-fabrics-proxy/go/pkg/metrics"
 	"github.com/jonasohland/mxl-fabrics-proxy/go/pkg/server"
@@ -52,7 +53,7 @@ func createLogger(tracing bool) *slog.Logger {
 	}
 }
 
-func launch(ctx context.Context, wg *sync.WaitGroup, options *Options) error {
+func launch(ctx context.Context, wg *sync.WaitGroup, options *Options, versions worker.Versions) error {
 	metrics := metrics.NewMetrics()
 	domains := initiator.NewDomains()
 	subs := initiator.NewSubscriptions(ctx, wg, domains, metrics, options.Tracing)
@@ -94,6 +95,7 @@ func launch(ctx context.Context, wg *sync.WaitGroup, options *Options) error {
 	server.Mux(domains)
 	server.Mux(metrics)
 	server.Mux(runner)
+	server.Mux(health.NewHealth(versions, domains, subs, targets))
 
 	if err := server.StartListening(options.Listen, nil); err != nil {
 		return err
@@ -119,7 +121,7 @@ func main() {
 	defer cancel()
 
 	slog.Info("starting", "proxy-version", versions.Proxy, "mxl-version", versions.MXL, "libfabric-version", versions.Libfabric)
-	if err := launch(ctx, wg, &options); err != nil {
+	if err := launch(ctx, wg, &options, versions); err != nil {
 		slog.Error("launch failed", "error", err)
 		cancel()
 		wg.Wait()

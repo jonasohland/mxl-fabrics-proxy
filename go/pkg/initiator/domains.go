@@ -65,6 +65,13 @@ func (d *Domains) Add(domainURL, name, mappedNode, provider string) (string, err
 	return id, nil
 }
 
+func (d *Domains) Count() int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	return len(d.domains)
+}
+
 func (d *Domains) Remove(id string) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
