@@ -22,6 +22,8 @@ for candidate in "$config_dir/$node_name.yaml" "$config_dir/$node_name.yml"; do
   fi
 done
 
+[[ -n "$config" ]] || fail "no configuration for node '$node_name' in '$config_dir'"
+
 echo "starting proxy for node '$node_name' with '$config'" >&2
 
 exec dumb-init -- mxl-fabrics-proxy \
