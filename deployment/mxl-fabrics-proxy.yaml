@@ -102,6 +102,16 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              memory: 64Mi
+          volumeMounts:
+            - name: config
+              mountPath: /config
+              readOnly: true
         - name: proxy
           image: docker.io/jonasohland/mxl-fabrics-proxy:latest
           command:
@@ -161,14 +171,4 @@ spec:
               readOnly: true
             - name: generated
               mountPath: /generated
-              readOnly: true
-          resources:
-            requests:
-              cpu: 10m
-              memory: 32Mi
-            limits:
-              memory: 64Mi
-          volumeMounts:
-            - name: config
-              mountPath: /config
               readOnly: true
