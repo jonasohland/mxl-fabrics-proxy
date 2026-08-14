@@ -14,7 +14,7 @@ data:
         url: mxl:///dev/shm/mxl0
     subscriptions:
       mxl0:
-        - url: mxl://node-b:2283/dev/shm/mxl0?id=e59a5dbd-d79c-41e0-b697-82b0f68ffdae
+        - url: mxl://node-b.mxl.ebu.org/dev/shm/mxl0?id=e59a5dbd-d79c-41e0-b697-82b0f68ffdae
   node-b.yaml: |
     defaults:
       provider: tcp
