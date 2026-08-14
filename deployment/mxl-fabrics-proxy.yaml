@@ -1,10 +1,3 @@
-# Reference deployment of mxl-fabrics-proxy as a DaemonSet with one
-# configuration per node.
-#
-# The ConfigMap holds one entry per node, named after the node it applies to.
-# An init container discovers a node address usable with the configured provider
-# and writes it to a shared volume as a config snippet; the entrypoint of the
-# proxy container selects this node's entry and starts the proxy with both.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -21,8 +14,7 @@ data:
         url: mxl:///dev/shm/mxl0
     subscriptions:
       mxl0:
-        - url: mxl://node-b:2283/dev/shm/mxl0
-          id: 5592a23b-0974-45bb-9388-89ea81c42537
+        - url: mxl://node-b:2283/dev/shm/mxl0?id=e59a5dbd-d79c-41e0-b697-82b0f68ffdae
   node-b.yaml: |
     defaults:
       provider: tcp
@@ -53,32 +45,30 @@ spec:
         prometheus.io/port: "2283"
         prometheus.io/path: /metrics
     spec:
-      # The fabric endpoint address ends up in the target info that peers
-      # connect to, and peers address each other by node. Host networking makes
-      # that address the node's own, and is required for the verbs and efa
-      # providers. It also means port 2283 is bound on the node itself.
+      nodeSelector:
+        # label your nodes with RDMA hardware with this label to run the proxy there
+        mxl.ebu.org/mxl-fabrics-proxy: "true"
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet
-      # Workers get SIGTERM with a 5s wait delay, and the proxy deletes its
-      # subscriptions on the way out.
       terminationGracePeriodSeconds: 30
       volumes:
         - name: devshm
-          # MXL domains are tmpfs directories shared with the media functions
-          # running on this node.
           hostPath:
             path: /dev/shm
+            type: Directory
+        - name: infiniband
+          hostPath:
+            path: /dev/infiniband
             type: Directory
         - name: config
           configMap:
             name: mxl-fabrics-proxy-config
-        - name: generated
-          # Carries the discovered node address from the init container to the
-          # proxy.
+        - name: generated # contains the generated config snipped that contains the probed node addr
           emptyDir: {}
       initContainers:
+        # Uses mxl-fabrics-info to find an available node address for your selected provider
         - name: node-addr-init
-          image: docker.io/jonasohland/mxl-fabrics-proxy:0.0.3
+          image: docker.io/jonasohland/mxl-fabrics-proxy:latest
           command:
             - k8s-write-node-address-config-snippet.sh
           args:
@@ -86,15 +76,34 @@ spec:
             - $(MXL_FABRICS_PROXY_NODE_CONFIG)
           env:
             - name: MXL_FABRICS_PROVIDER
-              value: tcp
+              value: verbs
             - name: MXL_FABRICS_PROXY_NODE_CONFIG
               value: /generated/node.yaml
+          securityContext:
+            privileged: true
           volumeMounts:
             - name: generated
               mountPath: /generated
+            - name: infiniband
+              mountPath: /dev/infiniband
       containers:
+        # triggers a config reload whenever the config changes
+        - name: reloader
+          image: docker.io/jonasohland/mxl-fabrics-proxy:latest
+          command:
+            - /usr/bin/mxl-fabrics-proxy-reloader
+          args:
+            - --config
+            - /config/$(MXL_FABRICS_PROXY_NODE_NAME).yaml
+            - --server
+            - 127.0.0.1:2283
+          env:
+            - name: MXL_FABRICS_PROXY_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
         - name: proxy
-          image: docker.io/jonasohland/mxl-fabrics-proxy:0.0.3
+          image: docker.io/jonasohland/mxl-fabrics-proxy:latest
           command:
             - k8s-entrypoint.sh
           args:
@@ -106,7 +115,7 @@ spec:
                 fieldRef:
                   fieldPath: spec.nodeName
             - name: MXL_FABRICS_PROVIDER
-              value: tcp
+              value: verbs
             - name: MXL_FABRICS_PROXY_CONFIG_DIR
               value: /config
             - name: MXL_FABRICS_PROXY_NODE_CONFIG
@@ -132,39 +141,27 @@ spec:
             failureThreshold: 3
           resources:
             requests:
-              # One worker process per flow per direction, each polling. Scale
-              # the CPU request with the number of flows this node carries.
               cpu: 500m
               memory: 256Mi
             limits:
-              # Deliberately no CPU limit: throttling a transfer loop drops
-              # grains.
               memory: 1Gi
+          securityContext:
+            privileged: true
+            capabilities:
+              add:
+                - IPC_LOCK
+                - SYS_RESOURCE
           volumeMounts:
             - name: devshm
               mountPath: /dev/shm
+            - name: infiniband
+              mountPath: /dev/infiniband
             - name: config
               mountPath: /config
               readOnly: true
             - name: generated
               mountPath: /generated
               readOnly: true
-        - name: reloader
-          image: docker.io/jonasohland/mxl-fabrics-proxy:0.0.3
-          command:
-            - mxl-fabrics-proxy-reloader
-          args:
-            # Watches only this node's entry, so an edit to another node's
-            # config does not trigger a reload here.
-            - --config
-            - /config/$(MXL_FABRICS_PROXY_NODE_NAME).yaml
-            - --server
-            - 127.0.0.1:2283
-          env:
-            - name: MXL_FABRICS_PROXY_NODE_NAME
-              valueFrom:
-                fieldRef:
-                  fieldPath: spec.nodeName
           resources:
             requests:
               cpu: 10m
