@@ -1,5 +1,8 @@
+VERSION := $(shell git describe --tags --dirty 2>/dev/null || echo unknown)
+GO_LDFLAGS := -X github.com/jonasohland/mxl-replicator/internal/version.Version=$(VERSION)
+
 .PHONY: all
-all: cmake-configure cmake-build cmake-install tidy proxy-legacy reloader-legacy
+all: cmake-configure cmake-build cmake-install tidy replicator proxy-legacy reloader-legacy
 
 .PHONY: cmake-configure
 cmake-configure:
@@ -16,7 +19,7 @@ cmake-install: cmake-build
 .PHONY: clean
 clean:
 	make -C build clean
-	rm -f build/mxl-fabrics-proxy build/mxl-fabrics-proxy-reloader
+	rm -f build/mxl-replicator build/mxl-fabrics-proxy build/mxl-fabrics-proxy-reloader
 
 # Two modules: the root module (mxl-replicator) and the frozen legacy tree at
 # legacy/go, tied together by go.work. `go mod tidy` is per-module.
@@ -25,10 +28,14 @@ tidy:
 	go mod tidy
 	go mod tidy -C legacy/go
 
-# The root module has no packages yet; add `go test ./...` here in M1.
 .PHONY: test
 test:
+	go test ./...
 	go test -C legacy/go ./...
+
+.PHONY: replicator
+replicator:
+	go build -ldflags "$(GO_LDFLAGS)" -o build/mxl-replicator ./cmd/mxl-replicator
 
 .PHONY: proxy-legacy
 proxy-legacy:

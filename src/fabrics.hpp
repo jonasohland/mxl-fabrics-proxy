@@ -1,10 +1,13 @@
 #pragma once
 
 #include "mxl.hpp"
+#include <cstdint>
 #include <memory>
 #include <mxl/fabrics.h>
 #include <optional>
+#include <string_view>
 #include <utility>
+#include <vector>
 
 namespace mxl::fabrics {
 
@@ -13,17 +16,60 @@ class DiscreteFlowInitiator;
 class ContinuousFlowTarget;
 class ContinuousFlowInitiator;
 
+/** The endpoint configuration both ends of a session must agree on. The library
+ * does no negotiation of its own: it is documented as requiring the target and
+ * the initiator to be handed the same capabilities and maximum message size,
+ * with the caller's out-of-band channel responsible for agreeing them.
+ */
+struct InterfaceConfig {
+    ::mxlFabricsProvider provider;
+    std::uint64_t capsFlags;
+    std::uint64_t maxMessageSize;
+};
+
 struct TargetConfig {
     std::string node;
     std::string service;
-    ::mxlFabricsProvider provider;
+    InterfaceConfig interface;
 };
 
 struct InitiatorConfig {
     std::string node;
     std::string service;
-    ::mxlFabricsProvider provider;
+    InterfaceConfig interface;
 };
+
+/** One (interface, address, provider) combination available on this host, as
+ * reported by mxlFabricsGetInterfaces(). The same physical interface appears
+ * several times when it is reachable through several providers or carries
+ * several addresses.
+ */
+struct InterfaceInfo {
+    ::mxlFabricsProvider provider;
+    std::string node;
+    std::string service;
+    std::uint64_t capsFlags;
+    std::uint64_t maxMessageSize;
+
+    /** Best-effort extra information as a JSON object, verbatim from the
+     * library. Empty when it reported none. Contents vary by platform and
+     * hardware; `device_name` is the interesting one and is not always present.
+     */
+    std::string attr;
+};
+
+/** Provider name, as used in the worker config and in the --interfaces output.
+ */
+[[nodiscard]] std::string_view providerName(::mxlFabricsProvider) noexcept;
+
+/** Capability flag names for a bitmask, in a stable order. */
+[[nodiscard]] std::vector<std::string> capsFlagNames(std::uint64_t flags);
+
+/** The bit for one capability flag name. Throws MXL_ERR_INVALID_ARG on an
+ * unknown name — a caps set the operator meant to constrain must never be
+ * silently widened by a typo.
+ */
+[[nodiscard]] std::uint64_t capsFlagFromName(std::string_view name);
 
 class TargetInfo {
   public:
@@ -76,17 +122,22 @@ class Instance {
   public:
     explicit Instance(mxl::Instance);
 
+    /** Enumerate every interface libfabric offers on this host. The domain
+     * behind the mxl instance is not used; only the fabrics instance is.
+     */
+    [[nodiscard]] std::vector<InterfaceInfo> getInterfaces() const;
+
     std::pair<DiscreteFlowTarget, TargetInfo>
     createTarget(mxl::DiscreteFlowWriter&, TargetConfig);
 
     std::pair<ContinuousFlowTarget, TargetInfo>
     createTarget(mxl::ContinuousFlowWriter&, TargetConfig);
 
-    DiscreteFlowInitiator
-    createInitiator(mxl::DiscreteFlowReader&, InitiatorConfig);
+    DiscreteFlowInitiator createInitiator(mxl::DiscreteFlowReader&,
+                                          InitiatorConfig);
 
-    ContinuousFlowInitiator
-    createInitiator(mxl::ContinuousFlowReader&, InitiatorConfig);
+    ContinuousFlowInitiator createInitiator(mxl::ContinuousFlowReader&,
+                                            InitiatorConfig);
 
   private:
     void destroy(::mxlFabricsTarget);

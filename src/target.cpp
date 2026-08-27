@@ -62,16 +62,18 @@ Target::createWriter() const {
 
 std::pair<::mxl::fabrics::DiscreteFlowTarget, ::mxl::fabrics::TargetInfo>
 Target::createTarget(::mxl::DiscreteFlowWriter& writer) {
-    return _fabrics.createTarget(writer, {.node = _config.node,
-                                          .service = _config.service,
-                                          .provider = _config.provider});
+    return _fabrics.createTarget(writer,
+                                 {.node = _config.node,
+                                  .service = _config.service,
+                                  .interface = _config.interfaceConfig()});
 }
 
 std::pair<::mxl::fabrics::ContinuousFlowTarget, ::mxl::fabrics::TargetInfo>
 Target::createTarget(::mxl::ContinuousFlowWriter& writer) {
-    return _fabrics.createTarget(writer, {.node = _config.node,
-                                          .service = _config.service,
-                                          .provider = _config.provider});
+    return _fabrics.createTarget(writer,
+                                 {.node = _config.node,
+                                  .service = _config.service,
+                                  .interface = _config.interfaceConfig()});
 }
 
 void Target::transferGrains(::mxl::DiscreteFlowWriter writer,
@@ -141,7 +143,7 @@ std::uint64_t Target::readNextGrain(::mxl::fabrics::DiscreteFlowTarget& target,
         res = target.readGrain(std::chrono::milliseconds(500));
         if (!res) {
             auto waitTime = std::chrono::system_clock::now() - lastRead;
-            if (waitTime > std::chrono::seconds(10)) {
+            if (_config.idleTimeout && (waitTime > *_config.idleTimeout)) {
                 throw ::mxl::Exception{MXL_ERR_TIMEOUT,
                                        "timed out waiting for a grain"};
             }
@@ -197,7 +199,7 @@ Target::readNextSamples(::mxl::fabrics::ContinuousFlowTarget& target,
         auto result = target.readSamples(std::chrono::milliseconds(500));
         if (!result) {
             auto waitTime = std::chrono::system_clock::now() - lastRead;
-            if (waitTime > std::chrono::seconds(10)) {
+            if (_config.idleTimeout && (waitTime > *_config.idleTimeout)) {
                 throw ::mxl::Exception{MXL_ERR_TIMEOUT,
                                        "timed out waiting for samples"};
             }

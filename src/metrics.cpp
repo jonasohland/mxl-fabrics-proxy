@@ -4,6 +4,7 @@
 #include <cerrno>
 #include <fcntl.h>
 #include <filesystem>
+#include <format>
 #include <iomanip>
 #include <mxl/time.h>
 #include <spdlog/spdlog.h>
@@ -33,7 +34,30 @@ Metrics::Metrics(std::string const& socketPath, bool withNetworkLatency)
 
     ::sockaddr_un addr{};
     addr.sun_family = AF_UNIX;
+
+    // sun_path is a fixed buffer and strncpy neither terminates it nor
+    // complains: an over-long path silently binds a *truncated* one instead,
+    // so the supervisor scrapes a socket nobody is listening on, and two
+    // workers whose paths share a prefix collide on a path neither asked for.
+    // That presents as EADDRINUSE from an unrelated worker, which is a long
+    // way from the actual cause.
+    if (socketPath.size() >= sizeof addr.sun_path) {
+        throw std::system_error{
+            ENAMETOOLONG, std::generic_category(),
+            std::format("metrics socket path is {} bytes, the limit is {}",
+                        socketPath.size(), sizeof addr.sun_path - 1)};
+    }
+
     ::strncpy(addr.sun_path, socketPath.c_str(), sizeof addr.sun_path);
+
+    // bind() fails with EADDRINUSE on a path that already exists, and a worker
+    // killed with SIGKILL leaves its socket behind. A fresh work directory per
+    // start is still the supervisor's job, but this removes the class of
+    // failure rather than relying on it.
+    if ((::unlink(socketPath.c_str()) < 0) && (errno != ENOENT)) {
+        throw std::system_error{errno, std::generic_category(),
+                                "unlink metrics socket"};
+    }
 
     if (::bind(_listenFd, reinterpret_cast<::sockaddr*>(&addr), sizeof addr) <
         0) {

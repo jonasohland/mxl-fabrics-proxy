@@ -1,10 +1,88 @@
 #include "fabrics.hpp"
+#include <array>
+#include <format>
 #include <mxl/fabrics.h>
 #include <mxl/mxl.h>
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
+#include <utility>
 
 namespace mxl::fabrics {
+
+namespace {
+
+/// The flag names, paired with their bits. Shared by the --interfaces output
+/// and by config parsing, so the two cannot drift apart: the name the probe
+/// prints is the name the config accepts.
+constexpr std::array<std::pair<std::string_view, std::uint64_t>, 3>
+    capsFlagTable{{
+        {"REMOTE_WRITE", MXL_FABRICS_IFACE_CAP_REMOTE_WRITE},
+        {"SEND_RECEIVE", MXL_FABRICS_IFACE_CAP_SEND_RECEIVE},
+        {"BLOCKING_OPERATIONS", MXL_FABRICS_IFACE_CAP_BLOCKING_OPERATIONS},
+    }};
+
+/// Build the library's interface config from a negotiated one. `node` and
+/// `service` are borrowed: the library clones them during setup, but the
+/// strings must outlive the returned struct, so keep the owner alive across the
+/// setup call.
+::mxlFabricsInterfaceConfig makeInterfaceConfig(InterfaceConfig const& iface,
+                                                std::string const& node,
+                                                std::string const& service) {
+    return {
+        .version = MXL_FABRICS_API_VERSION,
+        .provider = iface.provider,
+        .caps =
+            {
+                .version = MXL_FABRICS_API_VERSION,
+                .flags = iface.capsFlags,
+                .maxMessageSize = iface.maxMessageSize,
+            },
+        .address =
+            {
+                .node = node.c_str(),
+                .service = service.c_str(),
+            },
+        .attr = nullptr,
+    };
+}
+
+} // namespace
+
+std::string_view providerName(::mxlFabricsProvider provider) noexcept {
+    switch (provider) {
+    case MXL_FABRICS_PROVIDER_ANY:
+        return "any";
+    case MXL_FABRICS_PROVIDER_TCP:
+        return "tcp";
+    case MXL_FABRICS_PROVIDER_VERBS:
+        return "verbs";
+    case MXL_FABRICS_PROVIDER_EFA:
+        return "efa";
+    case MXL_FABRICS_PROVIDER_SHM:
+        return "shm";
+    }
+    return "unknown";
+}
+
+std::vector<std::string> capsFlagNames(std::uint64_t flags) {
+    auto out = std::vector<std::string>{};
+    for (auto const& [name, bit] : capsFlagTable) {
+        if ((flags & bit) != 0) {
+            out.emplace_back(name);
+        }
+    }
+    return out;
+}
+
+std::uint64_t capsFlagFromName(std::string_view name) {
+    for (auto const& [known, bit] : capsFlagTable) {
+        if (name == known) {
+            return bit;
+        }
+    }
+    throw Exception{MXL_ERR_INVALID_ARG,
+                    std::format("unknown interface capability flag: {}", name)};
+}
 
 TargetInfo::TargetInfo(std::string id, ::mxlFabricsTargetInfo info)
     : _id(std::move(id)),
@@ -61,6 +139,15 @@ std::string TargetInfo::toString() const {
     mxl(::mxlFabricsTargetInfoToString,
         "failed to convert target info to string", _targetInfo, buffer.data(),
         &size);
+
+    // The reported size counts the NUL terminator, so the string keeps it.
+    // Left in, it is written verbatim into target-info.json and every consumer
+    // has to know to strip it — most JSON parsers reject a trailing NUL after
+    // the top-level value.
+    while (!buffer.empty() && (buffer.back() == '\0')) {
+        buffer.pop_back();
+    }
+
     return buffer;
 }
 
@@ -83,6 +170,33 @@ Instance::Inner::~Inner() {
     ::mxlFabricsDestroyInstance(instance);
 }
 
+std::vector<InterfaceInfo> Instance::getInterfaces() const {
+    auto* list = static_cast<::mxlFabricsInterfaceList*>(nullptr);
+    // A null query lists every provider. Filtering happens above this layer:
+    // the probe reports everything and the caller joins it against its own
+    // configuration, so that a configured attachment with no match here can be
+    // reported as the configuration error it is.
+    mxl(::mxlFabricsGetInterfaces, "failed to query interfaces",
+        _inner->instance, nullptr, &list);
+
+    auto out = std::vector<InterfaceInfo>{};
+    for (auto const* node = list; node != nullptr; node = node->next) {
+        auto const& iface = node->interface;
+        out.push_back(InterfaceInfo{
+            .provider = iface.provider,
+            .node = (iface.address.node != nullptr) ? iface.address.node : "",
+            .service =
+                (iface.address.service != nullptr) ? iface.address.service : "",
+            .capsFlags = iface.caps.flags,
+            .maxMessageSize = iface.caps.maxMessageSize,
+            .attr = (iface.attr != nullptr) ? iface.attr : "",
+        });
+    }
+
+    ::mxlFabricsFreeInterfaceList(list);
+    return out;
+}
+
 std::pair<DiscreteFlowTarget, TargetInfo>
 Instance::createTarget(DiscreteFlowWriter& writer, TargetConfig targetConfig) {
     ::mxlFabricsTarget target{};
@@ -92,24 +206,8 @@ Instance::createTarget(DiscreteFlowWriter& writer, TargetConfig targetConfig) {
 
     ::mxlFabricsTargetConfig config = {
         .version = MXL_FABRICS_API_VERSION,
-        .interface =
-            {
-                .version = MXL_FABRICS_API_VERSION,
-                .provider = targetConfig.provider,
-                .caps =
-                    {
-                        .version = MXL_FABRICS_API_VERSION,
-                        .flags = MXL_FABRICS_IFACE_CAP_REMOTE_WRITE |
-                                 MXL_FABRICS_IFACE_CAP_BLOCKING_OPERATIONS,
-                        .maxMessageSize = 0,
-                    },
-                .address =
-                    {
-                        .node = targetConfig.node.c_str(),
-                        .service = targetConfig.service.c_str(),
-                    },
-                .attr = nullptr,
-            },
+        .interface = makeInterfaceConfig(
+            targetConfig.interface, targetConfig.node, targetConfig.service),
         .writer = writer.raw(),
     };
 
@@ -130,23 +228,8 @@ Instance::createInitiator(DiscreteFlowReader& reader,
     ::mxlFabricsInitiatorConfig config = {
         .version = MXL_FABRICS_API_VERSION,
         .interface =
-            {
-                .version = MXL_FABRICS_API_VERSION,
-                .provider = initiatorConfig.provider,
-                .caps =
-                    {
-                        .version = MXL_FABRICS_API_VERSION,
-                        .flags = MXL_FABRICS_IFACE_CAP_REMOTE_WRITE |
-                                 MXL_FABRICS_IFACE_CAP_BLOCKING_OPERATIONS,
-                        .maxMessageSize = 0,
-                    },
-                .address =
-                    {
-                        .node = initiatorConfig.node.c_str(),
-                        .service = initiatorConfig.service.c_str(),
-                    },
-                .attr = nullptr,
-            },
+            makeInterfaceConfig(initiatorConfig.interface, initiatorConfig.node,
+                                initiatorConfig.service),
         .reader = reader.raw(),
     };
 
@@ -155,7 +238,8 @@ Instance::createInitiator(DiscreteFlowReader& reader,
 }
 
 std::pair<ContinuousFlowTarget, TargetInfo>
-Instance::createTarget(ContinuousFlowWriter& writer, TargetConfig targetConfig) {
+Instance::createTarget(ContinuousFlowWriter& writer,
+                       TargetConfig targetConfig) {
     ::mxlFabricsTarget target{};
 
     mxl(::mxlFabricsCreateTarget, "failed to create target", _inner->instance,
@@ -163,21 +247,8 @@ Instance::createTarget(ContinuousFlowWriter& writer, TargetConfig targetConfig) 
 
     ::mxlFabricsTargetConfig config = {
         .version = MXL_FABRICS_API_VERSION,
-        .interface = {
-            .version = MXL_FABRICS_API_VERSION,
-            .provider = targetConfig.provider,
-            .caps = {
-                .version = MXL_FABRICS_API_VERSION,
-                .flags = MXL_FABRICS_IFACE_CAP_REMOTE_WRITE |
-                         MXL_FABRICS_IFACE_CAP_BLOCKING_OPERATIONS,
-                .maxMessageSize = 0,
-            },
-            .address = {
-                .node = targetConfig.node.c_str(),
-                .service = targetConfig.service.c_str(),
-            },
-            .attr = nullptr,
-        },
+        .interface = makeInterfaceConfig(
+            targetConfig.interface, targetConfig.node, targetConfig.service),
         .writer = writer.raw(),
     };
 
@@ -197,21 +268,9 @@ Instance::createInitiator(ContinuousFlowReader& reader,
 
     ::mxlFabricsInitiatorConfig config = {
         .version = MXL_FABRICS_API_VERSION,
-        .interface = {
-            .version = MXL_FABRICS_API_VERSION,
-            .provider = initiatorConfig.provider,
-            .caps = {
-                .version = MXL_FABRICS_API_VERSION,
-                .flags = MXL_FABRICS_IFACE_CAP_REMOTE_WRITE |
-                         MXL_FABRICS_IFACE_CAP_BLOCKING_OPERATIONS,
-                .maxMessageSize = 0,
-            },
-            .address = {
-                .node = initiatorConfig.node.c_str(),
-                .service = initiatorConfig.service.c_str(),
-            },
-            .attr = nullptr,
-        },
+        .interface =
+            makeInterfaceConfig(initiatorConfig.interface, initiatorConfig.node,
+                                initiatorConfig.service),
         .reader = reader.raw(),
     };
 
@@ -378,11 +437,13 @@ bool DiscreteFlowInitiator::makeProgressNonBlocking() {
 
 ContinuousFlowTarget::ContinuousFlowTarget(Instance instance,
                                            ::mxlFabricsTarget target)
-    : _instance(std::move(instance)), _target(target) {
+    : _instance(std::move(instance)),
+      _target(target) {
 }
 
 ContinuousFlowTarget::ContinuousFlowTarget(ContinuousFlowTarget&& other)
-    : _instance(std::move(other._instance)), _target(nullptr) {
+    : _instance(std::move(other._instance)),
+      _target(nullptr) {
     std::swap(_target, other._target);
 }
 
@@ -432,13 +493,16 @@ ContinuousFlowTarget::readSamplesNonBlocking() {
     return {{headIndex, count}};
 }
 
-ContinuousFlowInitiator::ContinuousFlowInitiator(Instance instance,
-                                                  ::mxlFabricsInitiator initiator)
-    : _instance(std::move(instance)), _initiator(initiator) {
+ContinuousFlowInitiator::ContinuousFlowInitiator(
+    Instance instance, ::mxlFabricsInitiator initiator)
+    : _instance(std::move(instance)),
+      _initiator(initiator) {
 }
 
-ContinuousFlowInitiator::ContinuousFlowInitiator(ContinuousFlowInitiator&& other)
-    : _instance(std::move(other._instance)), _initiator(nullptr) {
+ContinuousFlowInitiator::ContinuousFlowInitiator(
+    ContinuousFlowInitiator&& other)
+    : _instance(std::move(other._instance)),
+      _initiator(nullptr) {
     std::swap(_initiator, other._initiator);
 }
 
@@ -460,8 +524,8 @@ void ContinuousFlowInitiator::addTarget(TargetInfo const& targetInfo) {
 }
 
 void ContinuousFlowInitiator::removeTarget(TargetInfo const& targetInfo) {
-    mxl(::mxlFabricsInitiatorRemoveTarget, "failed to remove target", _initiator,
-        targetInfo.raw());
+    mxl(::mxlFabricsInitiatorRemoveTarget, "failed to remove target",
+        _initiator, targetInfo.raw());
 }
 
 bool ContinuousFlowInitiator::transferSamples(std::uint64_t headIndex,

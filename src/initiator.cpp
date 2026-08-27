@@ -4,9 +4,39 @@
 #include "util.hpp"
 #include <chrono>
 #include <mxl/time.h>
+#include <optional>
 #include <spdlog/spdlog.h>
 
 namespace mxl::proxy {
+namespace {
+
+/// The connect loop, shared by both flow kinds: they differ only in the
+/// initiator type. Returns once connected or once signalled; throws when the
+/// configured connect timeout expires.
+template <typename Initiator>
+void connectLoop(Initiator &initiator, utils::ExitSignal sig,
+                 std::optional<std::chrono::milliseconds> timeout) {
+  spdlog::info("waiting to connect...");
+  auto const start = std::chrono::steady_clock::now();
+  for (;;) {
+    if (sig.shouldExit()) {
+      return;
+    }
+
+    if (initiator.makeProgress(std::chrono::milliseconds(500))) {
+      if (timeout && ((std::chrono::steady_clock::now() - start) > *timeout)) {
+        throw Exception{MXL_ERR_TIMEOUT,
+                        "timed out waiting to connect to the target"};
+      }
+      continue;
+    }
+
+    spdlog::info("connected");
+    return;
+  }
+}
+
+} // namespace
 void Initiator::run(Config config, utils::ExitSignal sig) {
   Initiator{std::move(config)}.run(sig);
 }
@@ -58,54 +88,32 @@ Initiator::openWriter(::mxl::DiscreteFlowReader const &reader) {
 
 ::mxl::fabrics::DiscreteFlowInitiator
 Initiator::createInitiator(DiscreteFlowReader &reader) {
-  return _fabrics.createInitiator(reader, {
-                                              .node = _config.node,
-                                              .service = _config.service,
-                                              .provider = _config.provider,
-                                          });
+  return _fabrics.createInitiator(reader,
+                                  {
+                                      .node = _config.node,
+                                      .service = _config.service,
+                                      .interface = _config.interfaceConfig(),
+                                  });
 }
 
 ::mxl::fabrics::ContinuousFlowInitiator
 Initiator::createInitiator(::mxl::ContinuousFlowReader &reader) {
-  return _fabrics.createInitiator(reader, {
-                                              .node = _config.node,
-                                              .service = _config.service,
-                                              .provider = _config.provider,
-                                          });
+  return _fabrics.createInitiator(reader,
+                                  {
+                                      .node = _config.node,
+                                      .service = _config.service,
+                                      .interface = _config.interfaceConfig(),
+                                  });
 }
 
 void Initiator::connect(::mxl::fabrics::DiscreteFlowInitiator &initiator,
                         utils::ExitSignal sig) {
-  spdlog::info("waiting to connect...");
-  for (;;) {
-    if (sig.shouldExit()) {
-      return;
-    }
-
-    if (initiator.makeProgress(std::chrono::milliseconds(500))) {
-      continue;
-    }
-
-    spdlog::info("connected");
-    return;
-  }
+  connectLoop(initiator, sig, _config.connectTimeout);
 }
 
 void Initiator::connect(::mxl::fabrics::ContinuousFlowInitiator &initiator,
                         utils::ExitSignal sig) {
-  spdlog::info("waiting to connect...");
-  for (;;) {
-    if (sig.shouldExit()) {
-      return;
-    }
-
-    if (initiator.makeProgress(std::chrono::milliseconds(500))) {
-      continue;
-    }
-
-    spdlog::info("connected");
-    return;
-  }
+  connectLoop(initiator, sig, _config.connectTimeout);
 }
 
 void Initiator::transferGrains(::mxl::DiscreteFlowReader reader,
@@ -146,7 +154,6 @@ void Initiator::transferGrains(::mxl::DiscreteFlowReader reader,
       std::uint64_t skipped = 0;
       if (_lastIndex < index) {
         if (_lastIndex != 0) {
-          std::uint64_t skipped = 0;
           skipped = index - (_lastIndex + 1);
         }
 
@@ -169,7 +176,8 @@ void Initiator::transferGrains(::mxl::DiscreteFlowReader reader,
     } catch (::mxl::Exception const &ex) {
       auto timeSinceLastGrainRead =
           std::chrono::steady_clock::now() - lastSuccessfullGrainRead;
-      if (timeSinceLastGrainRead > std::chrono::seconds(10)) {
+      if (_config.idleTimeout &&
+          (timeSinceLastGrainRead > *_config.idleTimeout)) {
         throw Exception{MXL_ERR_TIMEOUT,
                         "timed out waiting for a grain to be published "
                         "to the flow"};
