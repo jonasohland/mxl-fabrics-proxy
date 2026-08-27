@@ -1,4 +1,4 @@
-module github.com/jonasohland/mxl-fabrics-proxy
+module github.com/jonasohland/mxl-fabrics-proxy/legacy/go
 
 go 1.26.0
 

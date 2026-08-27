@@ -18,11 +18,11 @@ RUN curl -LO https://go.dev/dl/go1.26.1.linux-amd64.tar.gz && \
 
 WORKDIR /build/mxl-fabrics-proxy
 
+# The legacy Go tree is its own module, rooted at legacy/go and carrying its own
+# go.mod/go.sum. The root module (mxl-replicator) is not needed for this image.
 COPY CMakeLists.txt CMakeLists.txt
 COPY src src
 COPY legacy legacy
-COPY go.mod go.mod
-COPY go.sum go.sum
 
 RUN PKG_CONFIG_PATH=/opt/amazon/efa/lib/pkgconfig cmake -B build  \
     -DCMAKE_BUILD_TYPE=Release \
@@ -31,8 +31,8 @@ RUN PKG_CONFIG_PATH=/opt/amazon/efa/lib/pkgconfig cmake -B build  \
 
 RUN make -C build -j$(nproc)
 RUN make -C build install
-RUN /usr/local/go/bin/go build -o /usr/bin/mxl-fabrics-proxy ./legacy/go/cmd/mxl-fabrics-proxy
-RUN /usr/local/go/bin/go build -o /usr/bin/mxl-fabrics-proxy-reloader ./legacy/go/cmd/mxl-fabrics-proxy-reloader
+RUN /usr/local/go/bin/go build -C legacy/go -o /usr/bin/mxl-fabrics-proxy ./cmd/mxl-fabrics-proxy
+RUN /usr/local/go/bin/go build -C legacy/go -o /usr/bin/mxl-fabrics-proxy-reloader ./cmd/mxl-fabrics-proxy-reloader
 
 FROM ${BASE_IMAGE}
 

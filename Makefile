@@ -18,9 +18,17 @@ clean:
 	make -C build clean
 	rm -f build/mxl-fabrics-proxy build/mxl-fabrics-proxy-reloader
 
+# Two modules: the root module (mxl-replicator) and the frozen legacy tree at
+# legacy/go, tied together by go.work. `go mod tidy` is per-module.
 .PHONY: tidy
 tidy:
 	go mod tidy
+	go mod tidy -C legacy/go
+
+# The root module has no packages yet; add `go test ./...` here in M1.
+.PHONY: test
+test:
+	go test -C legacy/go ./...
 
 .PHONY: proxy-legacy
 proxy-legacy:
