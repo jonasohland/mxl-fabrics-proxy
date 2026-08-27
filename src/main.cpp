@@ -121,7 +121,6 @@ int printInterfaces() {
                 {"provider",
                  std::string{mxl::fabrics::providerName(iface.provider)}},
                 {"node", iface.node},
-                {"service", iface.service},
                 {"caps",
                  {
                      {"flags", mxl::fabrics::capsFlagNames(iface.capsFlags)},

@@ -101,19 +101,27 @@ type FabricAttachment struct {
 	// verbs, a link-local device address for efa, and the hostname for shm. It is what goes in
 	// the worker config's `node` key — named Address here because "node" already means a host
 	// everywhere else in this API.
+	//
+	// It is always the probe's reported address, resolved agent-side before registration. An
+	// interface name never reaches this field or the wire: the probe names no interface, so
+	// the join that produces this attachment is where a configured `ib0` is resolved, and it
+	// is the only place that can be (§10.5, WRS §2).
 	Address string `json:"address"`
 
-	// Service is empty except for shm, where the library reports a per-process value (WRS §2).
-	// The port a target actually binds is allocated by the agent from its own range (§7.4) and
-	// reported in [SessionStatus], not here.
-	Service string `json:"service,omitempty"`
+	// There is deliberately no Service. The probe reports one, but it is empty for every
+	// provider but shm and the shm value is a per-process artefact of the probing process
+	// (WRS §2). The agent allocates a service for every provider from its own port range —
+	// for shm that is not a port, only a host-wide unique endpoint name, which the same
+	// allocator supplies for free (§7.4, WRS §9). What a target actually bound is reported in
+	// [SessionStatus], not here.
 
 	CapFlags       []CapFlag `json:"caps_flags"`
 	MaxMessageSize uint64    `json:"max_message_size"`
 
 	// Device is the probe's best-effort attr.device_name: the netdev name for tcp, but the
-	// libfabric device name for verbs and efa, which is *not* the netdev name (WRS §2).
-	// Diagnostics only — never join on it.
+	// libfabric device name for verbs and efa, which is *not* the netdev name, and absent
+	// entirely for shm (WRS §2). Diagnostics only — the agent may join on it locally when an
+	// attachment configures `device:`, but the server never interprets it.
 	Device string `json:"device,omitempty"`
 }
 

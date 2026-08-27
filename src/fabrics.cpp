@@ -185,8 +185,6 @@ std::vector<InterfaceInfo> Instance::getInterfaces() const {
         out.push_back(InterfaceInfo{
             .provider = iface.provider,
             .node = (iface.address.node != nullptr) ? iface.address.node : "",
-            .service =
-                (iface.address.service != nullptr) ? iface.address.service : "",
             .capsFlags = iface.caps.flags,
             .maxMessageSize = iface.caps.maxMessageSize,
             .attr = (iface.attr != nullptr) ? iface.attr : "",

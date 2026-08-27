@@ -6,6 +6,11 @@
 // note that the fabric connection is inbound to the *destination* node, so the range must be
 // open there.
 //
+// shm allocates from the same range with no special case. Its `service` is not a port at all
+// — it is a host-wide unique endpoint name — but that is what a range allocator produces
+// anyway, and the probe's own reported service is a per-process artefact that cannot serve
+// (WRS §2, §9). One allocator, one collision domain, no per-provider branch.
+//
 // This file defines the range type only. The allocator lands in M5.
 package ports
 

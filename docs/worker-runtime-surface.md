@@ -85,7 +85,6 @@ times when it is reachable through several providers or carries several addresse
   {
     "provider": "tcp",
     "node": "10.135.0.123",
-    "service": "",
     "caps": {
       "flags": ["REMOTE_WRITE", "SEND_RECEIVE", "BLOCKING_OPERATIONS"],
       "max_message_size": 18446744073709551615
@@ -106,15 +105,21 @@ configuration:
 
 - `node` is what goes in the config's `node` key for this interface: an IP for `tcp` and
   `verbs`, a link-local device address for `efa`, and the **hostname** for `shm`.
-- `service` is empty except for `shm`, where the library reports a per-process value.
-- **There is no interface-name field**, because the library's API has none. The physical
-  interface, where it is known at all, is `attr.device_name`. For `tcp` it is the netdev
-  name (`eth1`, `wlan0`, `lo`); for `verbs`/`efa` it is the libfabric device name, which is
-  *not* the netdev name. Matching a configured `interface: ib0` against this is therefore
-  best-effort — matching on `node` is the reliable join.
+- **There is no `service`, deliberately.** The library reports one alongside the address, but
+  it is empty for every provider except `shm`, and the `shm` value is a per-process artefact
+  of the process that ran the probe — binding it in a later worker would be meaningless. The
+  supervisor allocates `service` from its own port range for every provider, `shm` included
+  (§9).
+- **There is no interface-name field**, because the library's API has none, and this is the
+  one thing about the probe a supervisor must design around rather than work around. The
+  physical interface, where it is known at all, is `attr.device_name`: the netdev name for
+  `tcp` (`eth1`, `wlan0`, `lo`), but the **libfabric device name** for `verbs` and `efa`
+  (`mlx5_0`, `rdmap0s6-rdm`), which is not the netdev name an operator would write. There is
+  no reliable way to turn a configured `ib0` or `efa0` into an entry in this list.
+  §10 item 3 sets out the join that follows from that.
 - `attr` is the library's best-effort attribute blob, passed through verbatim and omitted
   when it reports none. Contents vary by platform and hardware; treat every key as
-  optional.
+  optional. `shm` reports no `device_name` at all.
 - `caps.max_message_size` is a `uint64` and providers do report `UINT64_MAX`. Decode it into
   a 64-bit unsigned integer, not a float.
 
@@ -139,7 +144,7 @@ Unknown keys are ignored silently.
 | `target` | bool | no | `false` | both | `true` = target/receiver, `false` = initiator/sender |
 | `domain` | string | **yes** | — | both | Local MXL domain path, e.g. `/dev/shm/mxl0`. Passed to `mxlCreateInstance`. |
 | `node` | string | **yes** | — | both | Local fabric bind address. Provider-dependent (IP for `tcp`/`verbs`, device address for `efa`). |
-| `service` | string | **yes** | — | both | Local fabric port, as a **string**. May be `""` (let provider choose), but the key must be present. |
+| `service` | string | **yes** | — | both | Local fabric endpoint name, as a **string**. A port number for `tcp`/`verbs`/`efa`; for `shm` it is not a port at all, only a host-wide unique name. May be `""` (let the provider choose), but the key must be present — and a supervisor that wants to know where its target bound should not leave it empty (§9). |
 | `provider` | string | no | `"tcp"` | both | One of `any`, `tcp`, `verbs`, `efa`, `shm`. Parsed via `mxlFabricsProviderFromString`; anything else is a fatal `MXL_ERR_INVALID_ARG` at startup. |
 | `caps_flags` | array of string | no | `["REMOTE_WRITE","BLOCKING_OPERATIONS"]` | both | Negotiated interface capabilities. Names as printed by `--interfaces`: `REMOTE_WRITE`, `SEND_RECEIVE`, `BLOCKING_OPERATIONS`. An unknown name is a fatal `MXL_ERR_INVALID_ARG`. **Must be identical on both ends.** |
 | `max_message_size` | uint64 | no | `0` | both | Negotiated maximum message size, in bytes. `0` leaves it to the library, which logs a warning that the field will be required in a future version. **Must be identical on both ends.** |
@@ -553,6 +558,11 @@ detection and no retry** (`legacy/go/pkg/worker/exec.go:171`) — a collision pr
 and a restart loop that eventually rolls a different number. A replication manager should
 own an explicit port range and allocate deterministically.
 
+This holds for `shm` too, even though nothing there is a port. `shm` endpoints are named
+within the host, and the probe's reported `service` is not usable as that name (§2), so the
+supervisor allocates from the same range and gets host-wide uniqueness from the same
+mechanism. One allocator, one collision domain, no per-provider special case.
+
 ---
 
 ## 10. What the supervisor must provide
@@ -568,7 +578,26 @@ Everything the Go tree does *around* the worker, i.e. what needs reimplementing:
    max_message_size)` per session across both nodes — the library does none of this itself
    (§3). Nothing in the Go tree does this today: it configures `provider` per side and
    leaves the capabilities at the worker's built-in default.
-4. **Port allocation** for `service` (§9).
+
+   Joining the probe output against operator configuration needs care, because the probe
+   names no interface (§2). Four selectors, at most one per configured attachment:
+
+   | Configured | Match against | Works for |
+   |---|---|---|
+   | `address:` | probe `node`, exactly | all providers |
+   | `interface:` | resolve the netdev's addresses locally, match probe `node` against that set | `tcp`, `verbs` |
+   | `device:` | probe `attr.device_name`, exactly | wherever the library reports one |
+   | nothing | the provider alone, which **must** match exactly one entry | the common case |
+
+   The last row is the one that makes `efa` and `shm` configurable at all: neither can be
+   named by netdev, and a node almost always has exactly one of each, so requiring no
+   selector is both the simplest config and an unambiguous one. When it *is* ambiguous the
+   supervisor cannot guess — refuse the attachment and log every candidate entry, which
+   hands the operator the exact strings they could have written.
+
+   A configured attachment matching nothing is a configuration error and must be loud. It is
+   the difference between "this node has no verbs" and "someone typo'd `ib0`".
+4. **Port allocation** for `service` (§9), for every provider including `shm`.
 5. **Flow definition transport.** A target cannot create its local flow without the *remote*
    flow's definition JSON. Today this is fetched over HTTP from the peer proxy
    (`GET /v1/flows{domain}?id={flowID}` → `legacy/go/pkg/target/target.go:265-281`) and re-encoded

@@ -46,8 +46,17 @@ struct InitiatorConfig {
  */
 struct InterfaceInfo {
     ::mxlFabricsProvider provider;
+
+    /** The local bind address for this interface, for the `node` config key.
+     *
+     * The library also reports a `service` alongside it. It is deliberately not
+     * carried here: it is empty for every provider but `shm`, and the `shm`
+     * value is a per-process artefact of the enumerating process rather than
+     * anything a later worker could bind. The supervisor allocates `service`
+     * from its own port range for every provider (§9).
+     */
     std::string node;
-    std::string service;
+
     std::uint64_t capsFlags;
     std::uint64_t maxMessageSize;
 
