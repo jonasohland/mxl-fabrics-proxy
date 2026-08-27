@@ -71,6 +71,14 @@ const (
 	// every worker in the fleet.
 	CodeNotReady ErrorCode = "not_ready"
 
+	// CodeReregister is a report from an agent whose liveness lease is gone — expired during a
+	// partition, revoked, or lost with the store's contents.
+	//
+	// It is not a teardown signal. The agent registers again and keeps its workers running
+	// while it does: losing a lease says the fleet has forgotten this node, not that its media
+	// should stop (§4.2, §7.1).
+	CodeReregister ErrorCode = "reregister"
+
 	// CodeVersionSkew is an agent whose protocol major differs from the server's (§13.1).
 	CodeVersionSkew ErrorCode = "version_skew"
 
@@ -99,6 +107,14 @@ const (
 
 	// ReasonSameEndpoint is a source and destination with the same (node, domain).
 	ReasonSameEndpoint ReasonCode = "same_endpoint"
+
+	// ReasonNodeNotRegistered is a source or destination node no agent has ever registered.
+	//
+	// INVALID rather than WAITING, and the distinction is deliberate: a registration is created
+	// by the agent itself and is durable, so an unregistered name is a typo or a node that was
+	// never deployed — something only a user can resolve. A *registered* node whose agent is
+	// merely down is [ReasonAgentNotLeased], which is WAITING and resolves by itself.
+	ReasonNodeNotRegistered ReasonCode = "node_not_registered"
 
 	// ReasonNoSharedFabric is two nodes with no fabric label in common: they may both offer
 	// verbs and simply be on different InfiniBand fabrics (§10.1).
@@ -134,9 +150,14 @@ const (
 	// ReasonAgentNotLeased is a source or destination agent that is not currently alive.
 	ReasonAgentNotLeased ReasonCode = "agent_not_leased"
 
-	// ReasonSourceIdle is a source flow that exists but is not being produced. Admission holds
-	// the path here and starts no workers at all, which is what keeps a dormant flow from
-	// costing anything (§11.1).
+	// ReasonSourceIdle is a source flow that exists but is not being produced.
+	//
+	// It accompanies [StatePaused], not [StateWaiting], whether or not workers are running:
+	// admission holds a dormant flow before any worker starts, and the long-idle threshold stops
+	// the workers of one that has gone quiet, and those are the same condition at two different
+	// ages — the source is not sending. WAITING would claim the flow is not visible, which is
+	// false, and PAUSED is exactly the distinction an operator needs at 3am: the plumbing is
+	// fine, nobody is writing (§11, §11.1).
 	ReasonSourceIdle ReasonCode = "source_idle"
 
 	// --- Established, but not moving media (§11) ---

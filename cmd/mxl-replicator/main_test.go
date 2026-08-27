@@ -124,10 +124,17 @@ func TestAgentDefaults(t *testing.T) {
 	assert.Equal(t, []string{"http://ctrl:2283"}, agent.Server)
 	assert.Equal(t, "24000-24999", agent.PortRange.String())
 	assert.Equal(t, "mxl-fabrics-proxy-worker", agent.WorkerBinary, "the worker binary keeps its name (§2.2)")
+}
+
+func TestServerIdleDefaults(t *testing.T) {
+	cli, _ := mustParse(t, "run", "--server")
+	idle := cli.Run.ServerOpts.Idle
+
 	// §11.1 mechanism 1: 0 means wait indefinitely, which is what makes PAUSED a real
-	// steady state instead of a ~13s restart loop.
-	assert.Zero(t, agent.Idle.IdleTimeout)
-	assert.NotZero(t, agent.Idle.IdleTeardown)
+	// steady state instead of a ~13s restart loop. Both knobs are session-level and therefore
+	// the server's, not the agent's (§5.5).
+	assert.Zero(t, idle.IdleTimeout)
+	assert.NotZero(t, idle.IdleTeardown)
 }
 
 // §16: the legacy `-m name=/path` syntax carries over byte-compatible.

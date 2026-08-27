@@ -16,6 +16,14 @@ const (
 	PrefixDerived  = "/derived/"
 )
 
+// PrefixElection is where leader election puts its keys (§8.2).
+//
+// Not one of the three layers: it is machinery rather than state, nothing reads it as part of a
+// fleet snapshot, and it is named here only so that the snapshot loader and the elector cannot
+// disagree about which keys are which. On etcd it sits under the deployment's own key prefix,
+// alongside everything else this store writes.
+const PrefixElection = "/election/"
+
 // Prefixes to list or watch. Each ends in a slash: prefixes match raw bytes, not path
 // components, so the trailing slash is what keeps "/desired/node" from matching
 // "/desired/nodes/edge-01".
@@ -51,6 +59,16 @@ const (
 // KeyPolicy is operator policy: provider preference order, port ranges, bandwidth budgets.
 // A single key, not a prefix.
 const KeyPolicy = PrefixDesired + "policy"
+
+// KeyReconciler is what the reconciler publishes about itself: which replica is leading, and
+// whether it has settled and acted at least once (§7.3).
+//
+// Every replica serves the agent API, but only the leader reconciles, so a follower cannot tell
+// from its own state whether the assignment sets in the store are meaningful yet. It reads this
+// key instead. That also makes a *wiped store* say so: with no reconciler record, no replica
+// will serve an assignment set, so agents get a not-ready answer and skip the reconcile
+// entirely rather than being handed an empty set that means "I don't know" (plan §4.2).
+const KeyReconciler = PrefixDerived + "reconciler"
 
 // NodeKey is the registration for one node.
 func NodeKey(node string) string { return PrefixNodes + escape(node) }

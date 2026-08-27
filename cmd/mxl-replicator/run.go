@@ -171,7 +171,11 @@ func (c *RunCmd) Run(ctx context.Context, logger *slog.Logger) error {
 			"node", c.AgentOpts.Node,
 			"agent_server", c.AgentOpts.Server,
 		)
-		return errNotImplemented{role: "server and agent", milestone: "M4 and M5"}
+		// Deliberately refused rather than half-started. Running the server alone under a
+		// command that says it runs both roles would be a node that looks like it is
+		// replicating and is not — and a control plane that appears healthy while no media
+		// moves is the failure mode this project spends most of its design avoiding.
+		return errNotImplemented{role: "agent", milestone: "M5"}
 	case server:
 		return c.ServerOpts.Run(ctx, logger)
 	default:

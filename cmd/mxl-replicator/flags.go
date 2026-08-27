@@ -52,6 +52,15 @@ type StoreFlags struct {
 	SqlitePath    string   `help:"Path to the sqlite database file." default:"/var/lib/mxl-replicator/store.db" type:"path"`
 	EtcdEndpoints []string `help:"etcd endpoints, e.g. http://etcd-0:2379."`
 	EtcdPrefix    string   `help:"Key prefix for all etcd keys owned by this cluster." default:"/mxl-replicator"`
+
+	// The prefix is what lets one cluster host more than one deployment, so credentials for a
+	// shared cluster are part of the same surface.
+	EtcdUsername string `help:"etcd username, if the cluster has authentication enabled." env:"MXL_REPLICATOR_ETCD_USERNAME"`
+	EtcdPassword string `help:"etcd password. Prefer a file-backed secret: a password on the command line is visible in the process table." env:"MXL_REPLICATOR_ETCD_PASSWORD"`
+
+	EtcdCAFile   string `help:"CA bundle for verifying the etcd cluster." type:"existingfile" name:"etcd-ca"`
+	EtcdCertFile string `help:"Client certificate for etcd." type:"existingfile" name:"etcd-cert"`
+	EtcdKeyFile  string `help:"Client private key for etcd." type:"existingfile" name:"etcd-key"`
 }
 
 // Validate rejects combinations that cannot work, so the failure is a startup error rather
@@ -66,6 +75,10 @@ func (s StoreFlags) Validate() error {
 		if s.SqlitePath == "" {
 			return fmt.Errorf("--store-backend=sqlite requires --store-sqlite-path")
 		}
+	}
+
+	if (s.EtcdCertFile == "") != (s.EtcdKeyFile == "") {
+		return fmt.Errorf("--store-etcd-cert and --store-etcd-key must be given together")
 	}
 	return nil
 }
@@ -89,6 +102,13 @@ func (t TLSFlags) Validate() error {
 }
 
 // IdleFlags is the two-tier idle policy of §11.1.
+//
+// **Server flags, not agent flags.** Both knobs describe a session rather than a node: the
+// worker timeout is written into *both* ends of every assignment, and the teardown threshold is
+// a decision only the server can take, because only it can see whether the source is producing.
+// The library performs no negotiation of its own and both ends must be handed identical values,
+// so anything session-level that lived on the agent would be a value two nodes could disagree
+// about (§5.5, §10.3).
 //
 // The two knobs are not redundant: they trade resume latency against resource cost.
 //

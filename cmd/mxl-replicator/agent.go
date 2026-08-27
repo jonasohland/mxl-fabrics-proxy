@@ -24,7 +24,7 @@ type AgentOptions struct {
 	// lease exclusive and rejects the second claimant loudly (§7.1).
 	Node string `help:"Node name. Must be unique fleet-wide." env:"MXL_REPLICATOR_NODE"`
 
-	Server []string `help:"URL of the mxl-replicator server. Repeatable for an HA deployment." env:"MXL_REPLICATOR_SERVER"`
+	Server []string  `help:"URL of the mxl-replicator server. Repeatable for an HA deployment." env:"MXL_REPLICATOR_SERVER"`
 	Auth   AuthFlags `embed:""`
 
 	// Kept byte-compatible with the legacy proxy's flag syntax and `domains:` YAML block,
@@ -48,8 +48,6 @@ type AgentOptions struct {
 	// unlink a pre-existing metrics socket before binding, so a leftover file from a
 	// SIGKILL is a fatal EADDRINUSE (WRS §6). Stale directories are swept at startup.
 	WorkDir string `help:"Parent directory for per-worker-instance working directories. Keep the full path well under 108 bytes: it holds an AF_UNIX socket path." default:"/run/mxl-replicator" type:"path"`
-
-	Idle IdleFlags `embed:""`
 
 	// The worker's only environment knob (§12, WRS §7). Left empty it follows --log-level,
 	// so raising the agent to debug also lights up the worker's transfer-loop logging.
@@ -81,10 +79,6 @@ func (c *AgentOptions) Validate() error {
 		}
 	}
 
-	if c.Idle.IdleTeardown < 0 {
-		return fmt.Errorf("--idle-teardown must not be negative")
-	}
-
 	return nil
 }
 
@@ -97,8 +91,6 @@ func (c *AgentOptions) Run(ctx context.Context, logger *slog.Logger) error {
 		"search_paths", len(c.SearchPath),
 		"port_range", c.PortRange.String(),
 		"worker_binary", c.WorkerBinary,
-		"idle_timeout", c.Idle.IdleTimeout,
-		"idle_teardown", c.Idle.IdleTeardown,
 	)
 
 	return errNotImplemented{role: "agent", milestone: "M5"}

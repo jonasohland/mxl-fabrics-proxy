@@ -125,6 +125,18 @@ type FabricAttachment struct {
 	Device string `json:"device,omitempty"`
 }
 
+// SHMFabric is the fabric label for a node's shm attachment (§10.1).
+//
+// shm is structurally same-node-only, and deriving its label from the node name is what makes
+// that fall out of ordinary fabric matching with no special case anywhere: two attachments can
+// only share this label if they are on one node, and node names are unique fleet-wide (§7.1).
+//
+// It lives here, in the shared wire package, because **both sides must derive the identical
+// string or a same-node shm pair silently fails to match** — the agent labels its own
+// attachment with it, and the server canonicalises what it stores so that an agent which
+// labelled it some other way still matches. One definition, no normalisation to agree on.
+func SHMFabric(node string) string { return "shm:" + node }
+
 // Versions is what a node reports about the software it is running (§10.2).
 type Versions struct {
 	// Protocol is the control-plane wire protocol, and the only field version-skew gating
@@ -231,6 +243,19 @@ type RegistrationResponse struct {
 	// Server reports what the agent is talking to, so version skew is visible in agent logs
 	// and not only server-side.
 	Server Versions `json:"server"`
+}
+
+// Heartbeat is POST /agent/v1/{node}/heartbeat, and is also the identity block every other
+// agent report carries.
+//
+// The lease ID is here because renewing is the one thing an agent does that must not be
+// possible for a *different* instance of the same node: the lease is what holds node identity
+// (§7.1), so an agent that lost the race for a name must not be able to keep the winner's
+// lease alive.
+type Heartbeat struct {
+	Node     string `json:"node"`
+	Instance string `json:"instance"`
+	Lease    string `json:"lease"`
 }
 
 // HeartbeatResponse is the answer to POST /agent/v1/{node}/heartbeat.
