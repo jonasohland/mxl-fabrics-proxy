@@ -20,7 +20,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/jonasohland/mxl-fabrics-proxy/go/pkg/mxl"
+	"github.com/jonasohland/mxl-fabrics-proxy/legacy/go/pkg/mxl"
 	"github.com/samber/lo"
 )
 

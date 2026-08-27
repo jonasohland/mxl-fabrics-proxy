@@ -10,7 +10,7 @@ import (
 
 	"github.com/alecthomas/kong"
 	"github.com/dpotapov/slogpfx"
-	"github.com/jonasohland/mxl-fabrics-proxy/go/pkg/reload"
+	"github.com/jonasohland/mxl-fabrics-proxy/legacy/go/pkg/reload"
 	"github.com/lmittmann/tint"
 )
 

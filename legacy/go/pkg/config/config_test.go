@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/jonasohland/mxl-fabrics-proxy/go/pkg/config"
+	"github.com/jonasohland/mxl-fabrics-proxy/legacy/go/pkg/config"
 	"github.com/kr/pretty"
 	"github.com/stretchr/testify/require"
 )

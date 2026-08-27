@@ -15,11 +15,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/jonasohland/mxl-fabrics-proxy/go/pkg/common"
-	"github.com/jonasohland/mxl-fabrics-proxy/go/pkg/metrics"
-	"github.com/jonasohland/mxl-fabrics-proxy/go/pkg/mxl"
-	"github.com/jonasohland/mxl-fabrics-proxy/go/pkg/server"
-	"github.com/jonasohland/mxl-fabrics-proxy/go/pkg/worker"
+	"github.com/jonasohland/mxl-fabrics-proxy/legacy/go/pkg/common"
+	"github.com/jonasohland/mxl-fabrics-proxy/legacy/go/pkg/metrics"
+	"github.com/jonasohland/mxl-fabrics-proxy/legacy/go/pkg/mxl"
+	"github.com/jonasohland/mxl-fabrics-proxy/legacy/go/pkg/server"
+	"github.com/jonasohland/mxl-fabrics-proxy/legacy/go/pkg/worker"
 	"github.com/samber/lo"
 )
 

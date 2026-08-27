@@ -11,13 +11,13 @@ import (
 
 	"github.com/alecthomas/kong"
 	"github.com/dpotapov/slogpfx"
-	"github.com/jonasohland/mxl-fabrics-proxy/go/pkg/config"
-	"github.com/jonasohland/mxl-fabrics-proxy/go/pkg/health"
-	"github.com/jonasohland/mxl-fabrics-proxy/go/pkg/initiator"
-	"github.com/jonasohland/mxl-fabrics-proxy/go/pkg/metrics"
-	"github.com/jonasohland/mxl-fabrics-proxy/go/pkg/server"
-	"github.com/jonasohland/mxl-fabrics-proxy/go/pkg/target"
-	"github.com/jonasohland/mxl-fabrics-proxy/go/pkg/worker"
+	"github.com/jonasohland/mxl-fabrics-proxy/legacy/go/pkg/config"
+	"github.com/jonasohland/mxl-fabrics-proxy/legacy/go/pkg/health"
+	"github.com/jonasohland/mxl-fabrics-proxy/legacy/go/pkg/initiator"
+	"github.com/jonasohland/mxl-fabrics-proxy/legacy/go/pkg/metrics"
+	"github.com/jonasohland/mxl-fabrics-proxy/legacy/go/pkg/server"
+	"github.com/jonasohland/mxl-fabrics-proxy/legacy/go/pkg/target"
+	"github.com/jonasohland/mxl-fabrics-proxy/legacy/go/pkg/worker"
 	"github.com/lmittmann/tint"
 )
 

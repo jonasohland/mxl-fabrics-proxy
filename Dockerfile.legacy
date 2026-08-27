@@ -20,7 +20,7 @@ WORKDIR /build/mxl-fabrics-proxy
 
 COPY CMakeLists.txt CMakeLists.txt
 COPY src src
-COPY go go
+COPY legacy legacy
 COPY go.mod go.mod
 COPY go.sum go.sum
 
@@ -31,8 +31,8 @@ RUN PKG_CONFIG_PATH=/opt/amazon/efa/lib/pkgconfig cmake -B build  \
 
 RUN make -C build -j$(nproc)
 RUN make -C build install
-RUN /usr/local/go/bin/go build -o /usr/bin/mxl-fabrics-proxy ./go/cmd/mxl-fabrics-proxy
-RUN /usr/local/go/bin/go build -o /usr/bin/mxl-fabrics-proxy-reloader ./go/cmd/mxl-fabrics-proxy-reloader
+RUN /usr/local/go/bin/go build -o /usr/bin/mxl-fabrics-proxy ./legacy/go/cmd/mxl-fabrics-proxy
+RUN /usr/local/go/bin/go build -o /usr/bin/mxl-fabrics-proxy-reloader ./legacy/go/cmd/mxl-fabrics-proxy-reloader
 
 FROM ${BASE_IMAGE}
 

@@ -4,10 +4,10 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/jonasohland/mxl-fabrics-proxy/go/pkg/initiator"
-	"github.com/jonasohland/mxl-fabrics-proxy/go/pkg/server"
-	"github.com/jonasohland/mxl-fabrics-proxy/go/pkg/target"
-	"github.com/jonasohland/mxl-fabrics-proxy/go/pkg/worker"
+	"github.com/jonasohland/mxl-fabrics-proxy/legacy/go/pkg/initiator"
+	"github.com/jonasohland/mxl-fabrics-proxy/legacy/go/pkg/server"
+	"github.com/jonasohland/mxl-fabrics-proxy/legacy/go/pkg/target"
+	"github.com/jonasohland/mxl-fabrics-proxy/legacy/go/pkg/worker"
 )
 
 // Status is the body returned by the health endpoint. The counts are

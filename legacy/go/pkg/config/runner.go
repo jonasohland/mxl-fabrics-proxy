@@ -9,9 +9,9 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/jonasohland/mxl-fabrics-proxy/go/pkg/initiator"
-	"github.com/jonasohland/mxl-fabrics-proxy/go/pkg/server"
-	"github.com/jonasohland/mxl-fabrics-proxy/go/pkg/target"
+	"github.com/jonasohland/mxl-fabrics-proxy/legacy/go/pkg/initiator"
+	"github.com/jonasohland/mxl-fabrics-proxy/legacy/go/pkg/server"
+	"github.com/jonasohland/mxl-fabrics-proxy/legacy/go/pkg/target"
 	"github.com/samber/lo"
 )
 

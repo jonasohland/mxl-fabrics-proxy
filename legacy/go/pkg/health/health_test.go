@@ -8,11 +8,11 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/jonasohland/mxl-fabrics-proxy/go/pkg/health"
-	"github.com/jonasohland/mxl-fabrics-proxy/go/pkg/initiator"
-	"github.com/jonasohland/mxl-fabrics-proxy/go/pkg/metrics"
-	"github.com/jonasohland/mxl-fabrics-proxy/go/pkg/target"
-	"github.com/jonasohland/mxl-fabrics-proxy/go/pkg/worker"
+	"github.com/jonasohland/mxl-fabrics-proxy/legacy/go/pkg/health"
+	"github.com/jonasohland/mxl-fabrics-proxy/legacy/go/pkg/initiator"
+	"github.com/jonasohland/mxl-fabrics-proxy/legacy/go/pkg/metrics"
+	"github.com/jonasohland/mxl-fabrics-proxy/legacy/go/pkg/target"
+	"github.com/jonasohland/mxl-fabrics-proxy/legacy/go/pkg/worker"
 	"github.com/stretchr/testify/require"
 )
 

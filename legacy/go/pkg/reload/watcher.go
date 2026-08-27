@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jonasohland/mxl-fabrics-proxy/go/pkg/server"
+	"github.com/jonasohland/mxl-fabrics-proxy/legacy/go/pkg/server"
 )
 
 const (

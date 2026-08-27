@@ -11,7 +11,7 @@ import (
 	"slices"
 	"strings"
 
-	"github.com/jonasohland/mxl-fabrics-proxy/go/pkg/target"
+	"github.com/jonasohland/mxl-fabrics-proxy/legacy/go/pkg/target"
 	"github.com/samber/lo"
 	"sigs.k8s.io/yaml"
 )

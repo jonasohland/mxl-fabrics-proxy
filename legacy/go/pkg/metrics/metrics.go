@@ -12,7 +12,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/jonasohland/mxl-fabrics-proxy/go/pkg/worker"
+	"github.com/jonasohland/mxl-fabrics-proxy/legacy/go/pkg/worker"
 	"github.com/samber/lo"
 )
 

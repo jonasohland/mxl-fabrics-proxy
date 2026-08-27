@@ -7,5 +7,7 @@ base_image="jonasohland/mxl:v1.1-rc1-fabrics"
 project_dir="$(realpath "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"/..)"
 version="$(git -C "${project_dir}" describe --tags)"
 
-docker build --build-arg "BASE_IMAGE=${base_image}" -t "jonasohland/mxl-fabrics-proxy:${version}" "${project_dir}"
-docker build --build-arg "BASE_IMAGE=${base_image}-efa" -t "jonasohland/mxl-fabrics-proxy:${version}-efa" "${project_dir}"
+dockerfile="${project_dir}/Dockerfile.legacy"
+
+docker build -f "${dockerfile}" --build-arg "BASE_IMAGE=${base_image}" -t "jonasohland/mxl-fabrics-proxy:${version}" "${project_dir}"
+docker build -f "${dockerfile}" --build-arg "BASE_IMAGE=${base_image}-efa" -t "jonasohland/mxl-fabrics-proxy:${version}-efa" "${project_dir}"
