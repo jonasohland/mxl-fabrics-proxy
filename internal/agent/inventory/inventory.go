@@ -1,0 +1,634 @@
+// Package inventory observes the flows in this node's MXL domains (§6, §11.1).
+//
+// It is the piece that replaces the legacy proxy's peer-to-peer flow fetch: rather than the
+// receiving proxy asking the sending proxy for a flow definition over HTTP, every agent reports
+// what it sees and the server aggregates a fleet-wide inventory. There is no agent-to-agent
+// control-plane traffic left at all.
+//
+// # What it reports, and the three ways to get it wrong
+//
+// Per flow: the ID, the **verbatim** bytes of flow_def.json, the parsed NMOS group hint, and a
+// coarse `producing` boolean. Each of the last three has a specific failure the plan calls out:
+//
+//   - `producing` comes from **head-index deltas across samples**, never from LastWriteTime.
+//     The timestamp looks more convenient — one sample, no state — but it is TAI nanoseconds and
+//     means nothing unless the host's TAI offset is configured. A delta needs no clock at all, so
+//     take the version that cannot be wrong. LastWriteTime stays useful for diagnostics.
+//   - [mxl.Flow.IsValid] is checked on **every** sample. A flow deleted and recreated under the
+//     same ID is a different data file; the old mapping keeps working and keeps returning stale
+//     values forever, so without the check a republished flow reports producing=false permanently
+//     and is never replicated again.
+//   - `producing` is **hysteretic and coarse**, and a raw head index never appears in a snapshot.
+//     Inventory is a full snapshot written to the store, so a field that changed every frame
+//     would make every snapshot differ and turn inventory into a per-heartbeat write stream —
+//     trading the churn §11.1 exists to eliminate for a slower version of the same thing. Rate
+//     and head index belong in metrics (§12).
+//
+// Every flow in every mapped domain is observed, not only flows with sessions: admission (§11.1)
+// needs the liveness of flows nothing is replicating yet, and the destination flow's liveness is
+// what ACTIVE is derived from.
+package inventory
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"slices"
+	"sync"
+	"time"
+
+	"github.com/jonasohland/mxl-utils/pkg/mxl"
+
+	"github.com/jonasohland/mxl-replicator/internal/api"
+)
+
+const (
+	// DefaultInterval is how often every flow is sampled. Fine enough that a producing flow is
+	// noticed within a frame or two of starting, coarse enough that the cost is nothing:
+	// GetInfo decodes from a live mapping and is documented as cheap enough to call on every
+	// scrape (§11.1).
+	DefaultInterval = 500 * time.Millisecond
+
+	// DefaultIdleAfter is how long a head index must stand still before a flow is reported as no
+	// longer producing.
+	//
+	// This is the hysteresis, and it is agent-local — a different knob from the server's
+	// two-tier idle policy (§11.1), which decides what to *do* about an idle source. Generous
+	// against a slow frame rate and against a sample landing either side of one: a 25 fps flow
+	// moves every 40 ms, so several seconds of stillness is a producer that stopped rather than
+	// scheduling noise.
+	DefaultIdleAfter = 3 * time.Second
+)
+
+// Domain is one configured name→path mapping (§6.2).
+type Domain struct {
+	// Name is how the domain is addressed fleet-wide. Paths are agent-local and are never
+	// accepted from the API (§7.2, §13).
+	Name string
+
+	// Path is the local filesystem path.
+	Path string
+}
+
+// Options configures an [Inventory].
+type Options struct {
+	// Domains are the operator's explicit mappings. They go in as the discoverer's *static*
+	// domains, which is exactly what that parameter is for: reported once at construction and
+	// never retracted by scanning, so a configured domain stays visible while it is temporarily
+	// empty.
+	Domains []Domain
+
+	// SearchPaths are recursively scanned for unconfigured domains. A discovered domain can be a
+	// replication *source* but never a destination — that is the invariant that stops the API
+	// being a remote arbitrary-filesystem-write primitive (§7.2, §13), and it is enforced by
+	// [api.DomainInventory.Configured] travelling with every domain.
+	SearchPaths []string
+
+	// Interval is the sampling period. Defaults to [DefaultInterval].
+	Interval time.Duration
+
+	// IdleAfter is the hysteresis threshold. Defaults to [DefaultIdleAfter].
+	IdleAfter time.Duration
+
+	// OnChange is called, without holding any lock, whenever something happened that may have
+	// changed the snapshot. It must not block; the caller coalesces.
+	OnChange func()
+
+	Logger *slog.Logger
+
+	// Now is the clock, injectable for tests. Only ever used for head-index staleness, never for
+	// anything that leaves this process.
+	Now func() time.Time
+}
+
+// Inventory watches this node's domains and the flows in them.
+//
+// Safe for concurrent use: mxl-utils' discoverer and watcher call in from their own goroutines
+// while the sample loop runs and the agent reads snapshots.
+type Inventory struct {
+	interval  time.Duration
+	idleAfter time.Duration
+	onChange  func()
+	log       *slog.Logger
+	now       func() time.Time
+
+	// static and byPath are fixed at construction: the configured mappings, and the reverse
+	// lookup a discovered domain never enters. byName is what resolves an assignment's domain
+	// *name* to a path, and it is a strict map lookup by design — an agent that fell back to
+	// treating an unmapped name as a path would hand the API the filesystem.
+	static  []Domain
+	byName  map[string]string
+	byPath  map[string]string
+	search  []string
+	watcher *mxl.Watcher
+
+	mu      sync.Mutex
+	domains map[string]*domainState // keyed by path
+}
+
+type domainState struct {
+	name       string
+	configured bool
+	flows      map[string]*flowState
+}
+
+// flowState is one observed flow and everything needed to keep observing it.
+type flowState struct {
+	id   string
+	dir  string
+	path string // domain path
+
+	// def is the verbatim flow_def.json. Verbatim is load-bearing: the destination worker
+	// reproduces the source definition exactly, including NMOS fields nothing in this tree
+	// models, and the session identity hashes these bytes (§5.4, §2a). Decoding and re-encoding
+	// would drop the first and could move the second.
+	def  json.RawMessage
+	hint *api.GroupHint
+
+	flow *mxl.Flow
+
+	head      uint64
+	haveHead  bool
+	lastMove  time.Time
+	producing bool
+
+	// complained suppresses a per-sample log line for a flow that is present but unreadable —
+	// a producer part-way through creating it, most often.
+	complained bool
+}
+
+// New validates the configuration and builds an inventory. It observes nothing until [Run].
+func New(opts Options) (*Inventory, error) {
+	inv := &Inventory{
+		interval:  opts.Interval,
+		idleAfter: opts.IdleAfter,
+		onChange:  opts.OnChange,
+		log:       opts.Logger,
+		now:       opts.Now,
+		byName:    map[string]string{},
+		byPath:    map[string]string{},
+		domains:   map[string]*domainState{},
+	}
+	if inv.interval <= 0 {
+		inv.interval = DefaultInterval
+	}
+	if inv.idleAfter <= 0 {
+		inv.idleAfter = DefaultIdleAfter
+	}
+	if inv.log == nil {
+		inv.log = slog.Default()
+	}
+	if inv.now == nil {
+		inv.now = time.Now
+	}
+	if inv.onChange == nil {
+		inv.onChange = func() {}
+	}
+
+	for _, domain := range opts.Domains {
+		if domain.Name == "" {
+			return nil, fmt.Errorf("inventory: domain with path %q has no name", domain.Path)
+		}
+		if !filepath.IsAbs(domain.Path) {
+			return nil, fmt.Errorf("inventory: domain %q: path %q is not absolute", domain.Name, domain.Path)
+		}
+
+		path := filepath.Clean(domain.Path)
+		if existing, ok := inv.byName[domain.Name]; ok {
+			return nil, fmt.Errorf("inventory: domain %q is mapped twice, to %q and %q", domain.Name, existing, path)
+		}
+		if existing, ok := inv.byPath[path]; ok {
+			// Two names for one directory would make the reverse lookup ambiguous, and would
+			// let one flow appear twice in the fleet-wide inventory under two addresses.
+			return nil, fmt.Errorf("inventory: path %q is mapped twice, as %q and %q", path, existing, domain.Name)
+		}
+
+		inv.byName[domain.Name] = path
+		inv.byPath[path] = domain.Name
+		inv.static = append(inv.static, Domain{Name: domain.Name, Path: path})
+	}
+
+	for _, path := range opts.SearchPaths {
+		if !filepath.IsAbs(path) {
+			return nil, fmt.Errorf("inventory: search path %q is not absolute", path)
+		}
+		inv.search = append(inv.search, filepath.Clean(path))
+	}
+
+	return inv, nil
+}
+
+// Mappings returns the configured domains as they are advertised at registration (§10.2).
+//
+// **Configured mappings only.** Discovered domains are deliberately absent: registration is
+// durable desired state and changes only when the operator changes the node's configuration,
+// whereas discovery comes and goes with whatever a producer happens to have created. A
+// discovered domain reaches the server through the *inventory* snapshot instead, with
+// Configured false — which is where high-churn observations belong (§4), and which is all the
+// server needs, since a discovered domain is only ever a source.
+func (i *Inventory) Mappings() []api.DomainMapping {
+	out := make([]api.DomainMapping, 0, len(i.static))
+	for _, domain := range i.static {
+		out = append(out, api.DomainMapping{Name: domain.Name, Path: domain.Path, Configured: true})
+	}
+	slices.SortFunc(out, func(a, b api.DomainMapping) int { return cmpString(a.Name, b.Name) })
+	return out
+}
+
+// Path resolves a domain name to a local path.
+//
+// This is the only place a name becomes a path, and it is a strict map lookup over the domains
+// this agent knows: configured mappings, plus domains found under a search path. It never
+// interprets its argument as a path, which is what stops an assignment from naming an arbitrary
+// directory on this host (§7.2, §13).
+func (i *Inventory) Path(name string) (string, bool) {
+	if path, ok := i.byName[name]; ok {
+		return path, true
+	}
+
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	for path, domain := range i.domains {
+		if domain.name == name {
+			return path, true
+		}
+	}
+	return "", false
+}
+
+// Configured reports whether a domain name is an explicitly mapped one, and therefore usable as
+// a replication destination (§7.2).
+//
+// The server validates this too, and is the authority. Checking it again here is deliberate
+// duplication: it is the single most important invariant in the design, it costs one map lookup,
+// and an agent that trusted the server on it would be one compromised or buggy control plane
+// away from writing into any directory a search path can reach.
+func (i *Inventory) Configured(name string) bool {
+	_, ok := i.byName[name]
+	return ok
+}
+
+// CreateDomains pre-creates the configured domain directories (§6.1).
+//
+// At startup rather than at assignment time: the worker does not create its domain directory
+// (WRS §5.1), and doing it here keeps it off the establishment path that §6.1 wants inside
+// 1–2 s. A directory that cannot be created is reported rather than left to fail later as a
+// target worker dying before its metrics socket exists.
+func (i *Inventory) CreateDomains() error {
+	var errs []error
+	for _, domain := range i.static {
+		if err := os.MkdirAll(domain.Path, 0o755); err != nil {
+			errs = append(errs, fmt.Errorf("create domain %q at %s: %w", domain.Name, domain.Path, err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// Run observes until ctx ends, then releases every mapping.
+func (i *Inventory) Run(ctx context.Context) error {
+	var wg sync.WaitGroup
+
+	watcher, err := mxl.NewWatcher(ctx, &wg, []mxl.FlowReceiver{i})
+	if err != nil {
+		return fmt.Errorf("inventory: watch flows: %w", err)
+	}
+	i.watcher = watcher
+
+	static := make([]string, 0, len(i.static))
+	for _, domain := range i.static {
+		static = append(static, domain.Path)
+	}
+
+	// Receiver order matters: this inventory learns of a domain before the watcher starts
+	// reporting the flows already in it, so a flow never arrives for a domain that is not there
+	// yet. On the way out the order reverses in effect — the domain is forgotten first and the
+	// watcher's removals land on nothing, which [Inventory.RemoveFlow] tolerates.
+	mxl.NewDiscoverer(ctx, &wg, []mxl.DomainReceiver{i, watcher}, i.search, static)
+
+	i.log.Info("observing domains",
+		"configured", len(i.static), "search_paths", len(i.search),
+		"interval", i.interval, "idle_after", i.idleAfter)
+
+	ticker := time.NewTicker(i.interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			wg.Wait()
+			i.closeAll()
+			return nil
+		case <-ticker.C:
+			if i.sample() {
+				i.onChange()
+			}
+		}
+	}
+}
+
+// AddDomain implements [mxl.DomainReceiver].
+func (i *Inventory) AddDomain(path string) {
+	path = filepath.Clean(path)
+
+	i.mu.Lock()
+	name, configured := i.byPath[path]
+	if !configured {
+		// A discovered domain is named by its path. That is not a path the API can ever use —
+		// resolution is a map lookup (see [Inventory.Path]) — it is simply the one string that is
+		// certainly unique on this node and stable across restarts, and it is what an operator
+		// looking at `GET /v1/flows` needs to see in order to find the thing.
+		name = path
+	}
+	if _, exists := i.domains[path]; exists {
+		i.mu.Unlock()
+		return
+	}
+	i.domains[path] = &domainState{name: name, configured: configured, flows: map[string]*flowState{}}
+	i.mu.Unlock()
+
+	i.log.Info("domain appeared", "domain", name, "path", path, "configured", configured)
+	i.onChange()
+}
+
+// RemoveDomain implements [mxl.DomainReceiver].
+func (i *Inventory) RemoveDomain(path string) {
+	path = filepath.Clean(path)
+
+	i.mu.Lock()
+	domain, ok := i.domains[path]
+	if ok {
+		for _, flow := range domain.flows {
+			flow.close()
+		}
+		delete(i.domains, path)
+	}
+	i.mu.Unlock()
+
+	if !ok {
+		return
+	}
+	i.log.Info("domain went away", "domain", domain.name, "path", path)
+	i.onChange()
+}
+
+// AddFlow implements [mxl.FlowReceiver]. The domain is a path, as mxl-utils reports it.
+func (i *Inventory) AddFlow(domainPath, id string) {
+	domainPath = filepath.Clean(domainPath)
+
+	i.mu.Lock()
+	domain, ok := i.domains[domainPath]
+	if !ok {
+		// The watcher saw a flow in a domain this inventory does not know about. Possible only in
+		// the window around a domain being removed, and dropping it is right: the next scan
+		// re-adds the domain and every flow in it.
+		i.mu.Unlock()
+		return
+	}
+	if _, exists := domain.flows[id]; exists {
+		i.mu.Unlock()
+		return
+	}
+
+	flow := &flowState{
+		id:   id,
+		path: domainPath,
+		dir:  filepath.Join(domainPath, id+".mxl-flow"),
+	}
+	domain.flows[id] = flow
+
+	// Open now rather than waiting for the first sample: a flow that appears and is immediately
+	// replicated should not spend a sample interval invisible on the establishment path.
+	i.refresh(flow)
+	name, readable := domain.name, flow.def != nil
+	i.mu.Unlock()
+
+	i.log.Debug("flow appeared", "domain", name, "flow", id, "readable", readable)
+	i.onChange()
+}
+
+// RemoveFlow implements [mxl.FlowReceiver].
+func (i *Inventory) RemoveFlow(domainPath, id string) {
+	domainPath = filepath.Clean(domainPath)
+
+	i.mu.Lock()
+	domain, ok := i.domains[domainPath]
+	if !ok {
+		i.mu.Unlock()
+		return
+	}
+	flow, ok := domain.flows[id]
+	if ok {
+		flow.close()
+		delete(domain.flows, id)
+	}
+	i.mu.Unlock()
+
+	if !ok {
+		return
+	}
+	i.log.Debug("flow went away", "domain", domain.name, "flow", id)
+	i.onChange()
+}
+
+// Snapshot renders what is currently observed, as the agent reports it (§9.2).
+//
+// Deterministically ordered — domains by name, flows by ID — because the agent compares
+// consecutive snapshots and only reports one that changed. Without a stable order every report
+// would differ, and inventory would advance the store revision on every heartbeat forever,
+// waking every watcher in the fleet (§8.3).
+func (i *Inventory) Snapshot() []api.DomainInventory {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+
+	out := make([]api.DomainInventory, 0, len(i.domains))
+	for _, domain := range i.domains {
+		flows := make([]api.FlowInventory, 0, len(domain.flows))
+		for _, flow := range domain.flows {
+			if flow.def == nil {
+				// The definition is not optional: the destination worker cannot create its local
+				// flow without it (§5.3 step 2), so a flow that is not yet readable is not yet a
+				// flow anyone can replicate. It appears once it is.
+				continue
+			}
+			flows = append(flows, api.FlowInventory{
+				ID:         flow.id,
+				Definition: flow.def,
+				GroupHint:  flow.hint,
+				Producing:  flow.producing,
+			})
+		}
+		slices.SortFunc(flows, func(a, b api.FlowInventory) int { return cmpString(a.ID, b.ID) })
+
+		out = append(out, api.DomainInventory{
+			Name:       domain.name,
+			Configured: domain.configured,
+			Flows:      flows,
+		})
+	}
+	slices.SortFunc(out, func(a, b api.DomainInventory) int { return cmpString(a.Name, b.Name) })
+	return out
+}
+
+// sample walks every flow once. It reports whether anything a snapshot would show changed.
+func (i *Inventory) sample() bool {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+
+	now := i.now()
+	changed := false
+
+	for _, domain := range i.domains {
+		for _, flow := range domain.flows {
+			if i.sampleFlow(domain, flow, now) {
+				changed = true
+			}
+		}
+	}
+	return changed
+}
+
+func (i *Inventory) sampleFlow(domain *domainState, flow *flowState, now time.Time) bool {
+	wasProducing, hadDef := flow.producing, flow.def != nil
+
+	// **Every sample.** A flow deleted and recreated under the same ID is a different data file;
+	// the old mapping keeps working and keeps returning the values it had when the file went
+	// away, so a republished flow would report producing=false forever and never be replicated
+	// again. This is precisely what IsValid exists for (§11.1).
+	if flow.flow == nil || !flow.flow.IsValid() {
+		if flow.flow != nil {
+			i.log.Info("flow was replaced under the same id; reopening",
+				"domain", domain.name, "flow", flow.id)
+		}
+		flow.close()
+		i.refresh(flow)
+	}
+
+	if flow.flow != nil {
+		if _, runtime, err := flow.flow.GetInfo(); err != nil {
+			// A mapping that stops decoding is a flow being torn down underneath us. Drop it and
+			// let the next sample reopen; the watcher removes it outright if it is really gone.
+			flow.close()
+		} else {
+			flow.observe(runtime.HeadIndex, now, i.idleAfter)
+		}
+	}
+
+	return flow.producing != wasProducing || (flow.def != nil) != hadDef
+}
+
+// observe applies the hysteresis: idle → advancing on the first movement, advancing → idle only
+// after the threshold (§11.1).
+func (f *flowState) observe(head uint64, now time.Time, idleAfter time.Duration) {
+	switch {
+	case !f.haveHead:
+		// The first sample establishes a baseline and claims nothing. A flow is only ever
+		// declared producing by having been *seen* to advance, never by having a head index at
+		// all — a dormant flow has one too.
+		f.head, f.haveHead, f.lastMove = head, true, now
+	case head != f.head:
+		f.head, f.lastMove, f.producing = head, now, true
+	case now.Sub(f.lastMove) >= idleAfter:
+		f.producing = false
+	}
+}
+
+// refresh reads the flow definition and reopens the mapping. Called with the lock held.
+func (i *Inventory) refresh(flow *flowState) {
+	def, hint, err := readDefinition(flow.dir, i.log)
+	if err != nil {
+		if !flow.complained {
+			// Debug, not warn: the overwhelmingly common cause is a producer part-way through
+			// creating the flow, and the watcher fires on the directory appearing.
+			i.log.Debug("flow definition is not readable yet", "flow", flow.id, "error", err)
+			flow.complained = true
+		}
+		return
+	}
+
+	// A reopened flow may carry a *different* definition — that is what makes it a different
+	// flow to the session-identity hash (§5.4), and reporting the old bytes would hide a
+	// republish from the server that has to rebuild the session.
+	flow.def, flow.hint, flow.complained = def, hint, false
+
+	opened, err := mxl.Open(flow.path, flow.id)
+	if err != nil {
+		i.log.Debug("cannot map flow", "flow", flow.id, "error", err)
+		return
+	}
+	flow.flow = opened
+	flow.head, flow.haveHead, flow.producing = 0, false, false
+}
+
+func (f *flowState) close() {
+	if f.flow != nil {
+		_ = f.flow.Close()
+		f.flow = nil
+	}
+	f.haveHead, f.producing = false, false
+}
+
+func (i *Inventory) closeAll() {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+
+	for _, domain := range i.domains {
+		for _, flow := range domain.flows {
+			flow.close()
+		}
+	}
+}
+
+// readDefinition returns flow_def.json verbatim, plus the parsed group hint.
+//
+// The bytes and the parse come from one read on purpose. mxl-utils' GetDefinition reopens the
+// file and hands back a decoded struct, which is the right shape for its callers and the wrong
+// one here twice over: the destination worker needs the original bytes including fields no
+// struct models, and reading the file twice invites the two answers to disagree about a flow
+// that was republished in between.
+func readDefinition(dir string, log *slog.Logger) (json.RawMessage, *api.GroupHint, error) {
+	raw, err := os.ReadFile(filepath.Join(dir, "flow_def.json"))
+	if err != nil {
+		return nil, nil, err
+	}
+	if !json.Valid(raw) {
+		// A partially written file. The producer creates the directory before the definition is
+		// complete, so this is a race rather than a corruption, and the next sample re-reads it.
+		return nil, nil, fmt.Errorf("flow_def.json is not valid json (%d bytes)", len(raw))
+	}
+
+	var decoded mxl.FlowDefinition
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		return nil, nil, fmt.Errorf("decode flow_def.json: %w", err)
+	}
+
+	var hint *api.GroupHint
+	parsed, err := decoded.GetGroupHint()
+	switch {
+	case err == nil:
+		hint = &api.GroupHint{Name: parsed.Name, Type: parsed.Type}
+	case errors.Is(err, mxl.ErrMissingGroupHint):
+		// Ordinary: not every flow carries one, and a group-hint selector simply does not match
+		// it (§9.1).
+	default:
+		// Malformed rather than missing, which is worth saying out loud — an operator who wrote
+		// a group hint expects it to select something.
+		log.Warn("flow has a malformed group hint", "flow", decoded.ID, "error", err)
+	}
+
+	return json.RawMessage(raw), hint, nil
+}
+
+func cmpString(a, b string) int {
+	switch {
+	case a < b:
+		return -1
+	case a > b:
+		return 1
+	default:
+		return 0
+	}
+}

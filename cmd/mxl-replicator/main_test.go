@@ -8,6 +8,8 @@ import (
 	"github.com/alecthomas/kong"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/jonasohland/mxl-replicator/internal/api"
 )
 
 func parse(t *testing.T, args ...string) (*CLI, *kong.Context, error) {
@@ -276,10 +278,90 @@ func TestAuthFlags(t *testing.T) {
 	assert.ErrorContains(t, err, "empty")
 }
 
-// Every role must return a distinguishable not-implemented error rather than appearing to
-// start. Remove these as the roles land.
-func TestRolesAreNotImplementedYet(t *testing.T) {
-	var err error = errNotImplemented{role: "server", milestone: "M4"}
-	assert.ErrorContains(t, err, "server")
-	assert.ErrorContains(t, err, "M4")
+// A fabric attachment can be declared on the command line, so that a single-host deployment
+// needs no configuration file at all (§10.1).
+func TestAgentFabricFlag(t *testing.T) {
+	cli, _ := mustParse(t, agentOnly(
+		"--agent-fabric", "provider=verbs,fabric=ib-a,interface=ib0",
+		"--agent-fabric", "provider=efa,fabric=vpc1",
+	)...)
+
+	require.Len(t, cli.Run.AgentOpts.fabrics, 2)
+	assert.Equal(t, api.ProviderVerbs, cli.Run.AgentOpts.fabrics[0].Provider)
+	assert.Equal(t, "ib0", cli.Run.AgentOpts.fabrics[0].Interface)
+	assert.Equal(t, api.ProviderEFA, cli.Run.AgentOpts.fabrics[1].Provider)
+	assert.False(t, cli.Run.AgentOpts.fabricsDefaulted)
+
+	// The join's failure modes are worth reaching from the command line too.
+	_, _, err := parse(t, agentOnly("--agent-fabric", "provider=efa,fabric=vpc1,interface=efa0")...)
+	assert.ErrorContains(t, err, "cannot select an efa attachment")
+}
+
+// A node with no attachments can do nothing, and refusing to start would break
+// `mxl-replicator run` with no arguments — which is the single-host and development case §2.2
+// exists to serve. shm is the right assumption there: same-node-only, no address, label derived.
+func TestNoFabricsMeansSHM(t *testing.T) {
+	cli, _ := mustParse(t, agentOnly()...)
+
+	require.Len(t, cli.Run.AgentOpts.fabrics, 1)
+	assert.Equal(t, api.ProviderSHM, cli.Run.AgentOpts.fabrics[0].Provider)
+	assert.True(t, cli.Run.AgentOpts.fabricsDefaulted, "the assumption is warned about at startup")
+}
+
+// A flag wins over a file for a scalar and adds to it for a collection, so a file describing a
+// host's hardware stays extensible on the command line.
+func TestAgentConfigFileIsMergedWithFlags(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "agent.yaml")
+	require.NoError(t, os.WriteFile(path, []byte(`
+node: from-file
+server:
+  - http://from-file:2283
+domains:
+  cameras: /dev/shm/mxl0
+  ingest:
+    url: mxl:///dev/shm/mxl1
+fabrics:
+  - provider: tcp
+    fabric: dc1
+    address: 10.0.0.1
+`), 0o600))
+
+	// Nothing on the command line: the file supplies everything.
+	cli, _ := mustParse(t, "run", "--agent", "--agent-config", path)
+	assert.Equal(t, "from-file", cli.Run.AgentOpts.Node)
+	assert.Equal(t, []string{"http://from-file:2283"}, cli.Run.AgentOpts.Server)
+	assert.Equal(t, map[string]string{
+		"cameras": "/dev/shm/mxl0",
+		"ingest":  "/dev/shm/mxl1",
+	}, cli.Run.AgentOpts.Domains)
+	require.Len(t, cli.Run.AgentOpts.fabrics, 1)
+
+	// Flags override the scalars and merge into the collections.
+	cli, _ = mustParse(t, "run", "--agent", "--agent-config", path,
+		"--agent-node", "edge-01",
+		"--agent-server", "http://ctrl:2283",
+		"-m", "cameras=/dev/shm/other",
+		"-m", "archive=/dev/shm/mxl2",
+		"--agent-fabric", "provider=shm")
+
+	assert.Equal(t, "edge-01", cli.Run.AgentOpts.Node)
+	assert.Equal(t, []string{"http://ctrl:2283"}, cli.Run.AgentOpts.Server)
+	assert.Equal(t, map[string]string{
+		"cameras": "/dev/shm/other",
+		"ingest":  "/dev/shm/mxl1",
+		"archive": "/dev/shm/mxl2",
+	}, cli.Run.AgentOpts.Domains)
+	require.Len(t, cli.Run.AgentOpts.fabrics, 2)
+}
+
+// A file that will not parse is a startup error, not a node that quietly comes up with no
+// connectivity.
+func TestAgentConfigFileErrorsAtParseTime(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "agent.yaml")
+	require.NoError(t, os.WriteFile(path, []byte("fabircs:\n  - provider: tcp\n"), 0o600))
+
+	_, _, err := parse(t, agentOnly("--agent-config", path)...)
+	assert.ErrorContains(t, err, "fabircs")
 }

@@ -2,11 +2,13 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
 	"net/url"
 	"os"
+	"sync"
 )
 
 // RunCmd is the only command. It starts the server role, the agent role, or both.
@@ -65,6 +67,12 @@ func (c *RunCmd) resolve() error {
 	server, agent := c.roles()
 	if !agent {
 		return nil
+	}
+
+	// The configuration file first: it may supply the node name and the server URLs, and the
+	// defaulting below must not fill in a loopback URL over a file that named real ones.
+	if err := c.AgentOpts.resolve(); err != nil {
+		return err
 	}
 
 	if c.AgentOpts.Node == "" {
@@ -166,19 +174,59 @@ func (c *RunCmd) Run(ctx context.Context, logger *slog.Logger) error {
 
 	switch {
 	case server && agent:
-		logger.With("module", "run").Info("running both roles",
-			"listen", c.ServerOpts.Listen,
-			"node", c.AgentOpts.Node,
-			"agent_server", c.AgentOpts.Server,
-		)
-		// Deliberately refused rather than half-started. Running the server alone under a
-		// command that says it runs both roles would be a node that looks like it is
-		// replicating and is not — and a control plane that appears healthy while no media
-		// moves is the failure mode this project spends most of its design avoiding.
-		return errNotImplemented{role: "agent", milestone: "M5"}
+		return c.runBoth(ctx, logger)
 	case server:
 		return c.ServerOpts.Run(ctx, logger)
 	default:
 		return c.AgentOpts.Run(ctx, logger)
 	}
+}
+
+// runBoth runs the control plane and this node's agent in one process.
+//
+// The two still speak HTTP over loopback — there is deliberately no in-memory short-circuit, so
+// the combined form cannot develop behaviour the distributed form lacks (§2.2). What it does
+// share is a lifetime, and that is the property worth being deliberate about: on a combined node,
+// fail-static no longer holds for the *local* agent, because a panic, an OOM kill or an image
+// update takes both halves down and every flow on the node re-establishes (plan §4.3).
+//
+// Either half returning ends the process. Neither is optional: a server without its agent is a
+// node that looks like it is replicating and is not, and an agent without its server has nothing
+// to register with.
+func (c *RunCmd) runBoth(ctx context.Context, logger *slog.Logger) error {
+	logger.With("module", "run").Info("running both roles",
+		"listen", c.ServerOpts.Listen,
+		"node", c.AgentOpts.Node,
+		"agent_server", c.AgentOpts.Server,
+	)
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	// The agent starts alongside rather than after the server: it retries registration with
+	// backoff anyway, so sequencing them would buy nothing and would add a startup ordering that
+	// has to stay correct.
+	failures := make(chan error, 2)
+	var running sync.WaitGroup
+
+	for name, role := range map[string]func(context.Context, *slog.Logger) error{
+		"server": c.ServerOpts.Run,
+		"agent":  c.AgentOpts.Run,
+	} {
+		running.Go(func() {
+			defer cancel()
+			if err := role(ctx, logger); err != nil {
+				failures <- fmt.Errorf("%s: %w", name, err)
+			}
+		})
+	}
+
+	running.Wait()
+	close(failures)
+
+	var errs []error
+	for err := range failures {
+		errs = append(errs, err)
+	}
+	return errors.Join(errs...)
 }

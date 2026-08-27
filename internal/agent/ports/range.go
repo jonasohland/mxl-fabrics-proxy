@@ -11,7 +11,7 @@
 // anyway, and the probe's own reported service is a per-process artefact that cannot serve
 // (WRS §2, §9). One allocator, one collision domain, no per-provider branch.
 //
-// This file defines the range type only. The allocator lands in M5.
+// This file defines the range type; [Allocator] is in alloc.go.
 package ports
 
 import (

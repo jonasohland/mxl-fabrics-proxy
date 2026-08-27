@@ -1,13 +1,10 @@
 // Command mxl-replicator drives MXL Fabrics replication for flows a host does not own.
 //
-// It ships both control-plane roles in one binary:
+// It ships both control-plane roles in one binary, selected by flags on one command:
 //
-//	mxl-replicator server            the central connection management server
-//	mxl-replicator agent             the per-node agent, supervising worker processes
-//	mxl-replicator run               both, for single-host and development use
-//
-// Roles are subcommands rather than flags because each grows its own configuration surface,
-// and a union of the two would make the help text a union of two unrelated tools (§2.2).
+//	mxl-replicator run               both roles — the default, and the single-host case
+//	mxl-replicator run --agent       agent only: every ordinary fleet node
+//	mxl-replicator run --server      server only: a control-plane-only node
 //
 // The data plane is a separate binary, mxl-fabrics-proxy-worker, which keeps its name: one
 // process = one flow, one direction, one peer, one role. This process never touches grain
@@ -16,7 +13,6 @@ package main
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -45,18 +41,6 @@ type CLI struct {
 	Globals
 
 	Run RunCmd `cmd:"" default:"withargs" help:"Run the server role, the agent role, or both."`
-}
-
-// errNotImplemented is returned by a role whose implementation has not landed yet. It exists
-// so the command surface can be exercised — and tested — ahead of the roles themselves,
-// while failing loudly rather than appearing to start.
-type errNotImplemented struct {
-	role      string
-	milestone string
-}
-
-func (e errNotImplemented) Error() string {
-	return fmt.Sprintf("the %s role is not implemented yet (%s)", e.role, e.milestone)
 }
 
 func main() {
@@ -97,12 +81,6 @@ func main() {
 	kctx.Bind(logger)
 
 	if err := kctx.Run(); err != nil {
-		var notImplemented errNotImplemented
-		if errors.As(err, &notImplemented) {
-			logger.Error("not implemented", "error", err)
-			os.Exit(2)
-		}
-
 		logger.Error("exiting", "error", err)
 		os.Exit(1)
 	}
