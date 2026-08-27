@@ -300,11 +300,22 @@ class ContinuousFlowWriter {
 
         void cancel();
 
+        /** The mutable sample buffers this write covers: one wrapped slice per
+         * channel, `count` channels `stride` bytes apart.
+         *
+         * The proxy never touches this — its target has already had the samples
+         * written into shared memory by the RDMA transfer, and only opens the
+         * range to commit it. A producer writing samples itself needs the
+         * buffers, so they are carried here rather than discarded. */
+        [[nodiscard]] ::mxlMutableWrappedMultiBufferSlice const&
+        buffers() const noexcept;
+
       private:
         friend class ContinuousFlowWriter;
-        explicit Access(ContinuousFlowWriter&);
+        Access(ContinuousFlowWriter&, ::mxlMutableWrappedMultiBufferSlice);
 
         ContinuousFlowWriter& _writer;
+        ::mxlMutableWrappedMultiBufferSlice _buffers;
         bool _cancelled = false;
     };
 
