@@ -1,0 +1,11 @@
+[2026-08-27 22:45:04.409] [info] [RCTarget.cpp:32] Setting up RC target with source address: fi_sockaddr_in://127.0.0.1:24501
+[2026-08-27 22:45:22.285] [info] [libfabric:core:core:372] variable prefer_sysconfig=<not set>
+[2026-08-27 22:45:22.285] [info] [libfabric:core:tcp:1003] Rx only caps ignored in Tx caps
+[2026-08-27 22:45:22.285] [info] [libfabric:mr:core:238] Initializing memory monitor uffd
+[2026-08-27 22:45:22.285] [info] [libfabric:core:core:665] Hmem iface FI_HMEM_CUDA not supported
+[2026-08-27 22:47:01.623] [console] [error] [flow.cpp:244] Failed to create flow : Invalid JSON flow definition. syntax error at line 1 near: not json
+[2026-08-27 22:47:02.625] [error] fatal: unknown error: failed to create flow writer
+[2026-08-27 22:47:02.639] [error] fatal: missing required field: metrics_socket
+[2026-08-27 22:47:02.685] [error] fatal: invalid argument: failed to parse provider string
+[2026-08-27 22:45:08.406] [error] fatal: timeout: timed out waiting for a grain
+[2026-08-27 22:43:58.868] [error] [mxl.cpp:56] Failed to create instance : filesystem error: Domain path is not a directory: Not a directory [/nonexistent/domain]

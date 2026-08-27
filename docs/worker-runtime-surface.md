@@ -449,25 +449,57 @@ was correct. A supervisor that learned to ignore the initiator's value should st
   (mxl `lib/internal/src/Instance.cpp:44`). The worker itself never configures a logger or
   a pattern.
 - **Log level is controlled by the `MXL_LOG_LEVEL` environment variable**, inherited from
-  the parent. This is the only environment knob the worker has, and it is not currently
-  exercised by the Go layer — `spdlog::debug` calls in the transfer loops are compiled in
-  but silent at the default `info` level. A new supervisor should plumb this through.
+  the parent. It was not exercised by the legacy Go layer — `spdlog::debug` calls in the
+  transfer loops are compiled in but silent at the default `info` level. A supervisor should
+  plumb it through.
+- **`FI_LOG_LEVEL` is a second environment knob**, read by mxl's own libfabric log bridge
+  (`lib/fabrics/ofi/src/internal/FILogging.cpp`), accepting `trace|debug|info|warn`. It
+  routes libfabric's diagnostics **into the same spdlog logger**, not to a separate stream.
+  At `debug` a single failed startup emits ~160 extra lines on stdout. Unset, libfabric is
+  quiet.
 
-Line format (spdlog's default pattern, plus mxl's own source-location prefixes):
+### Line format
+
+The format varies more than "spdlog's default pattern" suggests. What follows is measured,
+not inferred — captured from mxl 1.2.0-dev / libfabric 2.6 across a bad domain path, a
+malformed flow definition, a missing config key, an unparseable provider, an idle-source
+timeout, and a run with `FI_LOG_LEVEL=debug`:
 
 ```
-[2026-08-27 14:03:11.842] [console] [info] connected
-[2026-08-27 14:03:11.900] [console] [debug] [Flow.cpp:88] ...
+[2026-08-27 22:47:02.625] [error] fatal: unknown error: failed to create flow writer
+[2026-08-27 22:47:01.623] [console] [error] [flow.cpp:244] Failed to create flow : Invalid JSON …
+[2026-08-27 22:45:04.409] [info] [RCTarget.cpp:32] Setting up RC target with source address: …
+[2026-08-27 22:45:22.285] [info] [libfabric:core:core:372] variable prefer_sysconfig=<not set>
 ```
 
-The existing translator (`legacy/go/pkg/worker/exec.go:301-376`) parses this by consuming
-leading `[...]` tokens, dropping the literal `console`, then treating token 0 as a timestamp
-(`2006-01-02 15:04:05.000`), token 1 as the level (`trace|debug|info|warning|error`), and
-token 2 — if present — as a source location. The remainder is the message. Note this parser
-is positional and will mis-handle a message that itself starts with `[`.
+Three things a parser has to be built around, each of which the legacy translator gets wrong:
+
+1. **The logger name is optional and varies within a single run.** The first two lines above
+   came out of the same process. A line logged before the mxl instance installs its named
+   default logger (`Instance.cpp:44`) carries no name; one logged after carries `[console]`.
+   A parser that requires either spelling drops half of a failing worker's output.
+2. **libfabric's diagnostics arrive through this logger**, formatted as
+   `[libfabric:<subsys>:<provider>:<line>]` in the source-location position. Splitting that
+   token on the *first* colon reads `libfabric` as the file and `core:core:372` as the line
+   number, so it stays in the message. Split on the last colon.
+3. **The source-location bracket is optional**, and a message can itself begin with `[` — a
+   real one ends `… Not a directory [/nonexistent/domain]`. Consuming every leading bracket,
+   as the legacy parser does (`legacy/go/pkg/worker/exec.go:301-376`), eats the first token
+   of such a message and files it as a source location.
+
+Levels seen: `trace|debug|info|warning|error|critical`. Timestamps are local time in
+`2006-01-02 15:04:05.000`.
 
 Colour codes: the logger is a `stdout_color_mt` sink, which suppresses ANSI escapes when
-stdout is not a TTY. Piping it (as the supervisor does) gives clean text.
+stdout is not a TTY, so a supervisor that pipes stdout (as it must, to read the stream at
+all) gets clean text. Worth knowing what the other case looks like, because it is not what
+you would guess — the escapes wrap the **level token itself**,
+`[<esc>[31m<esc>[1merror<esc>[m]`, so a parser that does not strip them fails to recognise
+the level rather than merely rendering oddly.
+
+A supervisor must also **emit lines it cannot parse** rather than dropping them. Nothing
+guarantees every line on stdout is spdlog's, and the legacy translator's silent `continue`
+on a parse failure is an efficient way to lose the one message explaining a failure.
 
 ---
 
