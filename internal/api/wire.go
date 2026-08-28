@@ -192,6 +192,18 @@ const (
 	// ReasonLoop is A→B plus B→A for one flow ID. Chains (A→B→C) are fine and useful.
 	ReasonLoop ReasonCode = "loop"
 
+	// ReasonNamespaceOverlap is two requests in one namespace expanding onto the same path.
+	//
+	// Unlike the conflicts above it is not a corruption: the path is refcounted and works
+	// perfectly well held twice. It is refused because a namespace is a *partition* — the
+	// property a UI relies on to render a request set as a matrix, where clearing one cell
+	// stops exactly the paths in it. Two requests sharing an edge breaks that, and the
+	// operator's own fix (narrow one selector, or move one request to another namespace) is
+	// not something the server can pick for them.
+	//
+	// Across namespaces sharing stays legal and is the supported way to express fan-in.
+	ReasonNamespaceOverlap ReasonCode = "namespace_overlap"
+
 	// --- WAITING: waiting for something that may plausibly appear (§7.2) ---
 
 	// ReasonFlowNotFound is a source flow not currently observed in the source domain. For a

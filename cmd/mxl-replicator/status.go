@@ -7,7 +7,6 @@ import (
 	"os"
 	"sort"
 	"strings"
-	"text/tabwriter"
 
 	"gopkg.in/yaml.v3"
 
@@ -97,7 +96,7 @@ func (c *StatusCmd) Run(ctx context.Context) error {
 		if !node.Live {
 			summary.Unhealthy = append(summary.Unhealthy, Unhealthy{
 				Kind: "node", Name: node.Name, State: "not leased",
-				Reason: "no agent holds this node; its workers may still be running",
+				Reason: "no agent holds this node, its workers may still be running",
 			})
 		}
 	}
@@ -127,13 +126,17 @@ func printSummary(summary Summary) {
 		warn("still settling: this is intent, not what is running")
 	}
 
-	fmt.Printf("nodes      %d registered, %d leased\n", summary.Nodes.Registered, summary.Nodes.Leased)
-	fmt.Printf("requests   %d  %s\n", total(summary.Requests), states(summary.Requests))
-	fmt.Printf("paths      %d  %s\n", total(summary.Paths), states(summary.Paths))
-	fmt.Printf("sessions   %d running\n", summary.Sessions)
+	out := table()
+	defer flush(out)
+
+	fmt.Fprintf(out, "nodes\t%d registered, %d leased\n", summary.Nodes.Registered, summary.Nodes.Leased)
+	fmt.Fprintf(out, "requests\t%d  %s\n", total(summary.Requests), states(summary.Requests))
+	fmt.Fprintf(out, "paths\t%d  %s\n", total(summary.Paths), states(summary.Paths))
+	fmt.Fprintf(out, "sessions\t%d running\n", summary.Sessions)
 
 	if len(summary.Nodes.NoOutputRoot) > 0 {
-		fmt.Printf("\n%s: no output root, cannot be a destination\n",
+		fmt.Fprintln(out)
+		fmt.Fprintf(out, "%s: no output root, cannot be a destination\n",
 			strings.Join(summary.Nodes.NoOutputRoot, ", "))
 	}
 
@@ -143,20 +146,18 @@ func printSummary(summary Summary) {
 	case total(summary.Requests) == 0:
 		// "everything is active" is true of an empty fleet and useless. Say which of the two
 		// nothing-is-wrong states this is.
-		fmt.Println("\nno replication requests")
+		fmt.Fprintln(out, "\nno replication requests")
 		return
 	default:
-		fmt.Println("\neverything is active")
+		fmt.Fprintln(out, "\neverything is active")
 		return
 	}
 
-	fmt.Println()
-	out := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(out)
 	fmt.Fprintln(out, "KIND\tNAME\tSTATE\tREASON")
 	for _, item := range summary.Unhealthy {
 		fmt.Fprintf(out, "%s\t%s\t%s\t%s\n", item.Kind, item.Name, item.State, item.Reason)
 	}
-	_ = out.Flush()
 }
 
 func total(counts map[api.State]int) int {
@@ -221,8 +222,7 @@ func printRequestTable(requests []api.Request) {
 		return
 	}
 
-	out := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(out, "NAME\tSTATE\tPATHS\tSOURCE\tDESTINATIONS\tLABELS")
+	out := table("NAME", "STATE", "PATHS", "SOURCE", "DESTINATIONS", "LABELS")
 	for _, request := range requests {
 		fmt.Fprintf(out, "%s\t%s\t%s\t%s\t%s\t%s\n",
 			request.Name,

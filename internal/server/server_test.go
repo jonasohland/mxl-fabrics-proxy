@@ -918,6 +918,11 @@ func TestLabelValidation(t *testing.T) {
 		"quantile":                 {"quantile": "0.5"},
 		"not a label name":         {"show-name": "nab"},
 		"overlong value":           {"show": strings.Repeat("x", 300)},
+
+		// The namespace is the one label the server acts on, so its *value* is constrained too.
+		"empty namespace":          {api.LabelNamespace: ""},
+		"namespace with a slash":   {api.LabelNamespace: "shows/nab"},
+		"namespace with a space":   {api.LabelNamespace: "nab 2026"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			spec := flowRequestSpec("labelled-" + strings.ReplaceAll(name, " ", "-"))
@@ -930,8 +935,51 @@ func TestLabelValidation(t *testing.T) {
 	}
 
 	ok := flowRequestSpec("labelled-fine")
-	ok.Labels = map[string]string{"show": "nab", "tier_1": "yes"}
+	ok.Labels = map[string]string{"show": "nab", "tier_1": "yes", api.LabelNamespace: "nab-2026"}
 	assert.Equal(t, http.StatusCreated, h.do(http.MethodPost, api.PathRequests, ok).status)
+}
+
+// A request that would take a path another request in its namespace already holds is refused at
+// POST, with the reason naming the incumbent. It comes for free: admission reconciles a candidate
+// fleet and refuses anything that comes back INVALID, so the rule is enforced once and applies
+// both to what is written and to what a reconcile discovers later.
+func TestNamespaceOverlapIsRefusedAtPost(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	h.fleet()
+
+	first := flowRequestSpec("cam1")
+	require.Equal(t, http.StatusCreated, h.do(http.MethodPost, api.PathRequests, first).status)
+
+	// Same source, same flow, same destination, no namespace label on either: both are in the
+	// default namespace, which is a namespace like any other.
+	second := flowRequestSpec("cam1-again")
+	resp := h.do(http.MethodPost, api.PathRequests, second)
+	require.Equal(t, http.StatusBadRequest, resp.status, "body: %s", resp.body)
+
+	apiErr := resp.apiError(t)
+	assert.Equal(t, api.CodeInvalidRequest, apiErr.Code)
+	assert.Equal(t, string(api.ReasonNamespaceOverlap), apiErr.Details["reason_code"],
+		"the code is what a UI keys on to decide what to highlight")
+	assert.Contains(t, apiErr.Message, `request "cam1" already replicates`)
+	assert.Contains(t, apiErr.Message, `namespace "default"`,
+		"the message names the namespace the overlap is in, which is where a fix has to happen")
+
+	// Nothing was written.
+	var list api.RequestList
+	h.do(http.MethodGet, api.PathRequests, nil).decode(t, &list)
+	require.Len(t, list.Requests, 1)
+	assert.Equal(t, "cam1", list.Requests[0].ID)
+
+	// The same request in another namespace is accepted, and both then hold the one path.
+	second.Labels = map[string]string{api.LabelNamespace: "archive"}
+	require.Equal(t, http.StatusCreated, h.do(http.MethodPost, api.PathRequests, second).status)
+
+	var paths api.PathsResponse
+	h.do(http.MethodGet, api.PathPaths, nil).decode(t, &paths)
+	require.Len(t, paths.Paths, 1)
+	assert.Equal(t, []string{"cam1", "cam1-again"}, paths.Paths[0].Requests)
 }
 
 func TestRequestNameValidation(t *testing.T) {
@@ -1080,4 +1128,43 @@ func TestMalformedBodies(t *testing.T) {
 	require.NoError(t, err)
 	defer resp.Body.Close()
 	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+}
+
+// Every stored request says which namespace it is in. A request that named none is written into
+// the default one rather than left implying it, so that one label means one thing whichever
+// request is holding it — and so `--prune -l namespace=default` matches what is in fact in it.
+func TestRequestsWithoutANamespaceGetTheDefaultLabel(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	h.fleet()
+
+	spec := flowRequestSpec("cam1")
+	require.Nil(t, spec.Labels, "the fixture sends none")
+
+	var created api.Request
+	resp := h.do(http.MethodPost, api.PathRequests, spec)
+	require.Equal(t, http.StatusCreated, resp.status, "body: %s", resp.body)
+	resp.decode(t, &created)
+	assert.Equal(t, api.DefaultNamespace, created.Labels[api.LabelNamespace],
+		"the response already reflects what was stored")
+
+	var got api.Request
+	h.do(http.MethodGet, api.PathRequests+"/cam1", nil).decode(t, &got)
+	assert.Equal(t, map[string]string{api.LabelNamespace: api.DefaultNamespace}, got.Labels)
+
+	// **And re-applying the same label-less body is still unchanged.** Normalising after the
+	// comparison rather than before would make every apply of a manifest that names no namespace
+	// look like an edit, and write on every pass (invariant 13, §8.3).
+	before := h.revision()
+	again := h.do(http.MethodPost, api.PathRequests, flowRequestSpec("cam1"))
+	assert.Equal(t, http.StatusOK, again.status)
+	assert.Equal(t, api.OutcomeUnchanged, again.header.Get(api.HeaderOutcome))
+	assert.Equal(t, before, h.revision(), "nothing was written")
+
+	// An explicit `namespace: default` is the same request, not a different one.
+	explicit := flowRequestSpec("cam1")
+	explicit.Labels = map[string]string{api.LabelNamespace: api.DefaultNamespace}
+	assert.Equal(t, api.OutcomeUnchanged,
+		h.do(http.MethodPost, api.PathRequests, explicit).header.Get(api.HeaderOutcome))
 }

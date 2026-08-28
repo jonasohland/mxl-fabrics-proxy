@@ -67,17 +67,17 @@ func TestOutputRefusesAnUnadvertisedRoot(t *testing.T) {
 }
 
 // A node with no roots configured is not a replication destination at all (§10.6). It is the
-// default, and the message has to say that rather than looking like a typo.
+// default, and the message has to say what the node advertises rather than looking like a typo.
 func TestOutputRefusesEverythingWithoutRoots(t *testing.T) {
 	inv := rooted(t)
 
 	_, err := inv.Output("", []string{"ingest"})
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "not a replication destination")
+	assert.Contains(t, err.Error(), "advertises none")
 
 	_, err = inv.Output("fast", []string{"ingest"})
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "not a replication destination")
+	assert.Contains(t, err.Error(), "advertises none")
 }
 
 // The character-set half of the invariant. Every one of these is refused, and the traversal cases
@@ -400,7 +400,7 @@ func TestRootConfigurationIsRefusedWhenItIsAmbiguous(t *testing.T) {
 				SearchPaths: []string{base},
 				OutputRoots: []Root{{Name: "fast", Path: base}},
 			},
-			want: "could never find anything",
+			want: "is also search path",
 		},
 		{
 			// The other direction stays refused: a search path inside a root asks discovery to
@@ -505,7 +505,7 @@ func TestARootMayBeTheParentOfAnInputDomain(t *testing.T) {
 	_, err = inv.Output("fast", []string{"cameras"})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), `input domain "cams"`)
-	assert.Contains(t, err.Error(), "never written to")
+	assert.Contains(t, err.Error(), `maps as input domain "cams"`)
 
 	// And the name check still catches the ordinary case, where the names collide too.
 	inv, err = New(Options{

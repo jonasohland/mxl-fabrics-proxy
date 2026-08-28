@@ -123,7 +123,7 @@ func (s Selector) Validate() error {
 		for _, k := range set {
 			names = append(names, string(k))
 		}
-		return fmt.Errorf("selector: %s are both set; a selector has exactly one kind", strings.Join(names, " and "))
+		return fmt.Errorf("selector: %s are both set, expected exactly one", strings.Join(names, " and "))
 	}
 
 	if s.GroupHint != nil && s.GroupHint.Name == "" {
@@ -151,7 +151,7 @@ func (s *Selector) UnmarshalJSON(data []byte) error {
 	}
 	if len(unknown) > 0 {
 		slices.Sort(unknown)
-		return fmt.Errorf("selector: unknown kind %s (known kinds: %s); a newer server may support it",
+		return fmt.Errorf("selector: unknown kind %s (known kinds: %s)",
 			strings.Join(quoteAll(unknown), ", "), strings.Join(selectorKindNames(), ", "))
 	}
 

@@ -224,7 +224,7 @@ func TestAgentOutputRootValidation(t *testing.T) {
 			// anything. Distinct from a search path *above* a root, which is permitted below.
 			name: "root that is a search path",
 			args: []string{"--agent-output-root", "fast=/dev/shm/mxl", "--agent-search-path", "/dev/shm/mxl"},
-			want: "could never find anything",
+			want: "is also search path",
 		},
 		{
 			name: "root over a search path",
@@ -307,7 +307,7 @@ func TestCombinedRefusesToDeriveALoopbackURLUnderTLS(t *testing.T) {
 // Two listeners in one process must not collide. Only checked when both roles run.
 func TestCombinedRejectsListenCollision(t *testing.T) {
 	_, _, err := parse(t, "run", "--agent-node", "dev", "--server-listen", ":9000", "--agent-listen", ":9000")
-	assert.ErrorContains(t, err, "separate ports")
+	assert.ErrorContains(t, err, "--server-listen and --agent-listen are both")
 
 	_, _, err = parse(t, agentOnly("--agent-listen", ":2283")...)
 	assert.NoError(t, err, "no collision when the server role is not running")
@@ -398,7 +398,7 @@ func TestAgentFabricFlag(t *testing.T) {
 
 	// The join's failure modes are worth reaching from the command line too.
 	_, _, err := parse(t, agentOnly("--agent-fabric", "provider=efa,fabric=vpc1,interface=efa0")...)
-	assert.ErrorContains(t, err, "cannot select an efa attachment")
+	assert.ErrorContains(t, err, "efa attachment is selected by device")
 }
 
 // A node with no attachments can do nothing, and refusing to start would break

@@ -247,7 +247,7 @@ func (s *Server) heldBy(w http.ResponseWriter, ctx context.Context, node, instan
 
 	switch {
 	case !record.Found:
-		writeError(w, http.StatusConflict, api.CodeReregister, "node "+node+" holds no lease; register again")
+		writeError(w, http.StatusConflict, api.CodeReregister, "node "+node+" holds no lease")
 		return state.LeaseRecord{}, false
 	case instance == "":
 		writeError(w, http.StatusBadRequest, api.CodeInvalidRequest, "instance is required")
@@ -357,8 +357,7 @@ func (s *Server) handleAssignments(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !settled {
-		writeError(w, http.StatusServiceUnavailable, api.CodeNotReady,
-			"the reconciler has not settled; this is not an empty assignment set")
+		writeError(w, http.StatusServiceUnavailable, api.CodeNotReady, "the reconciler has not settled")
 		return
 	}
 

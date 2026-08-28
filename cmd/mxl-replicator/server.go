@@ -68,7 +68,7 @@ func (c *ServerOptions) Validate() error {
 	}
 
 	if c.LeaseTTL <= c.HeartbeatInterval {
-		return fmt.Errorf("--lease-ttl (%s) must be greater than --heartbeat-interval (%s), or every agent expires between heartbeats", c.LeaseTTL, c.HeartbeatInterval)
+		return fmt.Errorf("--lease-ttl (%s) must be greater than --heartbeat-interval (%s)", c.LeaseTTL, c.HeartbeatInterval)
 	}
 	if c.SettlingHeartbeats < 0 {
 		return fmt.Errorf("--settling-heartbeats must not be negative")
@@ -85,10 +85,13 @@ func (c *ServerOptions) Validate() error {
 	}
 
 	if c.Idle.IdleTimeout < 0 || c.Idle.IdleTeardown < 0 || c.ConnectTimeout < 0 {
-		return fmt.Errorf("timeouts must not be negative; 0 means wait indefinitely")
+		return fmt.Errorf("timeouts must not be negative")
 	}
-	if c.DegradedRestarts <= 0 || c.FailedRestarts < c.DegradedRestarts {
-		return fmt.Errorf("--failed-restarts (%d) must be at least --degraded-restarts (%d), and both must be positive", c.FailedRestarts, c.DegradedRestarts)
+	if c.DegradedRestarts <= 0 {
+		return fmt.Errorf("--degraded-restarts must be positive")
+	}
+	if c.FailedRestarts < c.DegradedRestarts {
+		return fmt.Errorf("--failed-restarts (%d) must be at least --degraded-restarts (%d)", c.FailedRestarts, c.DegradedRestarts)
 	}
 
 	return nil

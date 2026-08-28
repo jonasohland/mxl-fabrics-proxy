@@ -428,10 +428,10 @@ func TestGetRejectsInapplicableFilters(t *testing.T) {
 		cmd  GetCmd
 		want string
 	}{
-		"node filter on nodes":   {GetCmd{Kind: "nodes", Node: "studio-a"}, "--node does not apply"},
-		"domain filter on paths": {GetCmd{Kind: "paths", Domain: "cameras"}, "--domain does not apply"},
-		"selector on flows":      {GetCmd{Kind: "flows", Selector: []string{"a=b"}}, "--selector does not apply"},
-		"selector on sessions":   {GetCmd{Kind: "sessions", Selector: []string{"a=b"}}, "--selector does not apply"},
+		"node filter on nodes":   {GetCmd{Kind: "nodes", Node: "studio-a"}, "--node applies to"},
+		"domain filter on paths": {GetCmd{Kind: "paths", Domain: "cameras"}, "--domain applies to"},
+		"selector on flows":      {GetCmd{Kind: "flows", Selector: []string{"a=b"}}, "--selector applies to"},
+		"selector on sessions":   {GetCmd{Kind: "sessions", Selector: []string{"a=b"}}, "--selector applies to"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			cmd := tc.cmd

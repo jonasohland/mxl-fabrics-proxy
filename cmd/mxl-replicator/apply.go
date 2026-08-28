@@ -54,7 +54,7 @@ func (c *ApplyCmd) Run(ctx context.Context) error {
 	// moving video. The selector is the guard, which is also why there is no confirmation prompt:
 	// a prompt in a tool meant to run in CI is a trap, and this has a --dry-run instead.
 	if c.Prune && len(selector) == 0 {
-		return errors.New("--prune requires --selector: it is the guard on what may be cancelled")
+		return errors.New("--prune requires --selector")
 	}
 	if !c.Prune && len(selector) > 0 {
 		return errors.New("--selector is only meaningful with --prune")
@@ -203,15 +203,21 @@ func applyError(err error) string {
 }
 
 // sortedLabels renders a label set deterministically, for status output.
+// sortedLabels renders labels as one `key=value,key=value` cell, for the table column that has
+// room for exactly one. [DescribeCmd] has room for a line each and uses [sortedKeys] instead.
 func sortedLabels(labels map[string]string) string {
 	if len(labels) == 0 {
 		return ""
 	}
-	keys := slices.Collect(maps.Keys(labels))
-	sort.Strings(keys)
-	parts := make([]string, 0, len(keys))
-	for _, key := range keys {
+	parts := make([]string, 0, len(labels))
+	for _, key := range sortedKeys(labels) {
 		parts = append(parts, key+"="+labels[key])
 	}
 	return strings.Join(parts, ",")
+}
+
+func sortedKeys(labels map[string]string) []string {
+	keys := slices.Collect(maps.Keys(labels))
+	sort.Strings(keys)
+	return keys
 }

@@ -301,7 +301,7 @@ func (s *Server) versions() api.Versions {
 func (s *Server) checkProtocol(registration api.NodeRegistration) error {
 	agent := registration.Capabilities.Versions.Protocol
 	if agent > api.ProtocolVersion {
-		return fmt.Errorf("agent speaks protocol version %d and this server speaks %d; upgrade the server first", agent, api.ProtocolVersion)
+		return fmt.Errorf("agent speaks protocol version %d and this server speaks %d", agent, api.ProtocolVersion)
 	}
 	return nil
 }
@@ -315,14 +315,14 @@ func validateRegistration(registration api.NodeRegistration) error {
 		return err
 	}
 	if registration.Instance == "" {
-		return errors.New("instance is required: it is what makes a lease claim attributable")
+		return errors.New("instance is required")
 	}
 	for i, attachment := range registration.Capabilities.Fabrics {
 		if attachment.Provider == "" {
 			return fmt.Errorf("capabilities.fabrics[%d]: provider is required", i)
 		}
 		if attachment.Fabric == "" {
-			return fmt.Errorf("capabilities.fabrics[%d]: fabric label is required; two nodes may pair on a provider only if they share one", i)
+			return fmt.Errorf("capabilities.fabrics[%d]: fabric label is required", i)
 		}
 	}
 	for i, domain := range registration.Domains {

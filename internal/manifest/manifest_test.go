@@ -1,6 +1,7 @@
 package manifest
 
 import (
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -122,7 +123,7 @@ func TestDocumentRejections(t *testing.T) {
 		},
 		"two selectors": {
 			file: "name: a\nsource: {node: s, domain: d, flow: f, group_hint: {name: g}}\ndestinations: [{node: e, domain: i}]",
-			want: "exactly one kind",
+			want: "names both flow and group_hint",
 		},
 		"group hint with no name": {
 			file: "name: a\nsource: {node: s, domain: d, group_hint: {type: video}}\ndestinations: [{node: e, domain: i}]",
@@ -136,7 +137,7 @@ func TestDocumentRejections(t *testing.T) {
 		// about the root or the provider.
 		"duplicate destination": {
 			file: "name: a\nsource: {node: s, domain: d, flow: f}\ndestinations: [{node: e, domain: i}, {node: e, domain: i, root: bulk}]",
-			want: "one destination written twice",
+			want: "both name e/i",
 		},
 		// A destination domain is a directory this API asks a node to create, so the name rule is
 		// structural and refused before anything reaches the server (§10.6).
@@ -367,4 +368,106 @@ func TestEveryDocumentIsCheckedForNameAndUnknownKeys(t *testing.T) {
 	_, err = Load([]string{dir})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "cam1")
+}
+
+// --- namespaces (§7b) ---------------------------------------------------------------------
+
+// The namespace is a field of its own in the file and a label on the wire. The field exists
+// because burying the one key the server acts on in a free-text map hides it; the label is what
+// `--prune` selects on, which is the whole reason a namespace needs no second mechanism.
+func TestNamespaceBecomesALabel(t *testing.T) {
+	t.Parallel()
+
+	const file = `
+name: cam1
+namespace: nab
+source: {node: studio-a, domain: cameras, flow: f-1}
+destinations: [{node: edge-01, domain: ingest}]
+labels: {show: gala}
+`
+	docs, err := Parse(strings.NewReader(file), "-")
+	require.NoError(t, err)
+	specs, err := Specs(docs)
+	require.NoError(t, err)
+	require.Len(t, specs, 1)
+
+	assert.Equal(t, map[string]string{"show": "gala", api.LabelNamespace: "nab"}, specs[0].Labels)
+	assert.Equal(t, "nab", specs[0].Namespace())
+}
+
+// Naming no namespace leaves the spec alone. The server writes the default in on the POST, so
+// filling it here as well would only mean the file and the wire disagreed about what was sent.
+func TestNoNamespaceLeavesTheLabelsUntouched(t *testing.T) {
+	t.Parallel()
+
+	const file = `
+name: cam1
+source: {node: studio-a, domain: cameras, flow: f-1}
+destinations: [{node: edge-01, domain: ingest}]
+`
+	docs, err := Parse(strings.NewReader(file), "-")
+	require.NoError(t, err)
+	specs, err := Specs(docs)
+	require.NoError(t, err)
+
+	assert.Empty(t, specs[0].Labels, "nothing is invented here")
+	assert.Equal(t, api.DefaultNamespace, specs[0].Namespace(), "but a reader still gets an answer")
+}
+
+// A manifest written before the field existed spelled it under labels. It still works and still
+// means the same thing.
+func TestTheLabelSpellingStillWorks(t *testing.T) {
+	t.Parallel()
+
+	const file = `
+name: cam1
+source: {node: studio-a, domain: cameras, flow: f-1}
+destinations: [{node: edge-01, domain: ingest}]
+labels: {namespace: archive}
+`
+	docs, err := Parse(strings.NewReader(file), "-")
+	require.NoError(t, err)
+	specs, err := Specs(docs)
+	require.NoError(t, err)
+	assert.Equal(t, "archive", specs[0].Namespace())
+}
+
+// Both spellings agreeing is fine; disagreeing is refused rather than resolved. There is no
+// defensible winner, and the value decides which requests may not overlap and what --prune
+// catches.
+func TestBothNamespaceSpellingsMustAgree(t *testing.T) {
+	t.Parallel()
+
+	const doc = `
+name: cam1
+namespace: %s
+source: {node: studio-a, domain: cameras, flow: f-1}
+destinations: [{node: edge-01, domain: ingest}]
+labels: {namespace: archive}
+`
+	require.NoError(t, parseAndConvert(strings.NewReader(fmt.Sprintf(doc, "archive")), "-"),
+		"the same value twice is redundant, not wrong")
+
+	err := parseAndConvert(strings.NewReader(fmt.Sprintf(doc, "nab")), "-")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `namespace is "nab" but labels.namespace is "archive"`)
+	assert.Contains(t, err.Error(), `namespace is "nab" but labels.namespace is "archive"`)
+}
+
+// The name is checked where the file is read, so `apply --dry-run` on a bad file fails without a
+// server — and by the same function the server uses, so the two cannot drift.
+func TestNamespaceNameIsValidatedInTheFile(t *testing.T) {
+	t.Parallel()
+
+	for _, ns := range []string{"shows/nab", "nab 2026", `""`} {
+		file := fmt.Sprintf(`
+name: cam1
+namespace: %s
+source: {node: studio-a, domain: cameras, flow: f-1}
+destinations: [{node: edge-01, domain: ingest}]
+`, ns)
+		err := parseAndConvert(strings.NewReader(file), "-")
+		require.Error(t, err, "namespace %q", ns)
+		assert.Contains(t, err.Error(), "namespace")
+	}
 }

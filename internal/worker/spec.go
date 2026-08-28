@@ -359,7 +359,7 @@ func validateTimeout(name string, d time.Duration) error {
 	if d != 0 && d < time.Millisecond {
 		// Zero already means "wait indefinitely" (WRS §3). Truncating 500µs to 0 ms would turn
 		// the shortest possible timeout into no timeout at all.
-		return fmt.Errorf("worker: %s of %s truncates to zero milliseconds, which means indefinitely", name, d)
+		return fmt.Errorf("worker: %s of %s truncates to zero milliseconds", name, d)
 	}
 	return nil
 }

@@ -143,7 +143,7 @@ func (c *Client) Assignments(ctx context.Context, node string, cursor int64, wai
 		return nil, fmt.Errorf("client: assignments for node %q arrived while polling for %q", out.Node, node)
 	}
 	if out.Revision < cursor {
-		return nil, fmt.Errorf("client: assignment set at revision %d is behind the cursor %d already held; not reconciling against a view that moved backwards",
+		return nil, fmt.Errorf("client: assignment set at revision %d is behind the cursor %d already held",
 			out.Revision, cursor)
 	}
 

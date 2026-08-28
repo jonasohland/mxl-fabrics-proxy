@@ -91,7 +91,7 @@ func (a *Allocator) Allocate(owner string, provider api.Provider) (string, error
 		return strconv.FormatUint(uint64(port), 10), nil
 	}
 
-	return "", fmt.Errorf("ports: no free port in %s for %s; %d of %d are in use",
+	return "", fmt.Errorf("ports: no free port in %s for %s, %d of %d are in use",
 		a.rng, owner, len(a.inUse), a.rng.Count())
 }
 

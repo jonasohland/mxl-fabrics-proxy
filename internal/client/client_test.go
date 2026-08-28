@@ -135,7 +135,7 @@ func TestAssignmentsNeverYieldsASetOnFailure(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(t, w, http.StatusServiceUnavailable, api.Error{
 			Code:    api.CodeNotReady,
-			Message: "the reconciler has not settled; this is not an empty assignment set",
+			Message: "the reconciler has not settled",
 		})
 	}))
 	defer srv.Close()

@@ -31,6 +31,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -60,9 +61,29 @@ type Document struct {
 	// configured order. Never silently substituted.
 	Provider ProviderDoc `yaml:"provider"`
 
-	IdleTeardownMS *int64            `yaml:"idle_teardown_ms"`
-	SchedPrio      *int              `yaml:"sched_prio"`
-	Labels         map[string]string `yaml:"labels"`
+	IdleTeardownMS *int64 `yaml:"idle_teardown_ms"`
+	SchedPrio      *int   `yaml:"sched_prio"`
+
+	// Namespace is the partition this request belongs to. Omitted, the server writes
+	// [api.DefaultNamespace] in.
+	//
+	// It is a field of its own here and a *label* on the wire, and the asymmetry is deliberate
+	// on both sides. On the wire it has to be a label, because labels are what `--prune` selects
+	// on and the whole point of a namespace is that `apply -f nab.yaml --prune -l namespace=nab`
+	// means "make this namespace equal this file" without inventing a second mechanism. In the
+	// file it should not be, because burying the one key the server acts on in a free-text map
+	// hides it: an operator reading a document has to know that `labels` has a magic member.
+	//
+	// Spelling it under `labels` still works and still means the same thing — a manifest written
+	// before this is not wrong. Spelling it *both* ways with different values is refused rather
+	// than resolved, since there is no defensible winner.
+	//
+	// A pointer so that `namespace: ""` is distinguishable from omitting the key, and can be
+	// refused. Written out, it reads as a deliberate choice; treated as absent it would be a line
+	// that silently does nothing, which is the failure this format exists to prevent.
+	Namespace *string `yaml:"namespace"`
+
+	Labels map[string]string `yaml:"labels"`
 
 	// where this document came from — a file path and, past the first, its index. Carried on the
 	// document so that an error raised *after* parsing can still say which one. Unexported, so
@@ -151,13 +172,18 @@ func (p ProviderDoc) pin() api.ProviderPin {
 
 // Spec converts a document to the wire type and validates it.
 //
-// Validation is [api.RequestSpec.Validate] plus the one rule that only exists in the file: the
+// Validation is [api.RequestSpec.Validate] plus the two rules that only exist in the file: the
 // selector is flattened here, so "exactly one kind" has to be checked rather than being
-// guaranteed by the shape.
+// guaranteed by the shape, and the namespace has two spellings that must not disagree.
 func (d Document) Spec() (api.RequestSpec, error) {
 	var spec api.RequestSpec
 
 	selector, err := d.Source.selector()
+	if err != nil {
+		return spec, err
+	}
+
+	labels, err := d.labels()
 	if err != nil {
 		return spec, err
 	}
@@ -167,7 +193,7 @@ func (d Document) Spec() (api.RequestSpec, error) {
 		Source:    api.Source{Node: d.Source.Node, Domain: d.Source.Domain, Select: selector},
 		Provider:  d.Provider.pin(),
 		SchedPrio: d.SchedPrio,
-		Labels:    d.Labels,
+		Labels:    labels,
 	}
 	for i, dst := range d.Destinations {
 		elements, err := ParseDomain(dst.Domain)
@@ -192,11 +218,47 @@ func (d Document) Spec() (api.RequestSpec, error) {
 	return spec, nil
 }
 
+// labels folds the namespace field into the label map the wire type carries.
+//
+// The document's own map is not mutated: a caller may hold it, and `delete` parses the same
+// documents without ever converting them.
+func (d Document) labels() (map[string]string, error) {
+	fromLabels, spelledAsLabel := d.Labels[api.LabelNamespace]
+
+	switch {
+	case d.Namespace == nil && !spelledAsLabel:
+		return d.Labels, nil
+
+	case d.Namespace != nil && spelledAsLabel && *d.Namespace != fromLabels:
+		// No defensible winner, so no winner. Silently preferring either one would put the
+		// request in a namespace the file appears to contradict, and a namespace is what decides
+		// which requests may not overlap and what `--prune -l` catches.
+		return nil, fmt.Errorf("namespace is %q but labels.%s is %q",
+			*d.Namespace, api.LabelNamespace, fromLabels)
+
+	case d.Namespace == nil:
+		// Spelled only the old way. Still valid, still means the same thing.
+		if err := api.ValidNamespace(fromLabels); err != nil {
+			return nil, fmt.Errorf("labels.%s: %w", api.LabelNamespace, err)
+		}
+		return d.Labels, nil
+	}
+
+	if err := api.ValidNamespace(*d.Namespace); err != nil {
+		return nil, fmt.Errorf("namespace: %w", err)
+	}
+
+	labels := make(map[string]string, len(d.Labels)+1)
+	maps.Copy(labels, d.Labels)
+	labels[api.LabelNamespace] = *d.Namespace
+	return labels, nil
+}
+
 // selector enforces the tagged union the flattened spelling cannot enforce structurally.
 func (s SourceDoc) selector() (api.Selector, error) {
 	switch {
 	case s.Flow != "" && s.GroupHint != nil:
-		return api.Selector{}, errors.New("source names both flow and group_hint; a selector is exactly one kind")
+		return api.Selector{}, errors.New("source names both flow and group_hint")
 	case s.Flow != "":
 		return api.Selector{Flow: s.Flow}, nil
 	case s.GroupHint != nil:
@@ -252,7 +314,7 @@ func Parse(r io.Reader, origin string) ([]Document, error) {
 			continue
 		}
 		if doc.Name == "" {
-			return nil, fmt.Errorf("%s: name is required: it is the request's identity", where(origin, index))
+			return nil, fmt.Errorf("%s: name is required", where(origin, index))
 		}
 
 		doc.where = where(origin, index)
@@ -342,7 +404,7 @@ func Load(paths []string) ([]Document, error) {
 	seen := make(map[string]bool, len(docs))
 	for _, doc := range docs {
 		if seen[doc.Name] {
-			return nil, fmt.Errorf("request %q is named by more than one document; the second would silently replace the first", doc.Name)
+			return nil, fmt.Errorf("request %q is named by more than one document", doc.Name)
 		}
 		seen[doc.Name] = true
 	}
@@ -402,7 +464,7 @@ func ParseDomain(domain string) ([]string, error) {
 		// thing this whole design exists to prevent (§7.2, §13). It is also what a *discovered*
 		// domain is named by, so refusing it here is what keeps a requested domain and a
 		// discovered one from ever colliding.
-		return nil, errors.New("is absolute; an output domain is named relative to its root, never as a path")
+		return nil, errors.New("is absolute, expected a domain relative to its root")
 	case strings.HasSuffix(domain, api.DomainSeparator):
 		return nil, errors.New("ends with a separator")
 	case strings.Contains(domain, api.DomainSeparator+api.DomainSeparator):

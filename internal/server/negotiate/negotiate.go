@@ -135,7 +135,7 @@ func Negotiate(src, dst []api.FabricAttachment, pin api.ProviderPin, cfg Config)
 
 	return Result{}, &Error{
 		Code: api.ReasonNoSharedCapability,
-		Message: fmt.Sprintf("no shared transfer capability: the nodes share %s but neither %s nor %s survives the intersection",
+		Message: fmt.Sprintf("no shared transfer capability on %s: neither %s nor %s survives the intersection",
 			pairList(candidates), api.CapRemoteWrite, api.CapSendReceive),
 	}
 }
@@ -171,7 +171,7 @@ func noCandidateError(src, dst []api.FabricAttachment) error {
 	}
 	return &Error{
 		Code: api.ReasonNoSharedProvider,
-		Message: fmt.Sprintf("no shared provider: the nodes share fabric %s but no provider on it — source offers %s, destination offers %s",
+		Message: fmt.Sprintf("no shared provider on fabric %s: source offers %s, destination offers %s",
 			quoteList(shared), fabricList(src), fabricList(dst)),
 	}
 }

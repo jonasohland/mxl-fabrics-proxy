@@ -94,6 +94,12 @@ func (s *Server) handleCreateRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// A request that named no namespace is written into the default one explicitly rather than
+	// left implying it. Before the unchanged comparison below, deliberately — see
+	// [api.RequestSpec.EnsureNamespace]. The one-off consequence is that the first apply of a
+	// manifest predating this writes once to add the label, and is unchanged from then on.
+	spec.EnsureNamespace()
+
 	ctx := r.Context()
 	v, ok := s.loadView(w, r)
 	if !ok {
@@ -147,7 +153,7 @@ func (s *Server) handleCreateRequest(w http.ResponseWriter, r *http.Request) {
 	default:
 		if _, _, err := state.PutJSON(ctx, s.store, store.RequestKey(record.ID), record, existing.Prior(), state.WriteOptions{CAS: true}); err != nil {
 			if errors.Is(err, store.ErrCompareFailed) {
-				writeError(w, http.StatusConflict, api.CodeInvalidRequest, "the request was modified concurrently; retry")
+				writeError(w, http.StatusConflict, api.CodeInvalidRequest, "the request was modified concurrently")
 				return
 			}
 			storeError(w, s.logger, "write request", err)
@@ -432,7 +438,7 @@ func validateRequestName(name string) error {
 		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
 		case r == '-', r == '_', r == '.', r == ':':
 		default:
-			return errors.New("name may contain only letters, digits and the characters - _ . : — it is used as the request's ID, in URLs and in storage keys")
+			return errors.New("name may contain only letters, digits and the characters - _ . :")
 		}
 	}
 	if strings.HasPrefix(name, ".") {
@@ -472,12 +478,22 @@ func validateLabels(labels map[string]string) error {
 		case !metrics.ValidLabelName(key):
 			return fmt.Errorf("label %q is not a usable Prometheus label name: letters, digits and underscore, not starting with a digit or with __", key)
 		case slices.Contains(reserved, key):
-			return fmt.Errorf("label %q is reserved: this project sets it on worker metrics itself (%s)",
-				key, strings.Join(reserved, ", "))
+			return fmt.Errorf("label %q is reserved for worker metrics", key)
 		case len(key) > maxLabelKeyLength:
 			return fmt.Errorf("label %q is longer than %d characters", key, maxLabelKeyLength)
 		case len(labels[key]) > maxLabelValueLength:
 			return fmt.Errorf("label %q has a value longer than %d characters", key, maxLabelValueLength)
+		}
+	}
+
+	// The namespace is the one label the server itself acts on, so its *value* is constrained
+	// where other label values are free text. It names a partition an operator selects, prunes
+	// and files manifests by, and it ends up in `--prune -l namespace=…` on a command line.
+	// Empty is refused rather than quietly meaning [api.DefaultNamespace]: `namespace: ""` reads
+	// as a deliberate choice and would silently land the request somewhere else.
+	if ns, ok := labels[api.LabelNamespace]; ok {
+		if err := api.ValidNamespace(ns); err != nil {
+			return fmt.Errorf("label %q: %w", api.LabelNamespace, err)
 		}
 	}
 	return nil

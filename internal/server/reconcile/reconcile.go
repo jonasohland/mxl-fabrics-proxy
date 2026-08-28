@@ -351,6 +351,24 @@ func Compute(fleet *state.Fleet, cfg Config) *Result {
 		}
 	}
 
+	// Two requests in one namespace may not hold one path. Legs that lose that contest are
+	// moved across to `invalid` before anything is planned, so the winner's path is built
+	// exactly as if the loser had never named it.
+	if overlaps := namespaceOverlaps(fleet, valid); len(overlaps) > 0 {
+		kept := valid[:0]
+		for i, leg := range valid {
+			bad, lost := overlaps[i]
+			if !lost {
+				kept = append(kept, leg)
+				continue
+			}
+			leg.bad = &bad
+			invalid = append(invalid, leg)
+			invalidLegs[leg.request] = append(invalidLegs[leg.request], legFailure{Destination: leg.dst, Result: bad})
+		}
+		valid = kept
+	}
+
 	// Valid legs first, so that a path a valid one wants is never turned into a shadow path by an
 	// invalid leg that happens to name the same edge.
 	for _, leg := range valid {
@@ -576,6 +594,102 @@ func sameDestination(spec, path api.Destination) bool {
 	return spec.Root == "" || spec.Root == path.Root
 }
 
+// namespaceOverlaps finds legs that would put a second request from one namespace onto a path
+// another request in that namespace already holds. It returns a verdict per index into `legs`;
+// an index absent from the map is fine.
+//
+// **Why this is a rule and not a rendering problem.** A path is refcounted and works perfectly
+// well held by two requests — that is what makes fan-in expressible (§9.1, §10.6). What it
+// breaks is the claim a *namespace* makes: that its requests are a partition, so a set of them
+// can be drawn as a matrix where a cell means one edge and clearing it stops exactly the paths
+// in it. Sharing inside a namespace makes two cells one edge, silently, and the interface has no
+// honest way to draw it. Across namespaces sharing stays legal and untouched.
+//
+// **Precedence is by UpdatedAt, then request ID**, which is not the same choice
+// [validate.Conflicts] makes and the difference is deliberate. There it is creation time,
+// because the question is which path is probably already carrying media. Here the question is
+// who moved: an overlap appears when somebody writes a request, and the writer is the one who
+// should hear about it. Using creation time would let an old request be edited to swallow a
+// newer one's path, refusing nothing at the POST that caused it and flipping an untouched
+// request to INVALID instead. UpdatedAt puts the refusal in front of whoever typed.
+//
+// It also gives admission for free. A POST stamps UpdatedAt with now, so a new or edited request
+// is always the most recent and always the one that loses — which is how `handleCreateRequest`
+// comes to reject it with this reason before writing anything.
+//
+// The two cases it fires on are worth naming, because only one of them is decidable when the
+// request is written. A flow carries at most one parsed group hint, so two different hints, two
+// different types under one hint, and two different pinned flows can never collide however
+// producers behave; the collisions are a hint against a narrower hint of the same name, the same
+// flow pinned twice, and a pinned flow against a hint that matches it. That last one is the only
+// one that can *arrive* later, when a producer republishes a flow under a new group — which is
+// why this lives in the reconcile rather than only in validation.
+func namespaceOverlaps(fleet *state.Fleet, legs []leg) map[int]validate.Result {
+	type claim struct {
+		request string
+		ns      string
+	}
+
+	order := make([]int, len(legs))
+	for i := range order {
+		order[i] = i
+	}
+	sort.SliceStable(order, func(a, b int) bool {
+		x, y := legs[order[a]].record, legs[order[b]].record
+		if !x.UpdatedAt.Equal(y.UpdatedAt) {
+			return x.UpdatedAt.Before(y.UpdatedAt)
+		}
+		return x.ID < y.ID
+	})
+
+	// The expansion depends on the source and selector only, so it is the same for every leg of
+	// one request and is worth resolving once — a request with eight destinations otherwise
+	// walks the whole inventory eight times.
+	expansions := map[string][]api.FlowAddress{}
+	expansionOf := func(record state.RequestRecord) []api.FlowAddress {
+		if cached, ok := expansions[record.ID]; ok {
+			return cached
+		}
+		addresses := expand(fleet, record.Spec)
+		expansions[record.ID] = addresses
+		return addresses
+	}
+
+	held := map[string]claim{} // path id -> the request in that namespace already on it
+	out := map[int]validate.Result{}
+
+	for _, i := range order {
+		leg := legs[i]
+		ns := leg.record.Spec.Namespace()
+
+		for _, address := range expansionOf(leg.record) {
+			pid := state.PathIdentity{Source: address, Destination: leg.dst}.ID()
+
+			// Keyed on both, so a path held in one namespace says nothing about another.
+			key := pid + "\x00" + ns
+			switch prior, taken := held[key]; {
+			case !taken:
+				held[key] = claim{request: leg.record.ID, ns: ns}
+			case prior.request == leg.record.ID:
+				// A request cannot collide with itself: two destinations naming one endpoint are
+				// refused by Validate, and one selector yields each flow address once.
+			default:
+				out[i] = validate.Result{
+					Code: api.ReasonNamespaceOverlap,
+					Message: fmt.Sprintf(
+						"request %q already replicates %s/%s %s to %s in namespace %q",
+						prior.request, address.Node, address.Domain, address.Flow,
+						leg.dst.Endpoint(), ns),
+				}
+			}
+			if _, lost := out[i]; lost {
+				break
+			}
+		}
+	}
+	return out
+}
+
 func conflictRefs(plans map[string]*pathPlan) []validate.PathRef {
 	refs := make([]validate.PathRef, 0, len(plans))
 	for _, pid := range sortedKeys(plans) {
@@ -721,7 +835,7 @@ func (b *builder) plan(plan *pathPlan, negotiated negotiate.Result, bad *validat
 		status.ReasonCode = api.ReasonSourceIdle
 		status.Reason = "source flow is not being produced"
 		if exists && plan.tornDown(idle) {
-			status.Reason = "source flow has not been produced for " + idle.Round(time.Second).String() + "; workers stopped"
+			status.Reason = "workers stopped, the source flow has not been produced for " + idle.Round(time.Second).String()
 		}
 		b.emit(plan, status, nil)
 		return
@@ -950,7 +1064,7 @@ func (b *builder) append(node string, assignment api.Assignment) {
 func notLeasedReason(fleet *state.Fleet, src, dst string) string {
 	switch {
 	case !fleet.Live(src) && !fleet.Live(dst):
-		return "neither agent is currently leased; nothing is withdrawn while the fleet cannot be observed"
+		return "neither agent is currently leased"
 	case !fleet.Live(src):
 		return "source agent " + src + " is not currently leased"
 	default:

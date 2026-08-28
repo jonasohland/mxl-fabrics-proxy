@@ -193,7 +193,7 @@ func TestInitiatorVerifiesTheEpochBeforeStarting(t *testing.T) {
 		return ok && status.State == api.WorkerFailed
 	})
 	status, _ := h.server.lastStatus("s2", api.RoleInitiator)
-	assert.Contains(t, status.Reason, "does not match its epoch")
+	assert.Contains(t, status.Reason, "does not match the assigned epoch")
 	assert.Nil(t, h.launcher.Find("s2", api.RoleInitiator), "nothing may be started for a blob that fails verification")
 }
 
@@ -495,7 +495,7 @@ func TestAssignmentsAreRefusedRatherThanGuessedAt(t *testing.T) {
 		// anything else. Either rejection is the point; the assertion names the shape, not the
 		// clause that caught it first.
 		{"s2", "output domain"},
-		{"s3", `advertises no output root "bulk"`},
+		{"s3", `no output root "bulk" on this node`},
 		{"s4", "no output root named"},
 		{"s5", "advertises no tcp attachment"},
 	} {

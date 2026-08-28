@@ -3,6 +3,7 @@ package api
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"slices"
 	"strings"
@@ -211,7 +212,85 @@ type RequestSpec struct {
 
 	// Labels ride along into worker metrics as user labels, as the legacy proxy's
 	// subscription labels did (§12).
+	//
+	// One key is reserved and means something to the server: [LabelNamespace]. See
+	// [RequestSpec.Namespace].
 	Labels map[string]string `json:"labels,omitempty"`
+}
+
+const (
+	// LabelNamespace is the label whose value partitions requests (§7b of the UI handoff).
+	//
+	// It is a label rather than a field of its own because `apply --prune` already takes a
+	// label selector, so `--prune -l namespace=nab` already spells "make the fleet's nab
+	// namespace equal this file" and needs nothing added to say it. A namespace is therefore a
+	// prune scope, a manifest file and a matrix, all the same set.
+	//
+	// Deliberately not called a *group*: that word is taken by the NMOS group hint, which is
+	// the vocabulary of selectors and is unrelated.
+	LabelNamespace = "namespace"
+
+	// DefaultNamespace is where a request with no [LabelNamespace] label lives.
+	//
+	// It is a real namespace and not an exemption — the rule that two requests in one namespace
+	// may not hold one path applies to it exactly as to any other. On a fleet driven from the
+	// CLI it is also where everything is, which is the reason it cannot be exempt: a partition
+	// that most requests sit outside of buys nothing.
+	DefaultNamespace = "default"
+)
+
+// Namespace is the partition this request belongs to.
+//
+// The server fills the label in on write (see [RequestSpec.EnsureNamespace]), so a stored request
+// always carries it. This still defaults, for two readers that see specs the write path has not
+// touched: a record written before the label existed, and a manifest on its way in.
+func (s RequestSpec) Namespace() string {
+	if ns := s.Labels[LabelNamespace]; ns != "" {
+		return ns
+	}
+	return DefaultNamespace
+}
+
+// EnsureNamespace writes [DefaultNamespace] into the labels when no namespace is set.
+//
+// Every stored request says which namespace it is in, rather than some saying it and the rest
+// implying it. The implied form is workable for a reader — [RequestSpec.Namespace] defaults — but
+// it makes the label mean two different things depending on which request you are holding, and
+// it makes `--prune -l namespace=default` silently miss exactly the requests that are in it.
+//
+// It has to run before the unchanged comparison (invariant 13), not after: normalising a spec
+// after deciding whether it differs from the stored one would make every apply of a
+// label-less manifest look like a change and write on every pass.
+func (s *RequestSpec) EnsureNamespace() {
+	if s.Labels[LabelNamespace] != "" {
+		return
+	}
+	if s.Labels == nil {
+		s.Labels = map[string]string{}
+	}
+	s.Labels[LabelNamespace] = DefaultNamespace
+}
+
+// ValidNamespace checks a namespace name.
+//
+// It lives here rather than in the server because the manifest checks it too, and a namespace a
+// file accepts and a POST rejects is the split that makes `apply --dry-run` less useful than the
+// apply. Constrained where other label values are free text because it names a partition an
+// operator selects, prunes and files manifests by, and ends up in `--prune -l namespace=…` on a
+// command line.
+func ValidNamespace(ns string) error {
+	if ns == "" {
+		return fmt.Errorf("namespace must not be empty: omit it for the %q namespace", DefaultNamespace)
+	}
+	for _, r := range ns {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+		case r == '-', r == '_':
+		default:
+			return errors.New("namespace may contain only letters, digits, - and _")
+		}
+	}
+	return nil
 }
 
 // SameAs reports whether two specs are the same intent.
@@ -262,7 +341,7 @@ const maxNameLength = 253
 func (s RequestSpec) Validate() error {
 	switch {
 	case s.Name == "":
-		return fmt.Errorf("name is required: it is the idempotency key")
+		return fmt.Errorf("name is required")
 	case len(s.Name) > maxNameLength:
 		return fmt.Errorf("name is longer than %d characters", maxNameLength)
 	}
@@ -319,8 +398,7 @@ func (s RequestSpec) Validate() error {
 		}
 
 		if first, dup := seen[dst.Endpoint()]; dup {
-			return fmt.Errorf("%s and destinations[%d] both name %s; that is one destination written twice",
-				where, first, dst.Endpoint())
+			return fmt.Errorf("%s and destinations[%d] both name %s", where, first, dst.Endpoint())
 		}
 		seen[dst.Endpoint()] = i
 	}

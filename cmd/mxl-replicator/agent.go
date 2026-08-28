@@ -164,10 +164,10 @@ func (c *AgentOptions) resolve() error {
 // Validate is called by kong before Run.
 func (c *AgentOptions) Validate() error {
 	if c.Node == "" {
-		return fmt.Errorf("--node is required: it is the node's fleet-wide unique name")
+		return fmt.Errorf("--node is required")
 	}
 	if len(c.Server) == 0 {
-		return fmt.Errorf("--server is required: at least one server URL")
+		return fmt.Errorf("--server is required")
 	}
 	if _, err := c.Auth.Token(); err != nil {
 		return err

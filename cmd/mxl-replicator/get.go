@@ -82,7 +82,7 @@ func (c *GetCmd) checkFilters(kind string, selector map[string]string) error {
 		"--node": c.Node != "", "--domain": c.Domain != "", "--selector": len(selector) > 0,
 	} {
 		if given && !applies[flag] {
-			return fmt.Errorf("%s does not apply to %s; it applies to %s", flag, c.Kind, kindsFor(flag))
+			return fmt.Errorf("%s applies to %s, not to %s", flag, kindsFor(flag), c.Kind)
 		}
 	}
 	return nil
@@ -227,7 +227,7 @@ func (c *GetCmd) sessions(ctx context.Context, user *client.Client) error {
 
 	return renderAs(c.Output, sessions, func() {
 		if len(rows) == 0 {
-			fmt.Println("no sessions: nothing is running")
+			fmt.Println("no sessions")
 			return
 		}
 		out := table("ID", "PATH", "FROM", "TO", "PROVIDER", "TARGET", "INITIATOR")
@@ -244,11 +244,28 @@ func (c *GetCmd) sessions(ctx context.Context, user *client.Client) error {
 
 // --- shared ---------------------------------------------------------------------------------
 
+// table starts a block of aligned output: every column is as wide as its own widest cell, rather
+// than as wide as a number counted out in a format string and re-counted whenever a field is
+// added. Shared by get, status and describe.
+//
+// One writer per view rather than one per table. tabwriter aligns tab-terminated cells only while
+// the lines carrying them are contiguous, so any line without tabs — a blank line, a section
+// heading — ends the block and the next table sizes its columns independently. Everything written
+// to one writer also reaches stdout in the order it was written, which interleaving a writer with
+// bare Printf calls does not guarantee.
+//
+// Headings are optional: a label/value block is a two-column table without them.
 func table(headings ...string) *tabwriter.Writer {
 	out := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(out, strings.Join(headings, "\t"))
+	if len(headings) > 0 {
+		fmt.Fprintln(out, strings.Join(headings, "\t"))
+	}
 	return out
 }
+
+// flush is deferred rather than called at the end of a view, because several views return early
+// and output that is buffered but never flushed is output that never appears.
+func flush(out *tabwriter.Writer) { _ = out.Flush() }
 
 func filterPaths(paths []api.Path, node string) []api.Path {
 	if node == "" {

@@ -60,7 +60,7 @@ func parsePort(s string) (uint16, error) {
 		return 0, fmt.Errorf("port range: invalid port %q", strings.TrimSpace(s))
 	}
 	if v == 0 {
-		return 0, fmt.Errorf("port range: port 0 is not usable; the worker binds whatever `service` says and has no fallback")
+		return 0, fmt.Errorf("port range: port 0 is not usable")
 	}
 	return uint16(v), nil
 }

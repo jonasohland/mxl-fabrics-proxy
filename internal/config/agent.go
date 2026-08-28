@@ -180,7 +180,7 @@ func resolveDomainValue(name, value string) (string, error) {
 		// The legacy config used `mxl://host/path` for *remote* domains, which this agent has no
 		// business mapping: a domain block names directories on this host, and a remote flow is
 		// addressed by (node, domain) through the API now.
-		return "", fmt.Errorf("domain %q: %q names a host; a domain mapping is local to this node, and a remote domain is addressed by node and name through the API", name, value)
+		return "", fmt.Errorf("domain %q: %q names a host, but a domain mapping is local to this node", name, value)
 	}
 	return cleanAbs(name, parsed.Path)
 }

@@ -59,7 +59,7 @@ func ValidDomainName(name string) error {
 			// decoded — the names this refuses are frequently unicode lookalikes for names it
 			// accepts, and rendering one back to an operator as though it were ASCII is how the
 			// error message becomes part of the confusion.
-			return fmt.Errorf("contains byte %#x; a domain name is ASCII letters, digits, '-', '_' and '.'", c)
+			return fmt.Errorf("contains byte %#x, not an ASCII letter, digit, '-', '_' or '.'", c)
 		}
 	}
 	return nil
@@ -100,10 +100,10 @@ func ValidDomainElements(elements []string) error {
 	case len(elements) == 0:
 		return fmt.Errorf("empty")
 	case len(elements) > MaxDomainElements:
-		return fmt.Errorf("has %d elements; at most %d", len(elements), MaxDomainElements)
+		return fmt.Errorf("has %d elements, at most %d", len(elements), MaxDomainElements)
 	}
 	if rendered := DomainPath(elements); len(rendered) > MaxDomainPathLen {
-		return fmt.Errorf("is %d bytes long; at most %d", len(rendered), MaxDomainPathLen)
+		return fmt.Errorf("is %d bytes long, at most %d", len(rendered), MaxDomainPathLen)
 	}
 
 	for i, element := range elements {

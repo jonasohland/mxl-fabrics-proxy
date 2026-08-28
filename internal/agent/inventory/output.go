@@ -62,9 +62,9 @@ func (i *Inventory) Output(root string, elements []string) (string, error) {
 	path, ok := i.rootPaths[root]
 	if !ok {
 		if root == "" {
-			return "", fmt.Errorf("no output root named; this node advertises %s", rootList(i.roots))
+			return "", fmt.Errorf("no output root named, this node advertises %s", rootList(i.roots))
 		}
-		return "", fmt.Errorf("this node advertises no output root %q; it has %s", root, rootList(i.roots))
+		return "", fmt.Errorf("no output root %q on this node, it advertises %s", root, rootList(i.roots))
 	}
 
 	if err := api.ValidDomainElements(elements); err != nil {
@@ -91,7 +91,7 @@ func (i *Inventory) Output(root string, elements []string) (string, error) {
 	// path *may* now sit above a root, and that premise survives the change — it is held by the
 	// pruning rather than by the overlap rule that used to forbid the layout.
 	if mapped, taken := i.byPath[resolved]; taken {
-		return "", fmt.Errorf("output domain %q under root %q resolves to %s, which this node maps as input domain %q; an input domain is never written to",
+		return "", fmt.Errorf("output domain %q under root %q resolves to %s, which this node maps as input domain %q",
 			name, root, resolved, mapped)
 	}
 	return resolved, nil
@@ -309,7 +309,7 @@ func validateRoots(roots []Root, mappings []Domain, search []string) ([]Root, ma
 				// Provably a no-op rather than merely redundant: [prune] hides the whole root, so
 				// this search path could never report anything. Refused because it reads as
 				// meaningful configuration.
-				return nil, nil, fmt.Errorf("inventory: output root %q is also search path %q; discovery is pruned at every root, so the search path could never find anything", root.Name, dir)
+				return nil, nil, fmt.Errorf("inventory: output root %q is also search path %q", root.Name, dir)
 			}
 			if overlaps(path, dir) {
 				// The other direction stays refused, for the reason equality is: a search path
@@ -358,7 +358,7 @@ func strictlyContains(parent, child string) bool {
 
 func rootList(roots []Root) string {
 	if len(roots) == 0 {
-		return "no output roots at all, and is therefore not a replication destination"
+		return "none"
 	}
 	names := make([]string, 0, len(roots))
 	for _, root := range roots {

@@ -89,7 +89,7 @@ func (a Attachment) Validate() error {
 			a.Provider, providerList())
 	}
 	if a.Fabric == "" && a.Provider != api.ProviderSHM {
-		return fmt.Errorf("fabric label is required: two nodes may pair on %s only if they share one", a.Provider)
+		return fmt.Errorf("fabric label is required for provider %s", a.Provider)
 	}
 
 	var set []string
@@ -103,10 +103,10 @@ func (a Attachment) Validate() error {
 		return fmt.Errorf("at most one of address, interface or device may be set, got %s", strings.Join(set, " and "))
 	}
 	if a.Interface != "" && a.Provider == api.ProviderEFA {
-		// Not merely unsupported: the probe has no netdev name for efa to match against, so this
-		// would always drop the attachment at startup with a confusing "no match" rather than
-		// here with the reason.
-		return fmt.Errorf("interface: cannot select an efa attachment — the library reports a device name (%s-style), not a netdev name; use device: or no selector at all", "rdmap0s6-rdm")
+		// Not merely unsupported: the probe has no netdev name for efa to match against — the
+		// library reports a device name, `rdmap0s6-rdm`-style — so this would always drop the
+		// attachment at startup with a confusing "no match" rather than here with the reason.
+		return fmt.Errorf("interface: an efa attachment is selected by device, not by netdev name")
 	}
 	return nil
 }
@@ -276,11 +276,10 @@ func match(attachment Attachment, candidates []exec.Interface, resolve func(stri
 		return nil, fmt.Sprintf("no %s interface matches %s %q", attachment.Provider, kind, value)
 	default:
 		if kind == "" {
-			return nil, fmt.Sprintf("this node has %d %s interfaces, so the attachment needs an address:, interface: or device: selector to say which",
+			return nil, fmt.Sprintf("this node has %d %s interfaces and the attachment has no address:, interface: or device: selector",
 				len(matches), attachment.Provider)
 		}
-		return nil, fmt.Sprintf("%s %q matches %d %s interfaces; use address: to pin one",
-			kind, value, len(matches), attachment.Provider)
+		return nil, fmt.Sprintf("%s %q matches %d %s interfaces", kind, value, len(matches), attachment.Provider)
 	}
 }
 

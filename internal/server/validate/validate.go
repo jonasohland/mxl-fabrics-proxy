@@ -166,7 +166,7 @@ func resolveRoot(dst api.Destination, node state.NodeRecord) (string, *Result) {
 	case len(roots) == 0:
 		return "", &Result{
 			Code: api.ReasonNoOutputRoot,
-			Message: fmt.Sprintf("node %q advertises no output root; it maps %s as inputs",
+			Message: fmt.Sprintf("node %q advertises no output root, it maps %s as inputs",
 				dst.Node, domainList(node.Domains)),
 		}
 
@@ -178,7 +178,7 @@ func resolveRoot(dst api.Destination, node state.NodeRecord) (string, *Result) {
 			// error carries its own fix.
 			return "", &Result{
 				Code: api.ReasonAmbiguousOutputRoot,
-				Message: fmt.Sprintf("node %q advertises %d output roots (%s); name one",
+				Message: fmt.Sprintf("node %q advertises %d output roots (%s) and the destination names none",
 					dst.Node, len(roots), rootList(roots)),
 			}
 		}
@@ -188,7 +188,7 @@ func resolveRoot(dst api.Destination, node state.NodeRecord) (string, *Result) {
 		if node.Capabilities.FindRoot(dst.Root) == nil {
 			return "", &Result{
 				Code: api.ReasonUnknownOutputRoot,
-				Message: fmt.Sprintf("node %q advertises no output root %q; it has %s",
+				Message: fmt.Sprintf("node %q advertises no output root %q, it has %s",
 					dst.Node, dst.Root, rootList(roots)),
 			}
 		}

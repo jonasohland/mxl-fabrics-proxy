@@ -89,7 +89,7 @@ func guardDefaultCommand(args []string) error {
 	if strings.HasPrefix(first, "-") || slices.Contains(commands, first) {
 		return nil
 	}
-	return fmt.Errorf("unknown command %q; expected one of %s", first, strings.Join(commands, ", "))
+	return fmt.Errorf("unknown command %q, expected one of %s", first, strings.Join(commands, ", "))
 }
 
 // isDaemon reports whether the selected command is the long-running one. kong's Command() is the

@@ -132,6 +132,16 @@ func flowRequest(name string) api.RequestSpec {
 	}
 }
 
+// inNamespace puts a spec in a namespace. Sharing a path across requests is legal exactly when
+// they are in different ones (§7b), so the tests that exercise refcounting say which.
+func inNamespace(spec api.RequestSpec, ns string) api.RequestSpec {
+	if spec.Labels == nil {
+		spec.Labels = map[string]string{}
+	}
+	spec.Labels[api.LabelNamespace] = ns
+	return spec
+}
+
 // base is the ordinary fleet: two registered nodes, one request, one flow being produced.
 func base() *fleetBuilder {
 	return newFleet().
@@ -294,7 +304,7 @@ func TestFanOutStillDeduplicatesSharedPaths(t *testing.T) {
 		{Node: "edge-01", Domain: []string{"ingest"}},
 		{Node: "edge-02", Domain: []string{"ingest"}},
 	}
-	narrow := flowRequest("narrow")
+	narrow := inNamespace(flowRequest("narrow"), "archive")
 	narrow.Destinations = []api.Destination{{Node: "edge-02", Domain: []string{"ingest"}}}
 
 	fleet := newFleet().
@@ -757,7 +767,9 @@ func newFleetFrom(fleet *state.Fleet, id string, spec api.RequestSpec) *state.Fl
 func TestRequestsSharingAPathAreRefcounted(t *testing.T) {
 	t.Parallel()
 
-	two := base().request("cam1-again", flowRequest("cam1-again")).build()
+	// A second namespace, because refcounting across requests is exactly what is legal there
+	// and forbidden inside one — see TestTwoRequestsInOneNamespaceMayNotShareAPath.
+	two := base().request("cam1-again", inNamespace(flowRequest("cam1-again"), "archive")).build()
 	result := Compute(two, Config{})
 
 	assert.Len(t, result.Paths, 1)
@@ -780,15 +792,18 @@ func TestRequestsSharingAPathAreRefcounted(t *testing.T) {
 func TestSharedPathSettingsResolveConservatively(t *testing.T) {
 	t.Parallel()
 
+	// Different namespaces: sharing a path is legal exactly there. The namespace label is set
+	// alongside the user labels rather than by inNamespace, because assigning Labels wholesale
+	// after it would drop it — which is the same trap a caller could fall into.
 	pinned := flowRequest("pinned")
 	pinned.Provider = api.ProviderPin{api.ProviderTCP, api.ProviderVerbs}
-	pinned.Labels = map[string]string{"a": "1"}
+	pinned.Labels = map[string]string{"a": "1", api.LabelNamespace: "live"}
 	prio := 40
 	pinned.SchedPrio = &prio
 
 	other := flowRequest("other")
 	other.Provider = api.ProviderPin{api.ProviderVerbs, api.ProviderTCP}
-	other.Labels = map[string]string{"b": "2"}
+	other.Labels = map[string]string{"b": "2", api.LabelNamespace: "archive"}
 	higher := 80
 	other.SchedPrio = &higher
 
@@ -807,7 +822,11 @@ func TestSharedPathSettingsResolveConservatively(t *testing.T) {
 	require.NotNil(t, target)
 	require.NotNil(t, target.SchedPrio)
 	assert.Equal(t, 80, *target.SchedPrio, "the shared workers get the highest priority asked for")
-	assert.Equal(t, map[string]string{"a": "1", "b": "2"}, target.Labels)
+	// The namespace rides into worker metrics like any other label, and on a path shared across
+	// two of them the merge picks the last request ID — arbitrary, but deterministic, which is
+	// the same rule every other label follows here. There is no single right answer for a path
+	// two namespaces hold.
+	assert.Equal(t, map[string]string{"a": "1", "b": "2", api.LabelNamespace: "live"}, target.Labels)
 
 	// Pins intersect: a path shared by a verbs-only request and a tcp-only one cannot satisfy
 	// both, and says so rather than quietly satisfying one. Both nodes offer both providers, so
@@ -1056,4 +1075,181 @@ func pathOf(fleet *state.Fleet) state.PathIdentity {
 
 func sessionIDFor(fleet *state.Fleet) string {
 	return state.SessionID(pathOf(fleet), state.FlowDefHash(flowDef))
+}
+
+// --- namespaces: requests are a partition (§7b) ------------------------------------------
+
+// requestAt is `request` with an explicit UpdatedAt, which is what namespace-overlap precedence
+// turns on. The builder's default is the zero time, so tests that do not care get a tie broken
+// by request ID.
+func requestAt(b *fleetBuilder, id string, spec api.RequestSpec, updated time.Time) *fleetBuilder {
+	b.fleet.Requests[id] = state.Entry[state.RequestRecord]{Found: true, Value: state.RequestRecord{
+		ID: id, Spec: spec, CreatedAt: created, UpdatedAt: updated,
+	}}
+	return b
+}
+
+// Two requests in one namespace may not carry the same path. The path is not the problem — it
+// is refcounted and works — but a namespace claims to be a partition, and a set of requests that
+// can quietly share an edge is not one.
+func TestTwoRequestsInOneNamespaceMayNotShareAPath(t *testing.T) {
+	t.Parallel()
+
+	fleet := base().build()
+	requestAt(&fleetBuilder{fleet: fleet}, "cam1-again", flowRequest("cam1-again"), created.Add(time.Hour))
+
+	result := Compute(fleet, Config{})
+
+	// The winner is untouched: one path, one session, and it is *not* refcounted to the loser.
+	require.Len(t, result.Paths, 1)
+	assert.Equal(t, []string{"cam1"}, onlyPath(t, result).Requests)
+	assert.Equal(t, api.StateEstablishing, result.Requests["cam1"].State)
+	assert.Empty(t, result.Requests["cam1"].ReasonCode)
+
+	// The loser is INVALID and the message names who has it and what to do.
+	loser := result.Requests["cam1-again"]
+	assert.Equal(t, api.StateInvalid, loser.State)
+	assert.Equal(t, api.ReasonNamespaceOverlap, loser.ReasonCode)
+	assert.Contains(t, loser.Reason, `request "cam1" already replicates`)
+	assert.Contains(t, loser.Reason, "edge-01/ingest")
+	assert.Contains(t, loser.Reason, `namespace "default"`)
+}
+
+// The default namespace is a real namespace, not an exemption. A fleet driven from the CLI has
+// everything in it, so exempting it would buy nothing at all.
+func TestTheDefaultNamespaceIsNotExempt(t *testing.T) {
+	t.Parallel()
+
+	fleet := base().request("cam1-again", flowRequest("cam1-again")).build()
+	result := Compute(fleet, Config{})
+
+	assert.Equal(t, api.StateInvalid, result.Requests["cam1-again"].State,
+		"neither request carries a namespace label, so both are in %q", api.DefaultNamespace)
+	assert.Equal(t, api.ReasonNamespaceOverlap, result.Requests["cam1-again"].ReasonCode)
+}
+
+// Across namespaces sharing stays legal and refcounted — that is how fan-in is expressed, and
+// the rule must not reach it.
+func TestSharingAcrossNamespacesIsUntouched(t *testing.T) {
+	t.Parallel()
+
+	fleet := base().request("arch", inNamespace(flowRequest("arch"), "archive")).build()
+	result := Compute(fleet, Config{})
+
+	require.Len(t, result.Paths, 1)
+	assert.Equal(t, []string{"arch", "cam1"}, onlyPath(t, result).Requests)
+	assert.Equal(t, api.StateEstablishing, result.Requests["cam1"].State)
+	assert.Equal(t, api.StateEstablishing, result.Requests["arch"].State)
+}
+
+// **Losing an overlap does not stop media.** An overlapping leg goes down the same route as any
+// other invalid leg: it stops the request gaining new sessions, and the path itself — held by
+// the winner — carries on. This is the property that makes the rule safe to add to a fleet that
+// already has overlaps in it.
+func TestAnOverlapLoserDoesNotDisturbTheRunningPath(t *testing.T) {
+	t.Parallel()
+
+	fleet := base().build()
+	requestAt(&fleetBuilder{fleet: fleet}, "cam1-again", flowRequest("cam1-again"), created.Add(time.Hour))
+	result := Compute(fleet, Config{})
+
+	assert.Len(t, result.Sessions, 1, "the winner's session is created as normal")
+	assert.Len(t, result.Assignments["edge-01"].Assignments, 1)
+
+	// And the loser still reports the path, so an operator sees what it collided with rather
+	// than an empty request.
+	require.Len(t, result.Requests["cam1-again"].Paths, 1)
+	assert.Equal(t, api.StateEstablishing, result.Requests["cam1-again"].Paths[0].State)
+}
+
+// Precedence is by UpdatedAt, so the request that was written most recently is the one refused.
+// That is what puts the refusal in front of whoever typed, rather than flipping an untouched
+// request to INVALID because somebody else edited theirs.
+func TestTheMoreRecentlyWrittenRequestLosesTheOverlap(t *testing.T) {
+	t.Parallel()
+
+	older := base().build()
+	requestAt(&fleetBuilder{fleet: older}, "cam1", flowRequest("cam1"), created)
+	requestAt(&fleetBuilder{fleet: older}, "cam1-again", flowRequest("cam1-again"), created.Add(time.Hour))
+	assert.Equal(t, api.StateInvalid, Compute(older, Config{}).Requests["cam1-again"].State)
+
+	// Flip which one was written last and the verdict flips with it, even though "cam1" sorts
+	// first and was created at the same instant.
+	newer := base().build()
+	requestAt(&fleetBuilder{fleet: newer}, "cam1", flowRequest("cam1"), created.Add(time.Hour))
+	requestAt(&fleetBuilder{fleet: newer}, "cam1-again", flowRequest("cam1-again"), created)
+	flipped := Compute(newer, Config{})
+	assert.Equal(t, api.StateInvalid, flipped.Requests["cam1"].State)
+	assert.Equal(t, api.StateEstablishing, flipped.Requests["cam1-again"].State)
+}
+
+// Only the colliding leg is refused. A request fanning out to three destinations where one
+// collides keeps the other two, which is the same per-destination discipline every other
+// validation follows.
+func TestOnlyTheOverlappingLegIsRefused(t *testing.T) {
+	t.Parallel()
+
+	wide := flowRequest("wide")
+	wide.Destinations = []api.Destination{
+		{Node: "edge-01", Domain: []string{"ingest"}},
+		{Node: "edge-02", Domain: []string{"ingest"}},
+	}
+
+	fleet := base().node("edge-02").build()
+	requestAt(&fleetBuilder{fleet: fleet}, "wide", wide, created.Add(time.Hour))
+	result := Compute(fleet, Config{})
+
+	// edge-01 collides with `cam1`; edge-02 does not and establishes.
+	require.Len(t, result.Paths, 2)
+	assert.Equal(t, api.StateInvalid, result.Requests["wide"].State)
+	assert.Equal(t, api.ReasonNamespaceOverlap, result.Requests["wide"].ReasonCode)
+	assert.Contains(t, result.Requests["wide"].Reason, "destination edge-01/ingest",
+		"the leg is named, because the sibling leg is fine")
+
+	for _, path := range result.Paths {
+		if path.Destination.Node == "edge-02" {
+			assert.Equal(t, []string{"wide"}, path.Requests)
+		} else {
+			assert.Equal(t, []string{"cam1"}, path.Requests)
+		}
+	}
+}
+
+// The overlap that cannot be decided when the request is written: a pinned flow against a group
+// hint that does not match it yet. A producer republishing under that hint makes them collide
+// with nothing written, which is why this rule lives in the reconcile and not only in validation.
+func TestAnOverlapCanArriveWhenAProducerRetagsAFlow(t *testing.T) {
+	t.Parallel()
+
+	hint := flowRequest("camera-1")
+	hint.Source.Select = api.Selector{GroupHint: &api.GroupHintSelector{Name: "Studio A:Camera 1"}}
+
+	build := func(tag *api.GroupHint) *state.Fleet {
+		b := newFleet().
+			node("studio-a", api.DomainMapping{Name: "cameras", Configured: true}).
+			node("edge-01").
+			flow("studio-a", "cameras", api.FlowInventory{
+				ID: "flow-video", Definition: flowDef, Producing: true,
+				GroupHint: &api.GroupHint{Name: "Studio A:Camera 1", Type: "video"},
+			}).
+			flow("studio-a", "cameras", api.FlowInventory{ID: "flow-1", Definition: flowDef, Producing: true, GroupHint: tag})
+		requestAt(b, "camera-1", hint, created)
+		requestAt(b, "pinned", flowRequest("pinned"), created.Add(time.Hour))
+		return b.build()
+	}
+
+	// While flow-1 carries no hint, the two selectors are disjoint and both are fine.
+	before := Compute(build(nil), Config{})
+	assert.Equal(t, api.StateEstablishing, before.Requests["pinned"].State)
+	assert.Equal(t, api.StateEstablishing, before.Requests["camera-1"].State)
+	assert.Len(t, before.Paths, 2)
+
+	// The producer republishes flow-1 under the hint the other request selects. Nothing was
+	// written, and the more recently written request is now INVALID.
+	after := Compute(build(&api.GroupHint{Name: "Studio A:Camera 1", Type: "audio"}), Config{})
+	assert.Equal(t, api.StateInvalid, after.Requests["pinned"].State)
+	assert.Equal(t, api.ReasonNamespaceOverlap, after.Requests["pinned"].ReasonCode)
+	assert.Equal(t, api.StateEstablishing, after.Requests["camera-1"].State,
+		"the standing selector keeps both of its flows")
+	assert.Len(t, after.Requests["camera-1"].Paths, 2)
 }

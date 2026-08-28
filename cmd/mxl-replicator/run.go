@@ -81,7 +81,7 @@ func (c *RunCmd) resolve() error {
 		// warns when it is used.
 		hostname, err := os.Hostname()
 		if err != nil {
-			return fmt.Errorf("--agent-node not given and the hostname could not be determined: %w", err)
+			return fmt.Errorf("--agent-node not given and the hostname is unavailable: %w", err)
 		}
 		c.AgentOpts.Node = hostname
 		c.nodeFromHostname = true
@@ -95,8 +95,12 @@ func (c *RunCmd) resolve() error {
 		// The cost is that this agent cannot fail over to another replica. In an HA
 		// deployment, pass --agent-server explicitly with every replica (or the
 		// load-balancer URL) to buy that back.
+		//
+		// Under TLS the derivation is refused rather than attempted: the agent would
+		// dial the loopback URL, which a certificate issued for this node's routable
+		// name does not cover.
 		if c.ServerOpts.TLS.Enabled() {
-			return fmt.Errorf("--agent-server is required when the server terminates TLS: the co-located agent would dial the derived loopback URL, which a certificate issued for this node's routable name will not cover")
+			return fmt.Errorf("--agent-server is required when the server terminates TLS")
 		}
 
 		endpoint, err := loopbackURL(c.ServerOpts.Listen, false)
@@ -159,7 +163,7 @@ func (c *RunCmd) Validate() error {
 	// Two listeners in one process. Catch the collision here rather than as a bind error
 	// after one of the two halves has already started.
 	if server && agent && c.ServerOpts.Listen == c.AgentOpts.Listen {
-		return fmt.Errorf("--server-listen and --agent-listen are both %q; the API and the agent metrics endpoint need separate ports", c.ServerOpts.Listen)
+		return fmt.Errorf("--server-listen and --agent-listen are both %q", c.ServerOpts.Listen)
 	}
 
 	return nil

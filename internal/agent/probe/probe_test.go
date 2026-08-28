@@ -48,7 +48,7 @@ func TestValidate(t *testing.T) {
 			// efa and the drop would read as missing hardware.
 			"interface on efa",
 			Attachment{Provider: api.ProviderEFA, Fabric: "vpc1", Interface: "efa0"},
-			"cannot select an efa attachment",
+			"efa attachment is selected by device",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

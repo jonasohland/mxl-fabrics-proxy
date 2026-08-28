@@ -284,7 +284,7 @@ func (a *Agent) verifyEpoch(assignment api.Assignment) error {
 			"session", assignment.SessionID, "fields", unknown)
 	}
 	if err := epoch.Verify(assignment.Epoch, info); err != nil {
-		return fmt.Errorf("refusing to start an initiator against a target info blob that does not match its epoch: %w", err)
+		return fmt.Errorf("target info from the peer does not match the assigned epoch: %w", err)
 	}
 	return nil
 }

@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"os"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -75,7 +74,7 @@ func (c *DescribeCmd) node(ctx context.Context, user *client.Client) error {
 		}
 	}
 	if node == nil {
-		return fmt.Errorf("no node %q; the fleet has %s", c.Name, nodeNames(nodes))
+		return fmt.Errorf("no node %q, the fleet has %s", c.Name, nodeNames(nodes))
 	}
 
 	// The paths touching this node are what an operator is usually actually after, and they are
@@ -90,7 +89,10 @@ func (c *DescribeCmd) node(ctx context.Context, user *client.Client) error {
 }
 
 func printNode(node api.Node, paths []api.Path) {
-	fmt.Printf("Node      %s\n", node.Name)
+	out := table()
+	defer flush(out)
+
+	fmt.Fprintf(out, "Node      %s\n", node.Name)
 
 	// Registration is durable and survives the agent being down; only the lease goes away. An
 	// expired lease is not proof that this node's workers stopped, which is why the two are
@@ -99,62 +101,79 @@ func printNode(node api.Node, paths []api.Path) {
 	if node.Live {
 		live = "leased by " + node.Instance
 	}
-	fmt.Printf("  liveness      %s\n", live)
+	fmt.Fprintf(out, "  liveness\t%s\n", live)
 	if !node.RegisteredAt.IsZero() {
-		fmt.Printf("  registered    %s\n", node.RegisteredAt.Format(time.RFC3339))
+		fmt.Fprintf(out, "  registered\t%s\n", node.RegisteredAt.Format(time.RFC3339))
 	}
 	if !node.LastSeen.IsZero() {
-		fmt.Printf("  last seen     %s (%s ago)\n", node.LastSeen.Format(time.RFC3339), since(node.LastSeen))
+		fmt.Fprintf(out, "  last seen\t%s (%s ago)\n", node.LastSeen.Format(time.RFC3339), since(node.LastSeen))
 	}
 
 	versions := node.Capabilities.Versions
-	fmt.Printf("  versions      replicator %s, protocol %d\n", versions.Replicator, versions.Protocol)
+	fmt.Fprintf(out, "  versions\treplicator %s, protocol %d\n", versions.Replicator, versions.Protocol)
 	if versions.MXL != "" || versions.Libfabric != "" {
 		// The mxl version is the non-obvious one: target_info is produced by one node's
 		// mxl-fabrics and consumed by another's, so a pair straddling a version boundary is a
-		// compatibility concern neither agent can see alone (§10.2).
-		fmt.Printf("                worker %s, mxl %s, libfabric %s\n", versions.Proxy, versions.MXL, versions.Libfabric)
+		// compatibility concern neither agent can see alone (§10.2). An empty label cell keeps it
+		// under the line above without counting the indent out by hand.
+		fmt.Fprintf(out, "\tworker %s, mxl %s, libfabric %s\n", versions.Proxy, versions.MXL, versions.Libfabric)
 	}
-	fmt.Printf("  sched_prio    %t\n", node.Capabilities.SchedPrio)
+	fmt.Fprintf(out, "  sched_prio\t%t\n", node.Capabilities.SchedPrio)
 	if node.Capabilities.PortRange != "" {
-		fmt.Printf("  port range    %s (inbound)\n", node.Capabilities.PortRange)
+		fmt.Fprintf(out, "  port range\t%s (inbound)\n", node.Capabilities.PortRange)
 	}
 
-	fmt.Println("\n  Input domains")
+	heading(out, "  Input domains")
 	if len(node.Domains) == 0 {
-		fmt.Println("    none")
+		fmt.Fprintln(out, "    none")
 	}
 	for _, domain := range node.Domains {
 		origin := "configured"
 		if !domain.Configured {
 			origin = "discovered"
 		}
-		fmt.Printf("    %-24s %-10s %s\n", domain.Name, origin, domain.Path)
+		fmt.Fprintf(out, "    %s\t%s\t%s\n", domain.Name, origin, domain.Path)
 	}
 
 	// The whole of the authority the API has over this node's filesystem (§10.6, §13). A node
 	// with none is not a replication destination at all, and saying so plainly here saves an
 	// operator working it out from an INVALID request later.
-	fmt.Println("\n  Output roots")
+	heading(out, "  Output roots")
 	if len(node.Capabilities.OutputRoots) == 0 {
-		fmt.Println("    none — not a replication destination")
+		fmt.Fprintln(out, "    not a replication destination")
 	}
 	for _, root := range node.Capabilities.OutputRoots {
-		fmt.Printf("    %-24s %s\n", root.Name, root.Path)
+		fmt.Fprintf(out, "    %s\t%s\n", root.Name, root.Path)
 	}
 
-	fmt.Println("\n  Fabric attachments")
+	heading(out, "  Fabric attachments")
 	if len(node.Capabilities.Fabrics) == 0 {
-		fmt.Println("    none")
+		fmt.Fprintln(out, "    none")
 	}
 	for _, fabric := range node.Capabilities.Fabrics {
-		fmt.Printf("    %-8s %-18s %-20s %s\n", fabric.Provider, fabric.Fabric, fabric.Address, capsText(fabric.CapFlags, fabric.MaxMessageSize))
+		// A line each, as for labels: an attachment is a set of named fields, and four positional
+		// columns made the reader count which was the fabric label and which was the address —
+		// with the capability flags and the message limit sharing the last one.
+		fmt.Fprintln(out, "    "+string(fabric.Provider))
+		fmt.Fprintf(out, "      fabric\t%s\n", fabric.Fabric)
+		if fabric.Address != "" {
+			fmt.Fprintf(out, "      address\t%s\n", fabric.Address)
+		}
+		if fabric.Device != "" {
+			// Diagnostics only, and not the netdev name for verbs or efa — but it is what an
+			// operator matches against `fi_info` when an attachment does not come up (§10.5).
+			fmt.Fprintf(out, "      device\t%s\n", fabric.Device)
+		}
+		fmt.Fprintf(out, "      capabilities\t%s\n", capFlags(fabric.CapFlags))
+		if fabric.MaxMessageSize > 0 {
+			fmt.Fprintf(out, "      max message\t%s\n", byteSize(fabric.MaxMessageSize))
+		}
 	}
 
-	printNodePaths(node.Name, paths)
+	printNodePaths(out, node.Name, paths)
 }
 
-func printNodePaths(name string, paths []api.Path) {
+func printNodePaths(out *tabwriter.Writer, name string, paths []api.Path) {
 	// Both branches, not a switch: a node is routinely both ends of a path. Same node, *different*
 	// domain is legitimate and is exactly what the loopback configuration does (§7.2), and a
 	// switch that matched the source first would hide half of what that node is running.
@@ -168,18 +187,16 @@ func printNodePaths(name string, paths []api.Path) {
 		}
 	}
 
-	fmt.Println()
+	fmt.Fprintln(out)
 	if len(rows) == 0 {
-		fmt.Println("  No paths touch this node.")
+		fmt.Fprintln(out, "  No paths touch this node.")
 		return
 	}
 
-	out := tabwriter.NewWriter(os.Stdout, 2, 0, 2, ' ', 0)
 	fmt.Fprintln(out, "  ROLE\tPATH\tFLOW\tPEER\tSTATE")
 	for _, row := range rows {
 		fmt.Fprintf(out, "  %s\t%s\t%s\t%s\t%s\n", row[0], row[1], row[2], row[3], row[4])
 	}
-	_ = out.Flush()
 }
 
 // --- flow -----------------------------------------------------------------------------------
@@ -205,21 +222,25 @@ func (c *DescribeCmd) flow(ctx context.Context, user *client.Client) error {
 }
 
 func printFlow(id string, entries []api.FlowEntry, paths []api.Path) {
-	fmt.Printf("Flow      %s\n", id)
+	out := table()
+	defer flush(out)
+
+	fmt.Fprintf(out, "Flow      %s\n", id)
 
 	if hint := firstGroupHint(entries); hint != nil {
-		fmt.Printf("  group hint    %q", hint.Name)
+		// Built before it is written: a tabwriter cell cannot be assembled across calls, because
+		// the line is only measured once it is complete.
+		name := fmt.Sprintf("%q", hint.Name)
 		if hint.Type != "" {
-			fmt.Printf(" (%s)", hint.Type)
+			name += fmt.Sprintf(" (%s)", hint.Type)
 		}
-		fmt.Println()
+		fmt.Fprintf(out, "  group hint\t%s\n", name)
 	}
 	if summary := describeDefinition(entries[0].Definition); summary != "" {
-		fmt.Printf("  definition    %s\n", summary)
+		fmt.Fprintf(out, "  definition\t%s\n", summary)
 	}
 
-	fmt.Printf("\n  Locations\n")
-	out := tabwriter.NewWriter(os.Stdout, 2, 0, 2, ' ', 0)
+	heading(out, "  Locations")
 	fmt.Fprintln(out, "  NODE/DOMAIN\tPRODUCING")
 	for _, entry := range entries {
 		// Coarse and hysteretic on purpose — never a head index, which would change every frame
@@ -230,7 +251,6 @@ func printFlow(id string, entries []api.FlowEntry, paths []api.Path) {
 		}
 		fmt.Fprintf(out, "  %s\t%s\n", entry.Node+"/"+entry.Domain, producing)
 	}
-	_ = out.Flush()
 
 	var carrying []api.Path
 	for _, path := range paths {
@@ -239,18 +259,16 @@ func printFlow(id string, entries []api.FlowEntry, paths []api.Path) {
 		}
 	}
 
-	fmt.Println()
+	fmt.Fprintln(out)
 	if len(carrying) == 0 {
-		fmt.Println("  No path replicates this flow.")
+		fmt.Fprintln(out, "  No path replicates this flow.")
 		return
 	}
-	out = tabwriter.NewWriter(os.Stdout, 2, 0, 2, ' ', 0)
 	fmt.Fprintln(out, "  PATH\tFROM\tTO\tSTATE")
 	for _, path := range carrying {
 		fmt.Fprintf(out, "  %s\t%s\t%s\t%s\n",
 			path.ID, path.Source.Node+"/"+path.Source.Domain, path.Destination.Endpoint(), path.State)
 	}
-	_ = out.Flush()
 }
 
 func firstGroupHint(entries []api.FlowEntry) *api.GroupHint {
@@ -317,28 +335,36 @@ func (c *DescribeCmd) request(ctx context.Context, user *client.Client) error {
 }
 
 func printRequest(request api.Request) {
-	fmt.Printf("Request   %s\n", request.Name)
-	fmt.Printf("  source        %s/%s %s\n", request.Source.Node, request.Source.Domain, selectorText(request.Source.Select))
-	fmt.Printf("  created       %s (%s ago)\n", request.CreatedAt.Format(time.RFC3339), since(request.CreatedAt))
+	out := table()
+	defer flush(out)
+
+	fmt.Fprintf(out, "Request   %s\n", request.Name)
+	fmt.Fprintf(out, "  source\t%s/%s %s\n", request.Source.Node, request.Source.Domain, selectorText(request.Source.Select))
+	fmt.Fprintf(out, "  created\t%s (%s ago)\n", request.CreatedAt.Format(time.RFC3339), since(request.CreatedAt))
 	if !request.Provider.IsEmpty() {
-		fmt.Printf("  provider      %s (pinned)\n", providerText(request.Provider))
+		fmt.Fprintf(out, "  provider\t%s (pinned)\n", providerText(request.Provider))
 	}
 	if request.IdleTeardown != nil {
 		teardown := "never — workers stay hot"
 		if request.IdleTeardown.Duration() > 0 {
 			teardown = request.IdleTeardown.Duration().String()
 		}
-		fmt.Printf("  idle teardown %s\n", teardown)
+		fmt.Fprintf(out, "  idle teardown\t%s\n", teardown)
 	}
 	if request.SchedPrio != nil {
-		fmt.Printf("  sched_prio    %d\n", *request.SchedPrio)
+		fmt.Fprintf(out, "  sched_prio\t%d\n", *request.SchedPrio)
 	}
 	if len(request.Labels) > 0 {
-		fmt.Printf("  labels        %s\n", sortedLabels(request.Labels))
+		// A line each rather than the joined `key=value,…` cell the tables use. Both the key and
+		// the value are free text, so the joined form is where a value containing a comma or an
+		// equals sign stops being readable, and this view has the room.
+		fmt.Fprintln(out, "  labels")
+		for _, key := range sortedKeys(request.Labels) {
+			fmt.Fprintf(out, "    %s\t%s\n", key, request.Labels[key])
+		}
 	}
 
-	fmt.Println("\n  Destinations")
-	out := tabwriter.NewWriter(os.Stdout, 2, 0, 2, ' ', 0)
+	heading(out, "  Destinations")
 	fmt.Fprintln(out, "  NODE/DOMAIN\tROOT\tPROVIDER")
 	for _, dst := range request.Destinations {
 		root := dst.Root
@@ -351,27 +377,25 @@ func printRequest(request api.Request) {
 		}
 		fmt.Fprintf(out, "  %s\t%s\t%s\n", dst.Endpoint(), root, pin)
 	}
-	_ = out.Flush()
 
-	fmt.Printf("\n  state         %s %s\n", request.Status.State, pathSummary(request.Status))
+	fmt.Fprintln(out)
+	fmt.Fprintf(out, "  state\t%s %s\n", request.Status.State, pathSummary(request.Status))
 	if request.Status.Reason != "" {
-		fmt.Printf("  reason        %s\n", request.Status.Reason)
+		fmt.Fprintf(out, "  reason\t%s\n", request.Status.Reason)
 	}
 
 	// A request owns a *set* of paths, including in the pinned-flow case. "1 of 3 active" is the
 	// answer an operator needs and it has no meaning in a one-flow-per-request model (§9.1).
-	fmt.Println()
+	fmt.Fprintln(out)
 	if len(request.Status.Paths) == 0 {
-		fmt.Println("  No paths — the selector matches nothing yet.")
+		fmt.Fprintln(out, "  no paths")
 		return
 	}
-	out = tabwriter.NewWriter(os.Stdout, 2, 0, 2, ' ', 0)
 	fmt.Fprintln(out, "  PATH\tFLOW\tDESTINATION\tSTATE\tREASON")
 	for _, path := range request.Status.Paths {
 		fmt.Fprintf(out, "  %s\t%s\t%s\t%s\t%s\n",
 			path.ID, path.Source.Flow, path.Destination.Endpoint(), path.State, path.Reason)
 	}
-	_ = out.Flush()
 }
 
 // --- path -----------------------------------------------------------------------------------
@@ -390,31 +414,35 @@ func (c *DescribeCmd) path(ctx context.Context, user *client.Client) error {
 }
 
 func printPath(path api.Path) {
-	fmt.Printf("Path      %s\n", path.ID)
-	fmt.Printf("  source        %s/%s %s\n", path.Source.Node, path.Source.Domain, path.Source.Flow)
-	fmt.Printf("  destination   %s", path.Destination.Endpoint())
+	out := table()
+	defer flush(out)
+
+	destination := path.Destination.Endpoint()
 	if path.Destination.Root != "" {
-		fmt.Printf(" (root %s)", path.Destination.Root)
+		destination += fmt.Sprintf(" (root %s)", path.Destination.Root)
 	}
-	fmt.Println()
-	fmt.Printf("  state         %s\n", path.State)
+
+	fmt.Fprintf(out, "Path      %s\n", path.ID)
+	fmt.Fprintf(out, "  source\t%s/%s %s\n", path.Source.Node, path.Source.Domain, path.Source.Flow)
+	fmt.Fprintf(out, "  destination\t%s\n", destination)
+	fmt.Fprintf(out, "  state\t%s\n", path.State)
 	if path.Reason != "" {
-		fmt.Printf("  reason        %s\n", path.Reason)
+		fmt.Fprintf(out, "  reason\t%s\n", path.Reason)
 	}
 
 	// The refcount (§3). N requests naming one edge share one path, one session and one worker
 	// pair, and the path goes away when the last of them is cancelled — so this is the answer to
 	// "what happens if I delete that request".
-	fmt.Printf("  requests      %s (refcount %d)\n", strings.Join(path.Requests, ", "), len(path.Requests))
+	fmt.Fprintf(out, "  requests\t%s (refcount %d)\n", strings.Join(path.Requests, ", "), len(path.Requests))
 
-	fmt.Println()
+	fmt.Fprintln(out)
 	if path.Session == nil {
-		fmt.Println("  No session — nothing is running on this path yet.")
+		fmt.Fprintln(out, "  no session")
 		return
 	}
-	fmt.Printf("  Session %s\n", path.Session.ID)
-	fmt.Printf("    fabric      %s / %s\n", path.Session.Fabric, path.Session.Interface.Provider)
-	fmt.Printf("    state       %s\n", endpointSummary(*path.Session))
+	fmt.Fprintf(out, "  Session %s\n", path.Session.ID)
+	fmt.Fprintf(out, "    fabric\t%s / %s\n", path.Session.Fabric, path.Session.Interface.Provider)
+	fmt.Fprintf(out, "    state\t%s\n", endpointSummary(*path.Session))
 }
 
 // --- session --------------------------------------------------------------------------------
@@ -429,24 +457,28 @@ func (c *DescribeCmd) session(ctx context.Context, user *client.Client) error {
 			return c.render(path.Session, func() { printSession(path) })
 		}
 	}
-	return fmt.Errorf("no session %q; it may have been re-established under a new id", c.Name)
+	return fmt.Errorf("no session %q", c.Name)
 }
 
 func printSession(path api.Path) {
 	session := *path.Session
 
-	fmt.Printf("Session   %s\n", session.ID)
-	fmt.Printf("  path          %s\n", path.ID)
-	fmt.Printf("  source        %s/%s %s\n", path.Source.Node, path.Source.Domain, path.Source.Flow)
-	fmt.Printf("  destination   %s\n", path.Destination.Endpoint())
-	fmt.Printf("  state         %s\n", path.State)
+	out := table()
+	defer flush(out)
+
+	fmt.Fprintf(out, "Session   %s\n", session.ID)
+	fmt.Fprintf(out, "  path\t%s\n", path.ID)
+	fmt.Fprintf(out, "  source\t%s/%s %s\n", path.Source.Node, path.Source.Domain, path.Source.Flow)
+	fmt.Fprintf(out, "  destination\t%s\n", path.Destination.Endpoint())
+	fmt.Fprintf(out, "  state\t%s\n", path.State)
 
 	// Both ends are given the *same* negotiated config, and it is pinned for the session's
 	// lifetime. The library does no negotiation of its own and requires identical values, so this
 	// is one value describing two workers rather than one per side (§5.5, §10.3).
-	fmt.Printf("\n  fabric        %s\n", session.Fabric)
-	fmt.Printf("  provider      %s (pinned)\n", session.Interface.Provider)
-	fmt.Printf("  interface     %s\n", capsText(session.Interface.CapFlags, session.Interface.MaxMessageSize))
+	fmt.Fprintln(out)
+	fmt.Fprintf(out, "  fabric\t%s\n", session.Fabric)
+	fmt.Fprintf(out, "  provider\t%s (pinned)\n", session.Interface.Provider)
+	fmt.Fprintf(out, "  interface\t%s\n", capsText(session.Interface.CapFlags, session.Interface.MaxMessageSize))
 
 	// A content hash of the target worker's incarnation, not a counter: it has no ordering, only
 	// equality. It changes on every target restart, and that change is what makes the initiator
@@ -455,19 +487,19 @@ func printSession(path api.Path) {
 	if epoch == "" {
 		epoch = "not yet reported"
 	}
-	fmt.Printf("  epoch         %s\n", epoch)
+	fmt.Fprintf(out, "  epoch\t%s\n", epoch)
 
-	fmt.Println()
-	out := tabwriter.NewWriter(os.Stdout, 2, 0, 2, ' ', 0)
+	fmt.Fprintln(out)
 	fmt.Fprintln(out, "  ROLE\tNODE\tSTATE\tENDPOINT\tRESTARTS\tUP\tREASON")
 	printEndpoint(out, "target", session.Target)
 	printEndpoint(out, "initiator", session.Initiator)
-	_ = out.Flush()
 }
 
 func printEndpoint(out *tabwriter.Writer, role string, endpoint *api.SessionEndpoint) {
 	if endpoint == nil {
-		fmt.Fprintf(out, "  %s\t—\tnot running\t—\t—\t—\t\n", role)
+		// No trailing tab: an empty tab-terminated cell is padded to the column width, which is a
+		// line of trailing spaces where the reason would have been.
+		fmt.Fprintf(out, "  %s\t—\tnot running\t—\t—\t—\n", role)
 		return
 	}
 
@@ -487,6 +519,14 @@ func printEndpoint(out *tabwriter.Writer, role string, endpoint *api.SessionEndp
 }
 
 // --- shared ---------------------------------------------------------------------------------
+
+// heading opens a section: a blank line and a title, neither of which carries a tab. That is what
+// ends the preceding column block, so each section's columns are sized to that section alone
+// rather than to the widest cell anywhere in the view.
+func heading(out *tabwriter.Writer, title string) {
+	fmt.Fprintln(out)
+	fmt.Fprintln(out, title)
+}
 
 // render writes the machine formats verbatim from the API types, so a script written against
 // `-o json` is written against the documented API rather than against this command.
@@ -509,15 +549,21 @@ func endpointSummary(session api.Session) string {
 	return strings.Join(parts, ", ")
 }
 
-func capsText(flags []api.CapFlag, maxMessage uint64) string {
+func capFlags(flags []api.CapFlag) string {
 	names := make([]string, 0, len(flags))
 	for _, flag := range flags {
 		names = append(names, string(flag))
 	}
-	caps := strings.Join(names, ",")
-	if caps == "" {
-		caps = "no capabilities"
+	if len(names) == 0 {
+		return "no capabilities"
 	}
+	return strings.Join(names, ",")
+}
+
+// capsText is the one-cell form, for the session view's single `interface` line. Where there is
+// room for a line per field — the node's attachments — the two facts are printed separately.
+func capsText(flags []api.CapFlag, maxMessage uint64) string {
+	caps := capFlags(flags)
 	if maxMessage == 0 {
 		return caps
 	}
