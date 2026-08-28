@@ -72,12 +72,13 @@ func TestWorkerMetricsCarryTheirLabels(t *testing.T) {
 	// The labels this project applies itself, in one line, because the exposition is what a
 	// dashboard is actually written against. `format` is the definition's
 	// "urn:x-nmos:format:video" with the urn prefix taken off, which is what anyone would type.
-	const own = `direction="target",domain="cameras",flow_id="5592a23b-0974-45bb-9388-89ea81c42537",format="video",media_type="",session="s1"`
+	const own = `direction="target",domain="ingest",flow_id="5592a23b-0974-45bb-9388-89ea81c42537",format="video",media_type="",session="s1"`
 	assert.Contains(t, body, `mxl_grains_total{`+own+`} 300`)
 	assert.Contains(t, body, `mxl_octets_total{`+own+`} 1.234567e+06`)
 
-	// The domain label is the *name*, never the path the worker was given.
-	assert.NotContains(t, body, h.domain)
+	// The domain label is the *name*, never the path the worker was given — which for an output
+	// domain is a directory under a root the operator configured (§10.6, §12).
+	assert.NotContains(t, body, h.outputDomain)
 
 	// A quantile is a gauge with a quantile label, rendered the way Prometheus renders one —
 	// "0.5", not the legacy proxy's "0.500". The encoder sorts label names, so it lands between
@@ -106,9 +107,14 @@ func TestLivenessGaugesFollowTheFlow(t *testing.T) {
 	h.launcher.SetMetrics(workerSamples())
 	h.run()
 
-	flow, err := testutil.RandomVideoFlow(h.domain)
+	// The flow lives in the *destination* domain, which does not exist until the assignment is
+	// accepted and is observed only because the agent adds it to its own watch set (§10.6). If
+	// that step were missing this test would hang here rather than fail somewhere legible, which
+	// is exactly how the bug presents in production.
+	require.NoDirExists(t, h.outputDomain)
+
+	flow, err := testutil.RandomVideoFlow(h.outputDomain)
 	require.NoError(t, err)
-	require.NoError(t, flow.Create())
 
 	def, err := json.Marshal(flow.Definition())
 	require.NoError(t, err)
@@ -119,6 +125,9 @@ func TestLivenessGaugesFollowTheFlow(t *testing.T) {
 	h.eventually("the target to be running", func() bool {
 		return h.launcher.Find("s1", api.RoleTarget) != nil
 	})
+
+	// Created by the target worker in reality; created here because the launcher is a fake.
+	require.NoError(t, flow.Create())
 	h.eventually("the gauges to appear once the flow is observed", func() bool {
 		return strings.Contains(h.expose(), "mxl_writer_active")
 	})

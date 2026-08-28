@@ -185,6 +185,10 @@ type request struct {
 	// out receives the decoded 2xx body. Nil discards it.
 	out any
 
+	// header receives the 2xx response headers. Nil discards them. Only [Client.Apply] wants
+	// them, for the outcome the body cannot carry.
+	header *http.Header
+
 	// timeout bounds one attempt. Zero uses the client's default.
 	timeout time.Duration
 }
@@ -275,6 +279,9 @@ func (c *Client) attempt(ctx context.Context, server string, req request, body [
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return decodeError(server, resp)
+	}
+	if req.header != nil {
+		*req.header = resp.Header
 	}
 
 	if req.out == nil || resp.StatusCode == http.StatusNoContent {

@@ -12,6 +12,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/jonasohland/mxl-replicator/internal/agent/inventory"
 	"github.com/jonasohland/mxl-replicator/internal/api"
 	"github.com/jonasohland/mxl-replicator/internal/epoch"
 	"github.com/jonasohland/mxl-replicator/internal/worker"
@@ -54,6 +55,50 @@ func TestRegistrationAdvertisesVerifiedCapabilities(t *testing.T) {
 	require.Len(t, registration.Domains, 1)
 	assert.Equal(t, "cameras", registration.Domains[0].Name)
 	assert.True(t, registration.Domains[0].Configured)
+
+	// The harness configures one output root, which is what makes this node a destination at
+	// all (§10.6).
+	require.Len(t, registration.Capabilities.OutputRoots, 1)
+	assert.Equal(t, "fast", registration.Capabilities.OutputRoots[0].Name)
+}
+
+// Roots are static agent configuration rather than something the worker probe reports, and they
+// are advertised at registration for the same reason fabric attachments are: without them the
+// server would accept a request whose destination cannot be materialised (§10.2, §10.6).
+func TestOutputRootsAreAdvertisedAndPreCreated(t *testing.T) {
+	base := t.TempDir()
+	fast := filepath.Join(base, "fast")
+	bulk := filepath.Join(base, "bulk", "not-yet")
+
+	h := newHarness(t, harnessOptions{outputRoots: []inventory.Root{
+		{Name: "bulk", Path: bulk},
+		{Name: "fast", Path: fast},
+	}})
+	h.run()
+
+	h.eventually("registration", func() bool {
+		registrations, _, _ := h.server.counts()
+		return registrations >= 1
+	})
+
+	h.server.mu.Lock()
+	registration := h.server.registrations[0]
+	h.server.mu.Unlock()
+
+	// Ordered by name, and carrying the path for diagnostics only — the server sends a root
+	// *name* back to the agent and the agent resolves it.
+	assert.Equal(t, []api.OutputRoot{
+		{Name: "bulk", Path: bulk},
+		{Name: "fast", Path: fast},
+	}, registration.Capabilities.OutputRoots)
+
+	// Created at startup, so only the leaf MkdirAll for a domain is ever on the establishment
+	// path (§6.1).
+	for _, path := range []string{fast, bulk} {
+		info, err := os.Stat(path)
+		require.NoError(t, err, path)
+		assert.True(t, info.IsDir())
+	}
 }
 
 // A node name another instance holds is loud and never fatal — the holder may go away — and the
@@ -109,7 +154,8 @@ func TestTargetEstablishmentReportsTheEpoch(t *testing.T) {
 	handle := h.launcher.Find("s1", api.RoleTarget)
 	require.NotNil(t, handle)
 	spec := handle.Spec()
-	assert.Equal(t, h.domain, spec.DomainPath, "the domain name resolved to this node's path")
+	assert.Equal(t, h.outputDomain, spec.DomainPath,
+		"a target's domain name resolved under this node's output root, not through anything it observes")
 	assert.Empty(t, spec.TargetInfo, "a target's target_info config key is an output path, chosen by the launcher")
 	assert.NotEmpty(t, spec.FlowDef)
 }
@@ -409,25 +455,49 @@ func TestAssignmentsAreRefusedRatherThanGuessedAt(t *testing.T) {
 	h.run()
 
 	h.eventually("the discovered domain", func() bool {
-		_, ok := h.cfg.Inventory.Path(found)
+		_, ok := h.cfg.Inventory.Input(found)
 		return ok
 	})
 
-	unmapped := targetAssignment("s1")
-	unmapped.Domain = "/etc"
+	// A raw path where a domain element belongs. It is not interpreted as a path at any point: a
+	// separator is simply not something an element may contain (§10.6). Note that the resolver
+	// reads OutputDomain and never Domain, so a server that put a path in the *name* could not
+	// smuggle it through either — the name is for logs and labels.
+	rawPath := targetAssignment("s1")
+	rawPath.OutputDomain = []string{"/etc"}
 
+	// A domain this agent *discovered*. Its name is its path, so it fails the same rule — which
+	// is why "a discovered domain is never a destination" needs no separate check: after §10.6 a
+	// destination is elements under a root, and a discovered domain's name has no such shape.
 	discovered := targetAssignment("s2")
-	discovered.Domain = found
+	discovered.OutputDomain = []string{found}
 
-	wrongFabric := targetAssignment("s3")
+	// A root this node does not advertise. The server validates this and is the authority;
+	// checking it again is the deliberate duplication that keeps one buggy control plane from
+	// writing wherever a root can reach (§13).
+	unknownRoot := targetAssignment("s3")
+	unknownRoot.Root = "bulk"
+
+	// And an input mapping named as a destination, which resolves to nothing now: input and
+	// output are different namespaces reached by different functions.
+	inputAsOutput := targetAssignment("s4")
+	inputAsOutput.OutputDomain = []string{"cameras"}
+	inputAsOutput.Root = ""
+
+	wrongFabric := targetAssignment("s5")
 	wrongFabric.Fabric = "ib-somewhere-else"
 
-	h.server.assign("edge-01", unmapped, discovered, wrongFabric)
+	h.server.assign("edge-01", rawPath, discovered, unknownRoot, inputAsOutput, wrongFabric)
 
 	for _, tc := range []struct{ session, wants string }{
-		{"s1", "is not mapped on this node"},
-		{"s2", "discovered rather than configured"},
-		{"s3", "advertises no tcp attachment"},
+		{"s1", "contains byte 0x2f"},
+		// The discovered domain's path is over the per-element length cap before it is over
+		// anything else. Either rejection is the point; the assertion names the shape, not the
+		// clause that caught it first.
+		{"s2", "output domain"},
+		{"s3", `advertises no output root "bulk"`},
+		{"s4", "no output root named"},
+		{"s5", "advertises no tcp attachment"},
 	} {
 		h.eventually("session "+tc.session+" to be reported failed", func() bool {
 			status, ok := h.server.lastStatus(tc.session, api.RoleTarget)

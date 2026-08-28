@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -94,6 +95,7 @@ func (h *harness) reconciling() {
 type response struct {
 	status int
 	body   []byte
+	header http.Header
 }
 
 func (r response) decode(t *testing.T, into any) {
@@ -135,10 +137,13 @@ func (h *harness) doCtx(ctx context.Context, method, path string, body any) resp
 
 	raw, err := io.ReadAll(resp.Body)
 	require.NoError(h.t, err)
-	return response{status: resp.StatusCode, body: raw}
+	return response{status: resp.StatusCode, body: raw, header: resp.Header}
 }
 
 // register brings a node up the way an agent does, and returns its lease.
+//
+// Every node advertises one output root, so any of them can be a destination and a request can
+// name one without spelling the root (§10.6).
 func (h *harness) register(node, instance string, domains ...api.DomainMapping) api.RegistrationResponse {
 	h.t.Helper()
 
@@ -152,6 +157,7 @@ func (h *harness) register(node, instance string, domains ...api.DomainMapping) 
 				Provider: api.ProviderTCP, Fabric: "dc1", Address: "10.0.0.1",
 				CapFlags: []api.CapFlag{api.CapRemoteWrite, api.CapSendReceive},
 			}},
+			OutputRoots: []api.OutputRoot{{Name: "fast", Path: "/dev/shm/mxl"}},
 		},
 	})
 	require.Equal(h.t, http.StatusOK, resp.status, "body: %s", resp.body)
@@ -198,9 +204,9 @@ func (h *harness) assignments(node string, cursor int64, wait time.Duration) (ap
 
 func flowRequestSpec(name string) api.RequestSpec {
 	return api.RequestSpec{
-		Name:        name,
-		Source:      api.Source{Node: "studio-a", Domain: "cameras", Select: api.Selector{Flow: "flow-1"}},
-		Destination: api.Destination{Node: "edge-01", Domain: "ingest"},
+		Name:         name,
+		Source:       api.Source{Node: "studio-a", Domain: "cameras", Select: api.Selector{Flow: "flow-1"}},
+		Destinations: []api.Destination{{Node: "edge-01", Domain: []string{"ingest"}}},
 	}
 }
 
@@ -209,7 +215,7 @@ func (h *harness) fleet() {
 	h.t.Helper()
 
 	h.register("studio-a", "i-studio", api.DomainMapping{Name: "cameras", Path: "/dev/shm/a", Configured: true})
-	h.register("edge-01", "i-edge", api.DomainMapping{Name: "ingest", Path: "/dev/shm/b", Configured: true})
+	h.register("edge-01", "i-edge", api.DomainMapping{Name: "archive", Path: "/dev/shm/b", Configured: true})
 	h.reportInventory("studio-a", "i-studio", "cameras", api.FlowInventory{
 		ID: "flow-1", Definition: testFlowDef, Producing: true,
 	})
@@ -740,9 +746,12 @@ func TestInvalidRequestsAreRefusedAtCreation(t *testing.T) {
 		mutate func(*api.RequestSpec)
 		code   api.ReasonCode
 	}{
-		{"unmapped destination domain", func(s *api.RequestSpec) { s.Destination.Domain = "/dev/shm/anything" }, api.ReasonDomainNotMapped},
-		{"same endpoint", func(s *api.RequestSpec) { s.Destination = api.Destination{Node: "studio-a", Domain: "cameras"} }, api.ReasonSameEndpoint},
-		{"unknown node", func(s *api.RequestSpec) { s.Destination.Node = "typo" }, api.ReasonNodeNotRegistered},
+		{"destination collides with an input mapping", func(s *api.RequestSpec) { s.Destinations[0].Domain = []string{"archive"} }, api.ReasonDomainNameInUse},
+		{"unknown output root", func(s *api.RequestSpec) { s.Destinations[0].Root = "bulk" }, api.ReasonUnknownOutputRoot},
+		{"same endpoint", func(s *api.RequestSpec) {
+			s.Destinations[0] = api.Destination{Node: "studio-a", Domain: []string{"cameras"}}
+		}, api.ReasonSameEndpoint},
+		{"unknown node", func(s *api.RequestSpec) { s.Destinations[0].Node = "typo" }, api.ReasonNodeNotRegistered},
 		{"pin not viable", func(s *api.RequestSpec) { s.Provider = api.ProviderPin{api.ProviderEFA} }, api.ReasonPinNotViable},
 	}
 
@@ -760,6 +769,23 @@ func TestInvalidRequestsAreRefusedAtCreation(t *testing.T) {
 			assert.NotEmpty(t, failure.Message)
 
 			// Nothing was stored: a refused request must not come back in a listing.
+			assert.Equal(t, http.StatusNotFound, h.do(http.MethodGet, api.RequestPath(spec.Name), nil).status)
+		})
+	}
+
+	// A destination that is not a domain *name* at all is refused before any of the above runs —
+	// structurally, by the request body's own validation, with no reference to the fleet (§10.6).
+	// It carries no reason code because it never reaches the fleet-aware validator, and that is
+	// the right layering: a path where a name belongs is a malformed request, not a request the
+	// fleet cannot satisfy.
+	for _, domain := range []string{"/dev/shm/anything", "../etc", "a/b"} {
+		t.Run("path as destination domain "+domain, func(t *testing.T) {
+			spec := flowRequestSpec("path-" + strings.NewReplacer("/", "-", ".", "").Replace(domain))
+			spec.Destinations[0].Domain = []string{domain}
+
+			resp := h.do(http.MethodPost, api.PathRequests, spec)
+			require.Equal(t, http.StatusBadRequest, resp.status, "body: %s", resp.body)
+			assert.Equal(t, api.CodeInvalidRequest, resp.apiError(t).Code)
 			assert.Equal(t, http.StatusNotFound, h.do(http.MethodGet, api.RequestPath(spec.Name), nil).status)
 		})
 	}
@@ -783,6 +809,129 @@ func TestAValidButUnsatisfiableRequestIsAccepted(t *testing.T) {
 	resp.decode(t, &created)
 	assert.Equal(t, api.StateWaiting, created.Status.State)
 	assert.Equal(t, api.ReasonFlowNotFound, created.Status.ReasonCode)
+}
+
+// --- apply semantics (M8d, M8f) -----------------------------------------------------------
+
+// revision reads the store-wide revision, which is what "nothing was written" means: every
+// successful Put advances it, including one writing a byte-identical value.
+func (h *harness) revision() int64 {
+	h.t.Helper()
+	_, rev, err := h.store.List(h.t.Context(), "")
+	require.NoError(h.t, err)
+	return rev
+}
+
+// **Invariant 13.** A controller re-reconciling on every resync is exactly what the idempotency
+// key exists to support, so an unchanged apply must cost nothing. Without this the store churns
+// forever and every pass triggers a reconcile — the naive implementation passes every other test
+// in this file.
+func TestReApplyingAnUnchangedRequestWritesNothing(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	h.fleet()
+
+	spec := flowRequestSpec("cam1")
+	require.Equal(t, http.StatusCreated, h.do(http.MethodPost, api.PathRequests, spec).status)
+
+	before := h.revision()
+
+	// Twice, because a bug that writes once and then settles would still pass a single re-apply.
+	for range 2 {
+		resp := h.do(http.MethodPost, api.PathRequests, spec)
+		require.Equal(t, http.StatusOK, resp.status, "an existing request updates rather than creates")
+
+		// The outcome cannot be read off the status code — an unchanged apply and a real update
+		// are both 200 — nor off the body, which echoes the spec that was sent either way. It has
+		// to come from the server, or `apply` reports "unchanged" for something it just changed.
+		assert.Equal(t, api.OutcomeUnchanged, resp.header.Get(api.HeaderOutcome))
+
+		var got api.Request
+		resp.decode(t, &got)
+		assert.Equal(t, "cam1", got.ID)
+	}
+	assert.Equal(t, before, h.revision(), "an unchanged apply must not advance the store revision")
+
+	// A *changed* spec still writes, or apply would be unable to update anything.
+	spec.Labels = map[string]string{"show": "nab"}
+	changed := h.do(http.MethodPost, api.PathRequests, spec)
+	require.Equal(t, http.StatusOK, changed.status)
+	assert.Equal(t, api.OutcomeUpdated, changed.header.Get(api.HeaderOutcome))
+	assert.Greater(t, h.revision(), before)
+}
+
+// A dry run runs the whole accept path — decode, structural validation, fleet-aware validation,
+// reconciliation — and writes nothing. That is what lets `apply --dry-run` report the real
+// outcome rather than a spec diff.
+func TestDryRunDecidesWithoutWriting(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	h.fleet()
+
+	before := h.revision()
+	dryRun := api.PathRequests + "?dry_run=true"
+
+	// A request that would be accepted: reported as it would be, 201 for "would create".
+	resp := h.do(http.MethodPost, dryRun, flowRequestSpec("cam1"))
+	require.Equal(t, http.StatusCreated, resp.status, "body: %s", resp.body)
+
+	var planned api.Request
+	resp.decode(t, &planned)
+	assert.Equal(t, api.StateEstablishing, planned.Status.State)
+	require.Len(t, planned.Status.Paths, 1)
+
+	// A request that would be refused is refused, with the same reason a real POST would give.
+	bad := flowRequestSpec("bad")
+	bad.Destinations[0].Root = "bulk"
+	refused := h.do(http.MethodPost, dryRun, bad)
+	require.Equal(t, http.StatusBadRequest, refused.status)
+	assert.Equal(t, string(api.ReasonUnknownOutputRoot), refused.apiError(t).Details["reason_code"])
+
+	assert.Equal(t, before, h.revision(), "a dry run must not write")
+	assert.Equal(t, http.StatusNotFound, h.do(http.MethodGet, api.RequestPath("cam1"), nil).status,
+		"and must not create the request it planned")
+
+	// 200 rather than 201 once the request exists, so a client learns created-vs-updated from
+	// the dry run without a second round trip.
+	require.Equal(t, http.StatusCreated, h.do(http.MethodPost, api.PathRequests, flowRequestSpec("cam1")).status)
+	assert.Equal(t, http.StatusOK, h.do(http.MethodPost, dryRun, flowRequestSpec("cam1")).status)
+
+	// An unparseable value is an error, not a silent false: ?dry_run=yes must never write.
+	assert.Equal(t, http.StatusBadRequest,
+		h.do(http.MethodPost, api.PathRequests+"?dry_run=yes", flowRequestSpec("other")).status)
+}
+
+// A label the metrics path would silently drop must be an error the caller sees (M6b, M8e).
+// Under prune a dropped label silently changes what can cancel the request, which is a worse
+// failure than a missing series.
+func TestLabelValidation(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	h.fleet()
+
+	for name, labels := range map[string]map[string]string{
+		"reserved by this project": {"domain": "cameras"},
+		"reserved by prometheus":   {"__name__": "x"},
+		"quantile":                 {"quantile": "0.5"},
+		"not a label name":         {"show-name": "nab"},
+		"overlong value":           {"show": strings.Repeat("x", 300)},
+	} {
+		t.Run(name, func(t *testing.T) {
+			spec := flowRequestSpec("labelled-" + strings.ReplaceAll(name, " ", "-"))
+			spec.Labels = labels
+
+			resp := h.do(http.MethodPost, api.PathRequests, spec)
+			require.Equal(t, http.StatusBadRequest, resp.status, "body: %s", resp.body)
+			assert.Equal(t, api.CodeInvalidRequest, resp.apiError(t).Code)
+		})
+	}
+
+	ok := flowRequestSpec("labelled-fine")
+	ok.Labels = map[string]string{"show": "nab", "tier_1": "yes"}
+	assert.Equal(t, http.StatusCreated, h.do(http.MethodPost, api.PathRequests, ok).status)
 }
 
 func TestRequestNameValidation(t *testing.T) {

@@ -43,13 +43,40 @@ type Agent struct {
 	// Domains is the name→path mapping block, kept legacy-compatible (§16). See [Domains].
 	Domains Domains `yaml:"domains"`
 
-	// SearchPaths are recursively scanned for unconfigured domains. A domain found this way can
-	// be a replication source but is never a destination (§7.2, §13).
+	// SearchPaths are recursively scanned for unconfigured domains. A domain found this way is a
+	// replication source; nothing discovered is ever written to (§7.2, §10.6).
 	SearchPaths []string `yaml:"search_paths"`
+
+	// OutputRoots are the directories replication may create domains under (§10.6):
+	//
+	//	output_roots:
+	//	  - name: fast
+	//	    path: /dev/shm/mxl
+	//	  - name: bulk
+	//	    path: /mnt/nvme/mxl
+	//
+	// A list rather than a map, matching §10.6's own spelling and the `fabrics:` block next to
+	// it. No default and no legacy equivalent: this is the opt-in that makes a node a replication
+	// destination, and a node with none configured accepts none.
+	//
+	// Several are supported because "this domain on tmpfs, that one on NVMe" is a real
+	// requirement, and because a root is the natural place to hang a future capacity budget —
+	// capacity being a property of a mount rather than of a domain.
+	OutputRoots []OutputRoot `yaml:"output_roots"`
 
 	// Fabrics is what this node can be reached on (§10.1). Each entry is a (provider, fabric)
 	// pair plus at most one selector; the join against the worker's probe is [probe.Join].
 	Fabrics []probe.Attachment `yaml:"fabrics"`
+}
+
+// OutputRoot is one entry of the `output_roots:` block.
+//
+// Deliberately not reusing [Domains]' shape: a root is not a domain, and giving them one spelling
+// would invite exactly the confusion §10.6 exists to remove — an input mapping is a directory the
+// node *has*, a root is a place the control plane is permitted to create directories.
+type OutputRoot struct {
+	Name string `yaml:"name"`
+	Path string `yaml:"path"`
 }
 
 // Domains is the domain mapping block.
@@ -218,6 +245,9 @@ func (a *Agent) merge(other *Agent) {
 	if len(other.SearchPaths) > 0 {
 		a.SearchPaths = slices.Clone(other.SearchPaths)
 	}
+	if len(other.OutputRoots) > 0 {
+		a.OutputRoots = slices.Clone(other.OutputRoots)
+	}
 	for name, path := range other.Domains {
 		if a.Domains == nil {
 			a.Domains = Domains{}
@@ -231,8 +261,10 @@ func (a *Agent) Validate() error {
 	var errs []error
 
 	for name, path := range a.Domains {
-		if name == "" {
-			errs = append(errs, fmt.Errorf("domains: empty name for path %q", path))
+		// The same rule the inventory applies, so a name is refused where it is typed rather than
+		// several layers down (§10.6).
+		if err := api.ValidDomainName(name); err != nil {
+			errs = append(errs, fmt.Errorf("domains: name %q: %w", name, err))
 		}
 		if !filepath.IsAbs(path) {
 			errs = append(errs, fmt.Errorf("domain %q: path %q must be absolute", name, path))
@@ -241,6 +273,17 @@ func (a *Agent) Validate() error {
 	for _, path := range a.SearchPaths {
 		if !filepath.IsAbs(path) {
 			errs = append(errs, fmt.Errorf("search path %q must be absolute", path))
+		}
+	}
+	// Per-entry only. Whether the roots overlap each other, a domain mapping or a search path is
+	// a property of the *merged* configuration — file plus flags — so it is checked once there
+	// rather than twice with one of them seeing half the picture (§10.6).
+	for i, root := range a.OutputRoots {
+		if err := api.ValidDomainName(root.Name); err != nil {
+			errs = append(errs, fmt.Errorf("output_roots[%d]: name %q: %w", i, root.Name, err))
+		}
+		if !filepath.IsAbs(root.Path) {
+			errs = append(errs, fmt.Errorf("output root %q: path %q must be absolute", root.Name, root.Path))
 		}
 	}
 	for i, attachment := range a.Fabrics {

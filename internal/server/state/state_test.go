@@ -46,9 +46,9 @@ func TestLoadRoutesEveryLayer(t *testing.T) {
 	// A request always carries a valid selector — an invalid one refuses to marshal, which is
 	// the tagged union defending itself on the way *out* as well as in (§9.1).
 	put(t, s, store.RequestKey("cam1"), RequestRecord{ID: "cam1", Spec: api.RequestSpec{
-		Name:        "cam1",
-		Source:      api.Source{Node: "studio-a", Domain: "cameras", Select: api.Selector{Flow: "flow-1"}},
-		Destination: api.Destination{Node: "edge-01", Domain: "ingest"},
+		Name:         "cam1",
+		Source:       api.Source{Node: "studio-a", Domain: "cameras", Select: api.Selector{Flow: "flow-1"}},
+		Destinations: []api.Destination{{Node: "edge-01", Domain: []string{"ingest"}}},
 	}})
 	put(t, s, store.LeaseKey("edge-01"), LeaseRecord{Node: "edge-01", Instance: "i-1"}, store.WithLease(lease))
 	put(t, s, store.InventoryKey("edge-01"), api.InventorySnapshot{Node: "edge-01"}, store.WithLease(lease))
@@ -183,7 +183,7 @@ func TestFleetLookups(t *testing.T) {
 func identity() PathIdentity {
 	return PathIdentity{
 		Source:      api.FlowAddress{Node: "studio-a", Domain: "cameras", Flow: "flow-1"},
-		Destination: api.Destination{Node: "edge-01", Domain: "ingest"},
+		Destination: api.Destination{Node: "edge-01", Domain: []string{"ingest"}},
 	}
 }
 
@@ -218,7 +218,7 @@ func TestIdentityFieldsAllMatter(t *testing.T) {
 		{"source domain", func(p *PathIdentity) { p.Source.Domain = "other" }},
 		{"flow", func(p *PathIdentity) { p.Source.Flow = "flow-2" }},
 		{"destination node", func(p *PathIdentity) { p.Destination.Node = "edge-02" }},
-		{"destination domain", func(p *PathIdentity) { p.Destination.Domain = "other" }},
+		{"destination domain", func(p *PathIdentity) { p.Destination.Domain = []string{"other"} }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			changed := base

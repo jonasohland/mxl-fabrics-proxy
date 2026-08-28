@@ -1,0 +1,143 @@
+# The control plane (§7, §8.2).
+#
+# A Deployment rather than a DaemonSet, and it rolls *before* the agents: the server must tolerate
+# agents a version or more behind, agents may assume the server is at least as new, and the server
+# refuses an agent newer than itself (§13.1).
+#
+# This manifest is the **sqlite** shape: one replica, one PVC, always the leader. It is a real
+# production shape for a single control-plane node. For HA, swap the store flags for etcd, raise
+# the replica count and drop the PVC — every replica then serves the API and one of them is elected
+# reconciler leader (§8.2). Read `rewrite-plan.md` §4 before doing that: several of the risks there
+# are about running the server and an agent in one process, which this manifest does not do.
+apiVersion: v1
+kind: Service
+metadata:
+  name: mxl-replicator
+  labels:
+    app.kubernetes.io/name: mxl-replicator
+    app.kubernetes.io/component: server
+spec:
+  selector:
+    app.kubernetes.io/name: mxl-replicator
+    app.kubernetes.io/component: server
+  ports:
+    - name: http
+      port: 2283
+      targetPort: http
+---
+# The shared bearer token (§13). Optional — no-auth is supported on a trusted network — but the
+# user API is a fleet-wide bandwidth exhaustion primitive and the agent API can claim to be a node
+# and read other nodes' RDMA rkeys, so turn it on anywhere else.
+#
+# Replace this with a real secret; it is here so the manifests are complete, not because a literal
+# belongs in git.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: mxl-replicator-token
+  labels:
+    app.kubernetes.io/name: mxl-replicator
+stringData:
+  token: change-me
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mxl-replicator-store
+  labels:
+    app.kubernetes.io/name: mxl-replicator
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      # Desired state is small and low-churn by design, and observed state is leased so it
+      # collects itself (§8.3). This is generous.
+      storage: 1Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mxl-replicator-server
+  labels:
+    app.kubernetes.io/name: mxl-replicator
+    app.kubernetes.io/component: server
+spec:
+  # One, because the sqlite backend is single-node. etcd is required for more (§8.1).
+  replicas: 1
+  strategy:
+    # The PVC is ReadWriteOnce and sqlite has one writer: the old pod must be gone before the new
+    # one starts. A server restart does not glitch media — the settling window and deterministic
+    # session IDs mean the new process adopts the running sessions rather than re-establishing
+    # them (§7.3) — so there is nothing to gain from overlapping them.
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: mxl-replicator
+      app.kubernetes.io/component: server
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: mxl-replicator
+        app.kubernetes.io/component: server
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "2283"
+        prometheus.io/path: /metrics
+    spec:
+      terminationGracePeriodSeconds: 30
+      volumes:
+        - name: store
+          persistentVolumeClaim:
+            claimName: mxl-replicator-store
+      containers:
+        - name: server
+          image: docker.io/jonasohland/mxl-replicator:latest
+          args:
+            - run
+            - --server
+            - --server-listen
+            - 0.0.0.0:2283
+            - --server-store-backend
+            - sqlite
+            - --server-store-sqlite-path
+            - /var/lib/mxl-replicator/store.db
+          env:
+            - name: MXL_REPLICATOR_AUTH_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: mxl-replicator-token
+                  key: token
+          ports:
+            - name: http
+              containerPort: 2283
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 5
+            timeoutSeconds: 3
+          livenessProbe:
+            # Deliberately /healthz and not /readyz. Readiness reports whether the reconciler has
+            # settled; restarting the server because it has not yet would be a loop, and a server
+            # that is up but settling is not a failed one (§7.3).
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            - name: store
+              mountPath: /var/lib/mxl-replicator

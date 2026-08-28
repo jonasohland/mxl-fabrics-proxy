@@ -55,6 +55,9 @@ func (b *fleetBuilder) node(name string, domains ...api.DomainMapping) *fleetBui
 				Provider: api.ProviderTCP, Fabric: "dc1", Address: "10.0.0." + name[len(name)-1:],
 				CapFlags: []api.CapFlag{api.CapRemoteWrite, api.CapSendReceive},
 			}},
+			// One output root on every node, so any of them can be a destination and a request
+			// can name one without spelling the root (§10.6).
+			OutputRoots: []api.OutputRoot{{Name: "fast", Path: "/dev/shm/mxl"}},
 		},
 	}}
 	b.fleet.Leases[name] = state.Entry[state.LeaseRecord]{Found: true, Value: state.LeaseRecord{Node: name, Instance: "i-" + name}}
@@ -123,9 +126,9 @@ func (b *fleetBuilder) build() *state.Fleet { return b.fleet }
 
 func flowRequest(name string) api.RequestSpec {
 	return api.RequestSpec{
-		Name:        name,
-		Source:      api.Source{Node: "studio-a", Domain: "cameras", Select: api.Selector{Flow: "flow-1"}},
-		Destination: api.Destination{Node: "edge-01", Domain: "ingest"},
+		Name:         name,
+		Source:       api.Source{Node: "studio-a", Domain: "cameras", Select: api.Selector{Flow: "flow-1"}},
+		Destinations: []api.Destination{{Node: "edge-01", Domain: []string{"ingest"}}},
 	}
 }
 
@@ -133,9 +136,184 @@ func flowRequest(name string) api.RequestSpec {
 func base() *fleetBuilder {
 	return newFleet().
 		node("studio-a", api.DomainMapping{Name: "cameras", Configured: true}).
-		node("edge-01", api.DomainMapping{Name: "ingest", Configured: true}).
+		node("edge-01").
 		flow("studio-a", "cameras", api.FlowInventory{ID: "flow-1", Definition: flowDef, Producing: true}).
 		request("cam1", flowRequest("cam1"))
+}
+
+// --- fan-out: one source, many destinations (§9.1, 8a) -----------------------------------
+
+// A request fans out to a path per destination, and each path is its own session and its own
+// worker pair. The request's status aggregates over all of them (§11).
+func TestARequestFansOutToOnePathPerDestination(t *testing.T) {
+	t.Parallel()
+
+	spec := flowRequest("cam1")
+	spec.Destinations = []api.Destination{
+		{Node: "edge-01", Domain: []string{"ingest"}},
+		{Node: "edge-02", Domain: []string{"ingest"}},
+		{Node: "archive-01", Domain: []string{"capture"}},
+	}
+
+	fleet := base().node("edge-02").node("archive-01").request("cam1", spec).build()
+	result := Compute(fleet, Config{})
+
+	require.Len(t, result.Paths, 3)
+	require.Len(t, result.Requests["cam1"].Paths, 3)
+
+	// Every destination gets its own path, its own session, and a target assignment on its own
+	// node. The source node carries one initiator per destination: fan-out is N workers reading
+	// the same local flow, which is the cost the grouping makes legible.
+	seen := map[string]bool{}
+	for _, path := range result.Paths {
+		seen[path.Destination.Endpoint()] = true
+		assert.Equal(t, "flow-1", path.Source.Flow)
+		assert.Equal(t, "fast", path.Destination.Root, "the resolved root goes into the identity")
+		assert.Equal(t, []string{"cam1"}, path.Requests)
+	}
+	assert.Equal(t, map[string]bool{"edge-01/ingest": true, "edge-02/ingest": true, "archive-01/capture": true}, seen)
+
+	for _, node := range []string{"edge-01", "edge-02", "archive-01"} {
+		assert.Len(t, result.Assignments[node].Assignments, 1, "one target on %s", node)
+	}
+	assert.Len(t, result.Assignments["studio-a"].Assignments, 0,
+		"no initiator until each target has reported an epoch (invariant 3)")
+
+	assert.Equal(t, api.StateEstablishing, result.Requests["cam1"].State)
+	assert.Equal(t, 3, result.Requests["cam1"].Counts[api.StateEstablishing])
+}
+
+// **The point of validating per destination.** One unusable destination makes the request
+// INVALID, but it must not stop its siblings: they are separate paths on separate nodes and
+// nothing about them changed.
+func TestOneInvalidDestinationDoesNotStopTheOthers(t *testing.T) {
+	t.Parallel()
+
+	spec := flowRequest("cam1")
+	spec.Destinations = []api.Destination{
+		{Node: "edge-01", Domain: []string{"ingest"}},
+		{Node: "edge-02", Domain: []string{"ingest"}, Root: "bulk"}, // edge-02 advertises only "fast"
+	}
+
+	fleet := base().node("edge-02").request("cam1", spec).build()
+	result := Compute(fleet, Config{})
+
+	status := result.Requests["cam1"]
+	assert.Equal(t, api.StateInvalid, status.State)
+	assert.Equal(t, api.ReasonUnknownOutputRoot, status.ReasonCode)
+	assert.Contains(t, status.Reason, "edge-02/ingest",
+		"the reason must name which destination failed, or an operator cannot find it")
+
+	// The good leg is a real path with a real session and a real assignment...
+	require.Len(t, result.Paths, 2)
+	assert.Len(t, result.Assignments["edge-01"].Assignments, 1)
+	assert.Equal(t, 1, status.Counts[api.StateEstablishing])
+
+	// ...and the bad one is a shadow path that starts nothing.
+	assert.Empty(t, result.Assignments["edge-02"].Assignments)
+	assert.Equal(t, 1, status.Counts[api.StateInvalid])
+}
+
+// A failure that is really about the *source* fails every leg identically, and naming one
+// destination for it points at the wrong end — "(and 2 more)" would suggest two further problems
+// rather than the same one counted three times.
+func TestARequestWideFailureDoesNotBlameADestination(t *testing.T) {
+	t.Parallel()
+
+	spec := flowRequest("cam1")
+	spec.Source.Node = "typo" // never registered: nothing about any destination is wrong
+	spec.Destinations = []api.Destination{
+		{Node: "edge-01", Domain: []string{"ingest"}},
+		{Node: "edge-02", Domain: []string{"ingest"}},
+	}
+
+	fleet := base().node("edge-02").request("cam1", spec).build()
+	status := Compute(fleet, Config{}).Requests["cam1"]
+
+	assert.Equal(t, api.StateInvalid, status.State)
+	assert.Equal(t, api.ReasonNodeNotRegistered, status.ReasonCode)
+	assert.Contains(t, status.Reason, `source node "typo"`)
+	assert.NotContains(t, status.Reason, "destination edge-01/ingest")
+	assert.NotContains(t, status.Reason, "more destination")
+}
+
+// A leg that expands to no paths at all still has to say why it is unusable. Without this a
+// request whose source flow does not exist *yet* and whose destination can never work reports
+// WAITING, and POST lets it through — which is exactly what §7.2 requires be rejected.
+func TestAnUnusableDestinationIsInvalidEvenWithNothingToExpandOnto(t *testing.T) {
+	t.Parallel()
+
+	spec := flowRequest("cam1")
+	spec.Source.Select = api.Selector{Flow: "flow-does-not-exist-yet"}
+	spec.Destinations = []api.Destination{{Node: "edge-01", Domain: []string{"ingest"}, Root: "bulk"}}
+
+	result := Compute(base().request("cam1", spec).build(), Config{})
+
+	status := result.Requests["cam1"]
+	assert.Equal(t, api.StateInvalid, status.State, "not WAITING: the destination can never work")
+	assert.Equal(t, api.ReasonUnknownOutputRoot, status.ReasonCode)
+}
+
+// A per-destination pin overrides the request-level one rather than intersecting it, so
+// "verbs here, tcp there" is an ordinary request and not a pin conflict (§10.4).
+func TestAPerDestinationPinOverridesTheRequestPin(t *testing.T) {
+	t.Parallel()
+
+	spec := flowRequest("cam1")
+	spec.Provider = api.ProviderPin{api.ProviderEFA} // not viable for these fixture nodes
+	spec.Destinations = []api.Destination{
+		{Node: "edge-01", Domain: []string{"ingest"}, Provider: api.ProviderPin{api.ProviderTCP}},
+		{Node: "edge-02", Domain: []string{"ingest"}},
+	}
+
+	fleet := base().node("edge-02").request("cam1", spec).build()
+	result := Compute(fleet, Config{})
+
+	byNode := map[string]api.Path{}
+	for _, path := range result.Paths {
+		byNode[path.Destination.Node] = path
+	}
+	require.Contains(t, byNode, "edge-01")
+	require.Contains(t, byNode, "edge-02")
+
+	// The overriding destination negotiates tcp and comes up; the inheriting one takes the
+	// request's unviable efa pin and is refused, without ever being substituted onto tcp.
+	assert.Equal(t, api.StateEstablishing, byNode["edge-01"].State)
+	assert.Equal(t, api.StateInvalid, byNode["edge-02"].State)
+	assert.Equal(t, api.ReasonPinNotViable, byNode["edge-02"].ReasonCode)
+}
+
+// Two requests naming the same edge still share one path and one session, whether or not either
+// of them fans out elsewhere. Refcounting is at path level and the destination list changes
+// nothing about it (§9.1).
+func TestFanOutStillDeduplicatesSharedPaths(t *testing.T) {
+	t.Parallel()
+
+	wide := flowRequest("wide")
+	wide.Destinations = []api.Destination{
+		{Node: "edge-01", Domain: []string{"ingest"}},
+		{Node: "edge-02", Domain: []string{"ingest"}},
+	}
+	narrow := flowRequest("narrow")
+	narrow.Destinations = []api.Destination{{Node: "edge-02", Domain: []string{"ingest"}}}
+
+	fleet := newFleet().
+		node("studio-a", api.DomainMapping{Name: "cameras", Configured: true}).
+		node("edge-01").node("edge-02").
+		flow("studio-a", "cameras", api.FlowInventory{ID: "flow-1", Definition: flowDef, Producing: true}).
+		request("wide", wide).request("narrow", narrow).
+		build()
+	result := Compute(fleet, Config{})
+
+	require.Len(t, result.Paths, 2, "three destination entries, two distinct edges")
+	for _, path := range result.Paths {
+		if path.Destination.Node == "edge-02" {
+			assert.Equal(t, []string{"narrow", "wide"}, path.Requests)
+		} else {
+			assert.Equal(t, []string{"wide"}, path.Requests)
+		}
+	}
+	assert.Len(t, result.Sessions, 2)
 }
 
 func onlyPath(t *testing.T, result *Result) api.Path {
@@ -271,7 +449,7 @@ func established(t *testing.T, destinationProducing bool, sourceProducing bool) 
 
 	b := newFleet().
 		node("studio-a", api.DomainMapping{Name: "cameras", Configured: true}).
-		node("edge-01", api.DomainMapping{Name: "ingest", Configured: true}).
+		node("edge-01").
 		flow("studio-a", "cameras", api.FlowInventory{ID: "flow-1", Definition: flowDef, Producing: sourceProducing}).
 		flow("edge-01", "ingest", api.FlowInventory{ID: "flow-1", Definition: flowDef, Producing: destinationProducing}).
 		request("cam1", flowRequest("cam1")).
@@ -322,7 +500,7 @@ func TestDegradedAndFailedComeFromRestartRate(t *testing.T) {
 	withRestarts := func(n int) *Result {
 		b := newFleet().
 			node("studio-a", api.DomainMapping{Name: "cameras", Configured: true}).
-			node("edge-01", api.DomainMapping{Name: "ingest", Configured: true}).
+			node("edge-01").
 			flow("studio-a", "cameras", api.FlowInventory{ID: "flow-1", Definition: flowDef, Producing: true}).
 			flow("edge-01", "ingest", api.FlowInventory{ID: "flow-1", Definition: flowDef, Producing: true}).
 			request("cam1", flowRequest("cam1")).
@@ -355,7 +533,7 @@ func TestADormantSourceStartsNoWorkers(t *testing.T) {
 
 	fleet := newFleet().
 		node("studio-a", api.DomainMapping{Name: "cameras", Configured: true}).
-		node("edge-01", api.DomainMapping{Name: "ingest", Configured: true}).
+		node("edge-01").
 		flow("studio-a", "cameras", api.FlowInventory{ID: "flow-1", Definition: flowDef, Producing: false}).
 		request("cam1", flowRequest("cam1")).
 		build()
@@ -381,7 +559,7 @@ func TestIdleTeardownIsTwoTiered(t *testing.T) {
 	withIdle := func(idle time.Duration) *Result {
 		b := newFleet().
 			node("studio-a", api.DomainMapping{Name: "cameras", Configured: true}).
-			node("edge-01", api.DomainMapping{Name: "ingest", Configured: true}).
+			node("edge-01").
 			flow("studio-a", "cameras", api.FlowInventory{ID: "flow-1", Definition: flowDef, Producing: false}).
 			request("cam1", flowRequest("cam1")).
 			session(state.SessionRecord{ID: sessionID, Path: pathOf(fleet), FlowDefHash: state.FlowDefHash(flowDef), Fabric: "dc1", Interface: tcpInterface}).
@@ -425,7 +603,7 @@ func withTeardownDisabled(fleet *state.Fleet, sessionID string) *state.Fleet {
 
 	return newFleet().
 		node("studio-a", api.DomainMapping{Name: "cameras", Configured: true}).
-		node("edge-01", api.DomainMapping{Name: "ingest", Configured: true}).
+		node("edge-01").
 		flow("studio-a", "cameras", api.FlowInventory{ID: "flow-1", Definition: flowDef, Producing: false}).
 		request("cam1", spec).
 		session(state.SessionRecord{ID: sessionID, Path: pathOf(fleet), FlowDefHash: state.FlowDefHash(flowDef), Fabric: "dc1", Interface: tcpInterface}).
@@ -450,7 +628,7 @@ func TestAnAgentLosingItsLeaseWithdrawsNothing(t *testing.T) {
 
 	b := newFleet().
 		node("studio-a", api.DomainMapping{Name: "cameras", Configured: true}).
-		node("edge-01", api.DomainMapping{Name: "ingest", Configured: true}).
+		node("edge-01").
 		request("cam1", flowRequest("cam1")).
 		session(state.SessionRecord{ID: sessionID, Path: pathOf(fleet), FlowDefHash: state.FlowDefHash(flowDef), Fabric: "dc1", Interface: tcpInterface}).
 		assignments("studio-a", running).
@@ -485,7 +663,7 @@ func TestAGroupHintRequestDoesNotCollapseWhenItsSourceAgentIsGone(t *testing.T) 
 
 	b := newFleet().
 		node("studio-a", api.DomainMapping{Name: "cameras", Configured: true}).
-		node("edge-01", api.DomainMapping{Name: "ingest", Configured: true}).
+		node("edge-01").
 		request("cam1", spec).
 		session(state.SessionRecord{ID: sessionID, Path: pathOf(fleet), FlowDefHash: state.FlowDefHash(flowDef), Fabric: "dc1", Interface: tcpInterface}).
 		assignments("edge-01", api.AssignmentSet{Assignments: []api.Assignment{{SessionID: sessionID, Role: api.RoleTarget}}}).
@@ -512,7 +690,7 @@ func TestAMissingFlowWithBothAgentsLiveWithdrawsTheSession(t *testing.T) {
 
 	b := newFleet().
 		node("studio-a", api.DomainMapping{Name: "cameras", Configured: true}).
-		node("edge-01", api.DomainMapping{Name: "ingest", Configured: true}).
+		node("edge-01").
 		request("cam1", flowRequest("cam1")).
 		session(state.SessionRecord{ID: sessionID, Path: pathOf(fleet), FlowDefHash: state.FlowDefHash(flowDef), Fabric: "dc1", Interface: tcpInterface}).
 		assignments("edge-01", api.AssignmentSet{Assignments: []api.Assignment{{SessionID: sessionID, Role: api.RoleTarget}}})
@@ -536,7 +714,7 @@ func TestGroupHintExpansion(t *testing.T) {
 
 	fleet := newFleet().
 		node("studio-a", api.DomainMapping{Name: "cameras", Configured: true}).
-		node("edge-01", api.DomainMapping{Name: "ingest", Configured: true}).
+		node("edge-01").
 		flow("studio-a", "cameras", api.FlowInventory{
 			ID: "flow-video", Definition: flowDef, Producing: true,
 			GroupHint: &api.GroupHint{Name: "Studio A:Camera 1", Type: "video"},
@@ -663,7 +841,7 @@ func TestARepublishedFlowRebuildsTheSession(t *testing.T) {
 
 	changed := newFleet().
 		node("studio-a", api.DomainMapping{Name: "cameras", Configured: true}).
-		node("edge-01", api.DomainMapping{Name: "ingest", Configured: true}).
+		node("edge-01").
 		flow("studio-a", "cameras", api.FlowInventory{ID: "flow-1", Definition: flowDef2, Producing: true}).
 		request("cam1", flowRequest("cam1")).
 		session(state.SessionRecord{ID: oldID, Path: pathOf(fleet), FlowDefHash: state.FlowDefHash(flowDef), Fabric: "dc1", Interface: tcpInterface}).
@@ -726,13 +904,13 @@ func TestAnInvalidRequestStartsNothing(t *testing.T) {
 	t.Parallel()
 
 	spec := flowRequest("bad")
-	spec.Destination.Domain = "not-mapped"
+	spec.Destinations[0].Root = "bulk"
 
 	fleet := base().request("bad", spec).build()
 	result := Compute(fleet, Config{})
 
 	assert.Equal(t, api.StateInvalid, result.Requests["bad"].State)
-	assert.Equal(t, api.ReasonDomainNotMapped, result.Requests["bad"].ReasonCode)
+	assert.Equal(t, api.ReasonUnknownOutputRoot, result.Requests["bad"].ReasonCode)
 
 	require.Len(t, result.Requests["bad"].Paths, 1)
 	assert.Equal(t, api.StateInvalid, result.Requests["bad"].Paths[0].State)
@@ -782,7 +960,7 @@ func TestRequestStatusAggregatesOverItsPaths(t *testing.T) {
 
 	fleet := newFleet().
 		node("studio-a", api.DomainMapping{Name: "cameras", Configured: true}).
-		node("edge-01", api.DomainMapping{Name: "ingest", Configured: true}).
+		node("edge-01").
 		flow("studio-a", "cameras", api.FlowInventory{
 			ID: "flow-video", Definition: flowDef, Producing: true,
 			GroupHint: &api.GroupHint{Name: "Studio A:Camera 1", Type: "video"},
@@ -832,7 +1010,7 @@ func TestComputeIsDeterministic(t *testing.T) {
 
 	fleet := newFleet().
 		node("studio-a", api.DomainMapping{Name: "cameras", Configured: true}).
-		node("edge-01", api.DomainMapping{Name: "ingest", Configured: true}).
+		node("edge-01").
 		request("camera-1", spec).
 		request("cam1", flowRequest("cam1")).
 		build()
@@ -866,10 +1044,13 @@ func newFleetWithFlow(fleet *state.Fleet, id string) {
 
 // --- helpers -----------------------------------------------------------------------------
 
+// pathOf is the identity the base fleet's request expands onto. The root is the *resolved* one:
+// the request names none and edge-01 advertises exactly one, and it is the resolved value that
+// the identity and the session ID are derived from (§10.6).
 func pathOf(fleet *state.Fleet) state.PathIdentity {
 	return state.PathIdentity{
 		Source:      api.FlowAddress{Node: "studio-a", Domain: "cameras", Flow: "flow-1"},
-		Destination: api.Destination{Node: "edge-01", Domain: "ingest"},
+		Destination: api.Destination{Node: "edge-01", Domain: []string{"ingest"}, Root: "fast"},
 	}
 }
 

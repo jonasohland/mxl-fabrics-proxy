@@ -30,6 +30,42 @@ const (
 	PathRegister = AgentPrefix + "/register"
 )
 
+// HeaderOutcome reports what POST /v1/requests did, or would do under a dry run.
+//
+// A header rather than a body field, because it describes the *operation* and not the resource:
+// [Request] is what the request now is, and it is byte-identical whether the write happened or
+// was skipped as a no-op.
+//
+// The client cannot work this out for itself. The response echoes the spec that was sent, so
+// comparing the two says only that the server agreed — not whether anything changed. And the
+// status code cannot carry it either: skipping an unchanged write is still a 200, because the
+// request does exist and is as asked for.
+const HeaderOutcome = "X-Mxl-Outcome"
+
+// The values [HeaderOutcome] takes.
+const (
+	// OutcomeCreated: the request did not exist.
+	OutcomeCreated = "created"
+
+	// OutcomeUpdated: it existed and the spec differed, so it was rewritten.
+	OutcomeUpdated = "updated"
+
+	// OutcomeUnchanged: it existed with exactly this spec, and **nothing was written**
+	// (invariant 13). Distinguished from `updated` because a controller re-applying on every
+	// resync must be able to see that it is not churning the store, and because an operator
+	// re-running a file wants to see that nothing moved.
+	OutcomeUnchanged = "unchanged"
+)
+
+// QueryDryRun asks POST /v1/requests to validate, reconcile and report what *would* happen
+// without writing anything (plan M8d).
+//
+// Nearly free, because the accept path already builds a candidate fleet and reconciles it in
+// order to reject INVALID — the only difference is skipping the store write. It is what lets
+// `apply --dry-run` report real outcomes, including conflicts across requests, rather than
+// diffing specs and guessing.
+const QueryDryRun = "dry_run"
+
 // Query parameters on the assignment long poll (§9.2).
 const (
 	// QueryRevision is the agent's cursor. The server holds the request until the revision

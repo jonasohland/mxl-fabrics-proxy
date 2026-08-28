@@ -122,12 +122,17 @@ type Agent struct {
 	cfg Config
 	log *slog.Logger
 
-	// mu guards units, rejected and caps. reconcile is the only writer of units, and it runs on
-	// one goroutine, so this protects readers rather than serialising reconciles.
+	// mu guards units, rejected, outputs and caps. reconcile is the only writer of units, and it
+	// runs on one goroutine, so this protects readers rather than serialising reconciles.
 	mu       sync.Mutex
 	units    map[unitKey]*unit
 	rejected map[unitKey]string
 	caps     api.Capabilities
+
+	// outputs are the output domains currently materialised on this node, name → resolved path
+	// (§10.6). Derived from the target assignments on every reconcile rather than counted, so it
+	// cannot drift from the workers it exists for.
+	outputs map[string]string
 
 	// notify wakes the report loop. Capacity one and a non-blocking send: it is a "something
 	// changed" edge, and coalescing several into one report is the point.
@@ -231,6 +236,11 @@ func (a *Agent) Run(ctx context.Context) error {
 	if err := a.cfg.Inventory.CreateDomains(); err != nil {
 		return fmt.Errorf("agent: %w", err)
 	}
+	// Both at startup, so only the leaf MkdirAll for an output domain is ever on the
+	// establishment path (§6.1, §10.6).
+	if err := a.cfg.Inventory.CreateRoots(); err != nil {
+		return fmt.Errorf("agent: %w", err)
+	}
 
 	var observing sync.WaitGroup
 	observing.Go(func() {
@@ -264,6 +274,25 @@ type session struct {
 	heartbeat time.Duration
 }
 
+// outputRoots renders this node's configured roots for registration (§10.2, §10.6).
+//
+// Empty is the ordinary case and not an error: most nodes in a fleet are sources only, and a node
+// with no roots is simply not a replication destination. The server refuses any request aimed at
+// it with a reason that says so, which is the right place for that to surface — an operator
+// setting up a destination hears about it when they ask for one.
+func (a *Agent) outputRoots() []api.OutputRoot {
+	roots := a.cfg.Inventory.Roots()
+	if len(roots) == 0 {
+		return nil
+	}
+
+	out := make([]api.OutputRoot, 0, len(roots))
+	for _, root := range roots {
+		out = append(out, api.OutputRoot{Name: root.Name, Path: root.Path})
+	}
+	return out
+}
+
 // register loops until the server accepts this node, or ctx ends.
 //
 // Every attempt re-probes (§10.5): capabilities are static in the sense that they change only by
@@ -275,6 +304,13 @@ func (a *Agent) register(ctx context.Context) (session, bool) {
 	for ctx.Err() == nil {
 		capabilities, err := a.probe(ctx)
 		if err == nil {
+			// Output roots are not probed: they are static agent configuration, and the probe
+			// reports what the host offers rather than what the operator permits (§10.2, §10.6).
+			// They are added here so that every registration and re-registration advertises the
+			// current set, and so that what this node advertises is read off the same inventory
+			// its destination resolver answers from — one list, not two that agree today.
+			capabilities.OutputRoots = a.outputRoots()
+
 			var accepted *api.RegistrationResponse
 			accepted, err = a.cfg.Client.Register(ctx, api.NodeRegistration{
 				Node:         a.cfg.Node,

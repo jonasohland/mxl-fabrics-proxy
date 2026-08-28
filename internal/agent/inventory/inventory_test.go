@@ -212,7 +212,23 @@ func TestNewRejectsAmbiguousMappings(t *testing.T) {
 	assert.ErrorContains(t, err, "not absolute")
 
 	_, err = New(Options{Domains: []Domain{{Path: "/dev/shm/mxl0"}}})
-	assert.ErrorContains(t, err, "has no name")
+	assert.ErrorContains(t, err, "empty")
+
+	// **An input name takes the same rule as an output domain's elements.** Names are flat per
+	// node, so an input mapping and a rendered output domain share one namespace: `-m a/b=...`
+	// against `domain: a/b` would be two things with one address, and the server's collision check
+	// compares exactly those two strings (§10.6).
+	for _, name := range []string{"a/b", "with space", ".hidden", "-flag", "..", "ingést"} {
+		_, err := New(Options{Domains: []Domain{{Name: name, Path: "/dev/shm/mxl0"}}})
+		assert.Error(t, err, "input domain name %q should be refused", name)
+	}
+
+	// And the shapes an existing deployment actually uses still work — this tightens §16's
+	// byte-compatible `-m name=/path` promise without breaking the names it was made for.
+	for _, name := range []string{"mxl0", "cameras", "loopback-in", "studio_a", "a.b", "A1"} {
+		_, err := New(Options{Domains: []Domain{{Name: name, Path: "/dev/shm/mxl0"}}})
+		assert.NoError(t, err, "input domain name %q should be accepted", name)
+	}
 
 	_, err = New(Options{Domains: []Domain{{Name: "a", Path: "/x"}, {Name: "a", Path: "/y"}}})
 	assert.ErrorContains(t, err, "mapped twice")
@@ -442,7 +458,7 @@ func TestDiscoveredDomainsAreSourcesOnly(t *testing.T) {
 	assert.Equal(t, found, snapshot[0].Name, "a discovered domain is named by its path")
 
 	assert.False(t, h.Configured(found))
-	path, ok := h.Path(found)
+	path, ok := h.Input(found)
 	assert.True(t, ok, "a discovered domain still resolves, so it can be an initiator's source")
 	assert.Equal(t, found, path)
 
@@ -456,11 +472,11 @@ func TestDiscoveredDomainsAreSourcesOnly(t *testing.T) {
 func TestPathResolutionNeverInterpretsAName(t *testing.T) {
 	h := newHarness(t, Options{Domains: []Domain{{Name: "cameras", Path: t.TempDir()}}})
 
-	_, ok := h.Path("/etc")
+	_, ok := h.Input("/etc")
 	assert.False(t, ok)
-	_, ok = h.Path("../../etc")
+	_, ok = h.Input("../../etc")
 	assert.False(t, ok)
-	_, ok = h.Path("unmapped")
+	_, ok = h.Input("unmapped")
 	assert.False(t, ok)
 
 	assert.True(t, h.Configured("cameras"))

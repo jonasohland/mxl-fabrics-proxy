@@ -51,9 +51,55 @@ func (a *Agent) reconcile(ctx context.Context, set *api.AssignmentSet) {
 	a.mu.Unlock()
 
 	a.stopUndesired(running, desired)
+	a.materialise(desired)
 	a.startMissing(ctx, desired)
 
 	a.Notify()
+}
+
+// materialise makes the set of observed output domains match the target assignments (§10.6).
+//
+// This *is* the refcount, and it needs no counter: an output domain exists exactly while some
+// target spec names it, so the desired set of domains is a projection of the desired set of
+// workers. Two requests sharing a destination materialise it once; the first cancellation
+// changes nothing, because the other spec still names it; the second releases it.
+//
+// Between stopping and starting, deliberately. A domain must be watched before its worker
+// creates a flow in it, and released only once the last worker in it has gone.
+func (a *Agent) materialise(desired map[unitKey]worker.Spec) {
+	wanted := map[string]string{}
+	for _, spec := range desired {
+		if spec.IsTarget() {
+			wanted[spec.Domain] = spec.DomainPath
+		}
+	}
+
+	a.mu.Lock()
+	held := maps.Clone(a.outputs)
+	a.outputs = wanted
+	a.mu.Unlock()
+
+	for name, path := range held {
+		if wanted[name] == path {
+			continue
+		}
+		a.log.Info("releasing output domain", "domain", name, "path", path)
+		a.cfg.Inventory.Release(name, path)
+	}
+
+	for name, path := range wanted {
+		if held[name] == path {
+			continue
+		}
+		if err := a.cfg.Inventory.Materialise(name, path); err != nil {
+			// Logged rather than turned into a rejection: the worker's own MkdirAll fails on the
+			// same directory a moment later and reports it as a failed session with a reason,
+			// which is where an operator will look for it (§11).
+			a.log.Error("could not materialise an output domain", "domain", name, "path", path, "error", err)
+			continue
+		}
+		a.log.Info("materialised output domain", "domain", name, "path", path)
+	}
 }
 
 // stopUndesired stops every worker that is no longer wanted, or wanted with different material
@@ -133,20 +179,35 @@ func (a *Agent) stopAll() {
 // knows: where the named domain lives, which local address the negotiated fabric means, and
 // which service to bind.
 func (a *Agent) specFor(key unitKey, assignment api.Assignment) (worker.Spec, error) {
-	// A domain **name**, resolved by a strict map lookup over the domains this agent knows. It is
-	// never interpreted as a path: that is the single most important invariant in the design, and
-	// it is what stops the API being a remote arbitrary-filesystem-write primitive on every node
-	// in the fleet (§7.2, §13, invariant 6).
-	domainPath, ok := a.cfg.Inventory.Path(assignment.Domain)
-	if !ok {
-		return worker.Spec{}, fmt.Errorf("domain %q is not mapped on this node", assignment.Domain)
-	}
-
-	if assignment.Role == api.RoleTarget && !a.cfg.Inventory.Configured(assignment.Domain) {
-		// The server validates this and is the authority. Checking it again costs one map lookup,
-		// and it is the invariant above: an agent that trusted the control plane on it would be
-		// one compromised or buggy server away from creating flows anywhere a search path reaches.
-		return worker.Spec{}, fmt.Errorf("domain %q was discovered rather than configured, and a discovered domain is never a replication destination", assignment.Domain)
+	// A domain **name**, never a path. Which side of the split it is resolved through depends on
+	// the role, and the asymmetry is the sharpest property of the design (§10.6):
+	//
+	//   - An initiator's domain is an *input* one, looked up among the domains this agent
+	//     observes, because a source is by definition something the node already has.
+	//   - A target's is an *output* one, resolved from this agent's configured roots and the two
+	//     names in the assignment, with **no reference to observed state at all**. The
+	//     security-critical path is therefore a pure function of one config file and two names.
+	//
+	// The server validates both and is the authority. Checking again here is the one place in the
+	// tree where duplication earns its keep (§7.2, §13, invariant 6): an agent that trusted the
+	// control plane on it would be one compromised or buggy server away from creating flows
+	// wherever a root can reach.
+	var domainPath string
+	if assignment.Role == api.RoleTarget {
+		// Resolved from the *elements*, never by splitting [api.Assignment.Domain]. Nothing
+		// outside the CLI's manifest parser turns a domain string back into path elements, so
+		// the security-critical resolver only ever takes structure (§10.6).
+		resolved, err := a.cfg.Inventory.Output(assignment.Root, assignment.OutputDomain)
+		if err != nil {
+			return worker.Spec{}, err
+		}
+		domainPath = resolved
+	} else {
+		resolved, ok := a.cfg.Inventory.Input(assignment.Domain)
+		if !ok {
+			return worker.Spec{}, fmt.Errorf("domain %q is not mapped on this node", assignment.Domain)
+		}
+		domainPath = resolved
 	}
 
 	// The provider alone does not identify a local bind address: a node can hold two verbs

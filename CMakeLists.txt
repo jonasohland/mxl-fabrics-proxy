@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.24 FATAL_ERROR)
 
-project(mxl-fabrics-proxy VERSION 0.0.1)
+project(mxl-replicator VERSION 0.0.1)
 
 find_package(PkgConfig REQUIRED)
 find_package(mxl CONFIG REQUIRED COMPONENTS)

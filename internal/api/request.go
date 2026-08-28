@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"slices"
@@ -98,15 +99,71 @@ type Source struct {
 //
 // There is no selector here: a destination is a (node, domain) pair, and the flow keeps its
 // ID across the replication — the same flow ID existing on both nodes is the point (§3).
+//
+// A request carries a *list* of these (§9.1). That asymmetry with [Source] is deliberate: the
+// source side already has a selector and the destination side cannot have one, every path in a
+// fan-out shares a source and therefore a fate, and grouping several sources into one
+// destination is the arrangement that produces the two-producers-one-ring-buffer conflict §7.2
+// exists to reject.
 type Destination struct {
 	Node string `json:"node"`
 
-	// Domain must be a domain *name* the destination agent has explicitly mapped. A raw path
-	// is never accepted (§7.2): that invariant is what stops this API from being a remote
-	// arbitrary-filesystem-write primitive on every node in the fleet, and it holds regardless
-	// of what authentication is configured (§13).
-	Domain string `json:"domain"`
+	// Domain is the output domain to replicate into, created inside [Destination.Root] if it does
+	// not exist yet (§10.6).
+	//
+	// **A list of path elements, not a path.** `["studio-a","cam1"]` materialises
+	// `<root>/studio-a/cam1`. Each element must satisfy [ValidDomainName], and the whole must
+	// satisfy [ValidDomainElements].
+	//
+	// The element form is the invariant that stops this API being a remote
+	// arbitrary-filesystem-write primitive on every node in the fleet (§7.2, §13), and it holds
+	// regardless of what authentication is configured. Because no element can contain a separator
+	// or be `..`, joining them onto a root produces exactly `root + "/" + DomainPath(elements)` —
+	// an equality the agent checks on the whole path, with no prefix reasoning and no boundary
+	// case for a separator to hide in. A raw path is never accepted, and there is nothing here for
+	// one to be spelled as.
+	//
+	// A manifest writes it as `domain: studio-a/cam1` and the CLI splits it there. **Nothing else
+	// in the system ever parses a domain string** — see [ValidDomainElements].
+	//
+	// The domain needs no prior existence and has no lifecycle of its own. It is materialised by
+	// the first path that targets it and forgotten when the last one goes, on the refcount that
+	// already governs paths — so there is no create API, no delete API, and no "delete while
+	// referenced" conflict to resolve.
+	Domain []string `json:"domain"`
+
+	// Root names which of the destination node's advertised output roots the domain is created
+	// under (§10.6). Optional when the node advertises exactly one, which is the common case.
+	//
+	// A node with more than one and a request naming none is INVALID, listing the candidates,
+	// rather than being resolved by a guess. The cost is recorded rather than hidden: a request
+	// that worked becomes ambiguous the day its destination node grows a second root. Taken
+	// deliberately — the friendly case is overwhelmingly the common one, and the error carries
+	// its own fix.
+	Root string `json:"root,omitempty"`
+
+	// Provider overrides [RequestSpec.Provider] for this destination alone. Empty inherits it.
+	//
+	// This is the one per-destination override, and it exists because a provider is negotiated
+	// per session and therefore per (source, destination) pair (§10.3): with destinations on
+	// different nodes, one request-level pin can be right for one and *unsatisfiable* for
+	// another. IdleTeardown and SchedPrio stay request-level — they degrade, or are rejected
+	// with a reason naming the node, so splitting the request is the honest fix rather than an
+	// override that hides a node's missing capability.
+	//
+	// It overrides rather than intersects. Intersecting would make "verbs here, tcp there" a
+	// pin conflict instead of the perfectly ordinary request it is.
+	Provider ProviderPin `json:"provider,omitempty"`
 }
+
+// DomainName renders the domain as the single string everything downstream carries — the
+// assignment, the path and session identity, the `domain` metric label (§10.6).
+func (d Destination) DomainName() string { return DomainPath(d.Domain) }
+
+// Endpoint is the (node, domain) pair this destination names, which is what makes two
+// destinations the same destination. The root is not part of it: two entries naming one domain
+// under two roots are one name over two directories, which is exactly what must be rejected.
+func (d Destination) Endpoint() string { return d.Node + "/" + d.DomainName() }
 
 // RequestSpec is durable user intent: "replicate what this selector matches, from here to
 // there" (§3, §9.1).
@@ -125,8 +182,15 @@ type RequestSpec struct {
 	// mapping. Anything hand-rolling a POST has the same problem on retry.
 	Name string `json:"name"`
 
-	Source      Source      `json:"source"`
-	Destination Destination `json:"destination"`
+	Source Source `json:"source"`
+
+	// Destinations is where the source goes. One source, many destinations — see [Destination]
+	// for why the list is on this side and not the other.
+	//
+	// At least one is required. A request with three destinations and a selector matching two
+	// flows owns six paths, each with its own state, and the request's status aggregates over
+	// them (§11).
+	Destinations []Destination `json:"destinations"`
 
 	Provider ProviderPin `json:"provider,omitempty"`
 
@@ -150,16 +214,51 @@ type RequestSpec struct {
 	Labels map[string]string `json:"labels,omitempty"`
 }
 
+// SameAs reports whether two specs are the same intent.
+//
+// This is the definition of "unchanged" for an apply, and it lives here so that the server's
+// decision not to write (invariant 13) and the client's report of `unchanged` cannot disagree —
+// an apply that says "unchanged" while the server wrote, or the reverse, is worse than either
+// answer on its own.
+//
+// Compared as encoded JSON rather than with reflect.DeepEqual, because that is the form both
+// sides round-trip through and it collapses the distinctions the wire does not carry: a nil slice
+// and an empty one, a nil map and an empty one. A false negative is not a correctness bug, but it
+// is store churn, which is the whole thing being avoided.
+func (s RequestSpec) SameAs(other RequestSpec) bool {
+	left, err := json.Marshal(s)
+	if err != nil {
+		return false
+	}
+	right, err := json.Marshal(other)
+	if err != nil {
+		return false
+	}
+	return bytes.Equal(left, right)
+}
+
+// ProviderFor returns the pin that applies to one of this request's destinations: the
+// destination's own override when it has one, the request-level pin otherwise (§10.4).
+func (s RequestSpec) ProviderFor(dst Destination) ProviderPin {
+	if !dst.Provider.IsEmpty() {
+		return dst.Provider
+	}
+	return s.Provider
+}
+
 // maxNameLength bounds the idempotency key. 253 is the DNS-subdomain limit Kubernetes object
 // names use, which is the shape the adapter will hand us.
 const maxNameLength = 253
 
 // Validate checks a request body's structure.
 //
-// Structure only: whether the nodes exist, whether the destination domain is mapped, whether a
-// viable interface pair exists, whether this would form a loop — all of that is §7.2
-// validation on the server, because it needs registrations and inventory that this type cannot
-// see.
+// Structure only: whether the nodes exist, whether the destination node advertises the output
+// root, whether a viable interface pair exists, whether this would form a loop — all of that is
+// §7.2 validation on the server, because it needs registrations and inventory that this type
+// cannot see.
+//
+// The destination domain *name* is the one thing on that side checked here, because it is the
+// only one that needs nothing but the request body itself (§10.6).
 func (s RequestSpec) Validate() error {
 	switch {
 	case s.Name == "":
@@ -182,12 +281,50 @@ func (s RequestSpec) Validate() error {
 	if err := s.Source.Select.Validate(); err != nil {
 		return fmt.Errorf("source.select: %w", err)
 	}
-	if s.Destination.Node == "" {
-		return fmt.Errorf("destination.node is required")
+	if len(s.Destinations) == 0 {
+		return fmt.Errorf("at least one destination is required")
 	}
-	if s.Destination.Domain == "" {
-		return fmt.Errorf("destination.domain is required")
+
+	// Two entries naming one (node, domain) are the same path written twice. Deduplicating
+	// silently would hide a copy-paste error in a manifest, and the two entries can disagree
+	// about the root or the provider, at which point there is no answer to pick.
+	seen := make(map[string]int, len(s.Destinations))
+	for i, dst := range s.Destinations {
+		where := fmt.Sprintf("destinations[%d]", i)
+
+		if dst.Node == "" {
+			return fmt.Errorf("%s.node is required", where)
+		}
+		if len(dst.Domain) == 0 {
+			return fmt.Errorf("%s.domain is required", where)
+		}
+		// Structural, and checkable here because it needs no server state: a destination domain is
+		// a directory this API is asking a node to create, so the name rule is part of the request
+		// body rather than a property of the fleet (§10.6).
+		//
+		// The server checks it again during reconciliation and reports [ReasonMalformedDomainName]
+		// there. Not redundant: validate runs over *stored* requests on every reconcile, so a
+		// request written straight into the store, or stored before this rule existed, must still
+		// be refused legibly rather than reaching an agent as an assignment.
+		if err := ValidDomainElements(dst.Domain); err != nil {
+			return fmt.Errorf("%s.domain %q: %w", where, dst.DomainName(), err)
+		}
+		if dst.Root != "" {
+			if err := ValidDomainName(dst.Root); err != nil {
+				return fmt.Errorf("%s.root %q: %w", where, dst.Root, err)
+			}
+		}
+		if err := dst.Provider.Validate(); err != nil {
+			return fmt.Errorf("%s.%w", where, err)
+		}
+
+		if first, dup := seen[dst.Endpoint()]; dup {
+			return fmt.Errorf("%s and destinations[%d] both name %s; that is one destination written twice",
+				where, first, dst.Endpoint())
+		}
+		seen[dst.Endpoint()] = i
 	}
+
 	if err := s.Provider.Validate(); err != nil {
 		return err
 	}

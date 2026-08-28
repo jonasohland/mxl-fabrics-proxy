@@ -1,6 +1,9 @@
 VERSION := $(shell git describe --tags --dirty 2>/dev/null || echo unknown)
 GO_LDFLAGS := -X github.com/jonasohland/mxl-replicator/internal/version.Version=$(VERSION)
 
+# The legacy binaries are still built, because legacy/go stays in the tree until parity is
+# declared and it is the production implementation until then (§16). Drop `proxy-legacy` and
+# `reloader-legacy` from this list, and delete the tree, on the day parity is called.
 .PHONY: all
 all: cmake-configure cmake-build cmake-install tidy replicator proxy-legacy reloader-legacy
 
@@ -47,3 +50,21 @@ reloader-legacy:
 
 .PHONY: install
 install: cmake-install
+
+# Container images. `runtime` is what ships; `test` adds mxl-mock-src/mxl-mock-sink so the
+# end-to-end suite can run against the same binaries, and must not be published as :latest.
+IMAGE ?= jonasohland/mxl-replicator
+EFA_BASE ?= jonasohland/mxl:v1.1-rc1-fabrics-efa
+
+.PHONY: image
+image:
+	docker build --target runtime --build-arg VERSION=$(VERSION) -t $(IMAGE):latest .
+
+.PHONY: image-efa
+image-efa:
+	docker build --target runtime --build-arg VERSION=$(VERSION) \
+		--build-arg BASE_IMAGE=$(EFA_BASE) -t $(IMAGE):latest-efa .
+
+.PHONY: image-test
+image-test:
+	docker build --target test --build-arg VERSION=$(VERSION) -t $(IMAGE):test .

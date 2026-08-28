@@ -42,11 +42,16 @@ func TestUnknownFieldsAreIgnored(t *testing.T) {
 		require.NoError(t, json.Unmarshal([]byte(`{
 			"node": "edge-01",
 			"instance": "1e1d",
-			"capabilities": {"fabrics": [{"provider":"tcp","fabric":"dc1","address":"10.0.0.1","numa_node":0}]},
+			"capabilities": {
+				"fabrics": [{"provider":"tcp","fabric":"dc1","address":"10.0.0.1","numa_node":0}],
+				"output_roots": [{"name":"fast","path":"/dev/shm/mxl","capacity_bytes":0}]
+			},
 			"zone": "rack-3"
 		}`), &reg))
 		require.Len(t, reg.Capabilities.Fabrics, 1)
 		assert.Equal(t, "dc1", reg.Capabilities.Fabrics[0].Fabric)
+		require.Len(t, reg.Capabilities.OutputRoots, 1)
+		assert.Equal(t, "fast", reg.Capabilities.OutputRoots[0].Name)
 	})
 
 	t.Run("inventory", func(t *testing.T) {
@@ -109,6 +114,7 @@ func TestAssignmentRoleShapes(t *testing.T) {
 		SessionID: "s-1",
 		Role:      RoleTarget,
 		Domain:    "ingest",
+		Root:      "fast",
 		FlowDef:   json.RawMessage(`{"id":"abc"}`),
 		Interface: InterfaceConfig{Provider: ProviderVerbs, CapFlags: []CapFlag{CapRemoteWrite}},
 		Fabric:    "ib-fabric-a",
@@ -118,6 +124,9 @@ func TestAssignmentRoleShapes(t *testing.T) {
 	assert.NotContains(t, string(encoded), `"epoch"`)
 	assert.NotContains(t, string(encoded), `"target_info"`)
 	assert.Contains(t, string(encoded), `"fabric":"ib-fabric-a"`)
+	// The root is meaningful for a target only: it is where the output domain is materialised
+	// (§10.6), and an initiator's domain is an input one resolved through inventory instead.
+	assert.Contains(t, string(encoded), `"root":"fast"`)
 	assert.True(t, target.Role.IsTarget())
 
 	initiator := Assignment{
@@ -133,7 +142,34 @@ func TestAssignmentRoleShapes(t *testing.T) {
 	require.NoError(t, err)
 	assert.Contains(t, string(encoded), `"epoch"`)
 	assert.NotContains(t, string(encoded), `"flow_def"`)
+	assert.NotContains(t, string(encoded), `"root"`)
 	assert.False(t, initiator.Role.IsTarget())
+}
+
+// Version skew resolves in the safe direction (§13.1, §10.6). Servers upgrade first, so the case
+// is a new server's assignment reaching an old agent: the agent ignores the root it does not
+// know about, looks the domain up among its input mappings, does not find it, and reports a
+// failed session with a reason. Legible, and it fails closed — which is why this needs no
+// protocol bump.
+func TestAnOlderAgentIgnoresTheOutputRoot(t *testing.T) {
+	t.Parallel()
+
+	// What such an agent's decoder amounts to: the type as it was before Root existed.
+	var old struct {
+		SessionID string `json:"session_id"`
+		Role      Role   `json:"role"`
+		Domain    string `json:"domain"`
+	}
+	encoded, err := json.Marshal(Assignment{
+		SessionID: "s-1", Role: RoleTarget, Domain: "ingest", Root: "fast",
+	})
+	require.NoError(t, err)
+	require.NoError(t, json.Unmarshal(encoded, &old))
+
+	assert.Equal(t, "ingest", old.Domain)
+	// The name it is left holding is a plain domain name, not a path — so the worst it can do is
+	// fail to resolve it. Nothing about dropping the root can widen where it writes.
+	assert.NoError(t, ValidDomainName(old.Domain))
 }
 
 // Path embeds PathStatus, so a request's per-path summary and the full path view agree on

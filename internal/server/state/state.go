@@ -387,10 +387,19 @@ const idLength = 32
 // Note what is *not* in it — the flow definition. A path is "this flow, from here to there",
 // and it stays the same path when the producer republishes the flow with a different
 // definition. The session underneath it is what changes; see [SessionID].
+//
+// The **output root is in it**, which §3's "(src flow address) → (dst node, dst domain)" does
+// not say and is worth the sentence. It is always the *resolved* root by the time an identity is
+// built, so two requests spelling one destination differently — one naming the node's only root,
+// one omitting it — still produce one path. What it separates is two requests naming the same
+// domain under *different* roots, and separating them is the point: that is one name over two
+// directories, which is the flat-namespace violation, and a violation has to be two things
+// before it can be reported as a conflict between them (§10.6). Folded into one ID they would
+// instead silently share a path and take whichever root merged first.
 func (p PathIdentity) ID() string {
 	return hashID(pathIDTag,
 		p.Source.Node, p.Source.Domain, p.Source.Flow,
-		p.Destination.Node, p.Destination.Domain)
+		p.Destination.Node, p.Destination.DomainName(), p.Destination.Root)
 }
 
 // SessionID derives a session's stable identifier from the path it realises and the source flow
@@ -401,10 +410,14 @@ func (p PathIdentity) ID() string {
 // happens the destination's local flow is wrong in a way no amount of reconnecting fixes. Since
 // the ID changes, the old session is torn down and a new one is built, which is the only
 // correct outcome.
+// The output root is in it for the same reason it is in [PathIdentity.ID], plus a stronger one:
+// a session's target worker writes into a directory derived from it, so a session that changed
+// root while keeping its ID would be one worker's flow moving house underneath a running
+// initiator (§10.6).
 func SessionID(path PathIdentity, flowDefHash string) string {
 	return hashID(sessionIDTag,
 		path.Source.Node, path.Source.Domain, path.Source.Flow,
-		path.Destination.Node, path.Destination.Domain,
+		path.Destination.Node, path.Destination.DomainName(), path.Destination.Root,
 		flowDefHash)
 }
 

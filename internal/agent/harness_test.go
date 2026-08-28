@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -256,10 +257,16 @@ type harness struct {
 	t        *testing.T
 	server   *server
 	launcher *fake.Launcher
-	domain   string
-	stopped  chan struct{}
-	cancel   context.CancelFunc
-	once     sync.Once
+
+	// domain is the configured *input* domain: a source. outputDomain is where a target
+	// assignment from targetAssignment materialises, which is a directory that does not exist
+	// until one is accepted (§10.6).
+	domain       string
+	root         string
+	outputDomain string
+	stopped      chan struct{}
+	cancel       context.CancelFunc
+	once         sync.Once
 }
 
 type harnessOptions struct {
@@ -273,6 +280,10 @@ type harnessOptions struct {
 	// searchPaths adds a discovered-domain root alongside the configured domain.
 	searchPaths []string
 
+	// outputRoots are the directories replication may create domains under (§10.6). Empty, as in
+	// most of these tests, means a node that is not a replication destination.
+	outputRoots []inventory.Root
+
 	// tweak adjusts the agent config before it is built.
 	tweak func(*Config)
 }
@@ -282,10 +293,19 @@ func newHarness(t *testing.T, opts harnessOptions) *harness {
 
 	srv := newServer(t)
 	domain := t.TempDir()
+	root := t.TempDir()
+
+	if opts.outputRoots == nil {
+		// Most of these tests assign a target, and after §10.6 a target's domain is a name
+		// materialised under a root. One root means a destination can be spelled without naming
+		// it, which is the common deployment as well as the short spelling.
+		opts.outputRoots = []inventory.Root{{Name: "fast", Path: root}}
+	}
 
 	inv, err := inventory.New(inventory.Options{
 		Domains:     []inventory.Domain{{Name: "cameras", Path: domain}},
 		SearchPaths: opts.searchPaths,
+		OutputRoots: opts.outputRoots,
 		Interval:    5 * time.Millisecond,
 		IdleAfter:   50 * time.Millisecond,
 		Logger:      discard(),
@@ -342,12 +362,14 @@ func newHarness(t *testing.T, opts harnessOptions) *harness {
 	require.NoError(t, err)
 
 	h := &harness{
-		Agent:    ag,
-		t:        t,
-		server:   srv,
-		launcher: launcher,
-		domain:   domain,
-		stopped:  make(chan struct{}),
+		Agent:        ag,
+		t:            t,
+		server:       srv,
+		launcher:     launcher,
+		domain:       domain,
+		root:         root,
+		outputDomain: filepath.Join(root, "ingest"),
+		stopped:      make(chan struct{}),
 	}
 	return h
 }
@@ -408,14 +430,21 @@ func (h *harness) consistently(what string, d time.Duration, cond func() bool) {
 }
 
 // targetAssignment is the destination end of a session (§5.3 step 2).
+// targetAssignment is the destination end. Its domain is an *output* one — a name the agent
+// creates inside the "fast" root — which is what makes it a destination at all (§10.6).
 func targetAssignment(sessionID string) api.Assignment {
 	return api.Assignment{
 		SessionID: sessionID,
 		Role:      api.RoleTarget,
-		Domain:    "cameras",
-		FlowID:    "5592a23b-0974-45bb-9388-89ea81c42537",
-		FlowDef:   json.RawMessage(`{"id":"5592a23b-0974-45bb-9388-89ea81c42537","format":"urn:x-nmos:format:video"}`),
-		Fabric:    "dc1",
+		Domain:    "ingest",
+		// The elements the agent resolves from. Domain is the rendered name — what it logs and
+		// labels metrics with — and OutputDomain is what the resolver takes, so that nothing
+		// outside the CLI's manifest parser turns a domain string back into path elements (§10.6).
+		OutputDomain: []string{"ingest"},
+		Root:         "fast",
+		FlowID:       "5592a23b-0974-45bb-9388-89ea81c42537",
+		FlowDef:      json.RawMessage(`{"id":"5592a23b-0974-45bb-9388-89ea81c42537","format":"urn:x-nmos:format:video"}`),
+		Fabric:       "dc1",
 		Interface: api.InterfaceConfig{
 			Provider:       api.ProviderTCP,
 			CapFlags:       []api.CapFlag{api.CapRemoteWrite},

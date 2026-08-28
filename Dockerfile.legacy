@@ -16,7 +16,7 @@ RUN apt-get update && \
 RUN curl -LO https://go.dev/dl/go1.26.1.linux-amd64.tar.gz && \
     tar -C /usr/local -xzf go1.26.1.linux-amd64.tar.gz
 
-WORKDIR /build/mxl-fabrics-proxy
+WORKDIR /build/mxl-replicator
 
 # The legacy Go tree is its own module, rooted at legacy/go and carrying its own
 # go.mod/go.sum. The root module (mxl-replicator) is not needed for this image.

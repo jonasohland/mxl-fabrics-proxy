@@ -178,6 +178,44 @@ type Capabilities struct {
 	// the agent allocates and reports what it actually bound (§7.4), and the server is
 	// deliberately kept out of a job it cannot verify.
 	PortRange string `json:"port_range,omitempty"`
+
+	// OutputRoots are the directories this node permits replication to create domains under
+	// (§10.6). Empty means this node is not a replication destination at all, which is the
+	// default and the right posture for the one piece of configuration that grants the control
+	// plane write authority over a host's filesystem.
+	//
+	// A capability by the sharp test (§10.2): without it the server would accept a request whose
+	// destination cannot be materialised, and it is what the destination resolver's error message
+	// is built from.
+	OutputRoots []OutputRoot `json:"output_roots,omitempty"`
+}
+
+// OutputRoot is one directory an operator has designated as a place output domains may be
+// created (§10.6).
+//
+// Roots rather than output domains, which is the same shape as fabric attachments and for the
+// same reason: a node declares what it *has*, and a request names what it *wants* inside that.
+// An output domain has no meaning without a session behind it, so modelling it as durable node
+// configuration would mean provisioning every destination twice — once on the node, once in the
+// request — and would put a piece of high-level intent in the one place that cannot see it.
+type OutputRoot struct {
+	// Name is how a request names the root. It never becomes part of a path: the agent looks it
+	// up among the roots it advertises and joins the domain name onto the path it finds.
+	Name string `json:"name"`
+
+	// Path is the local directory. Diagnostics only — the server never sends a path to an agent,
+	// exactly as with [DomainMapping.Path].
+	Path string `json:"path,omitempty"`
+}
+
+// FindRoot returns the advertised output root of that name, or nil.
+func (c Capabilities) FindRoot(name string) *OutputRoot {
+	for i := range c.OutputRoots {
+		if c.OutputRoots[i].Name == name {
+			return &c.OutputRoots[i]
+		}
+	}
+	return nil
 }
 
 // FindFabric returns the attachment for a (provider, fabric) pair, or nil.
@@ -190,7 +228,13 @@ func (c Capabilities) FindFabric(provider Provider, fabric string) *FabricAttach
 	return nil
 }
 
-// DomainMapping is one MXL domain the agent knows about (§6.2).
+// DomainMapping is one **input** MXL domain the agent knows about: somewhere this node reads
+// from, and a replication source (§6.2, §10.6).
+//
+// Destinations are not here and never were a kind of mapping. An output domain is named by a
+// request and materialised under an [OutputRoot]; the two roles are separate mechanisms because
+// they sit in different layers — an input domain is observed state, something the node *has*,
+// while an output domain is derived state, something a request *asks for* (§4, §10.6).
 type DomainMapping struct {
 	// Name is how the domain is addressed fleet-wide. Paths are agent-local and are never
 	// accepted from the API (§7.2).
@@ -200,13 +244,16 @@ type DomainMapping struct {
 	// to an agent, it sends the name and the agent resolves it.
 	Path string `json:"path,omitempty"`
 
-	// Configured distinguishes an explicitly mapped domain from one found by a search path.
-	// Only a configured domain may be a replication *destination* (§7.2, §13); a discovered
-	// domain can be a source.
+	// Configured distinguishes an explicitly mapped input domain from one found by a search
+	// path. It is **descriptive**, and nothing keys authority off it.
 	//
-	// Note the direction of the default: an older or buggy agent that omits this field reports
-	// false, and false means "not usable as a destination". The security-critical invariant
-	// fails closed.
+	// It used to be the security bit: before output roots existed, a destination was an input
+	// mapping and this field was what separated one from a directory that merely happened to be
+	// discovered (§7.2, §13). That is no longer how a destination is authorised — the resolver
+	// consults no observed state at all now, only the node's configured roots and the two names
+	// in the assignment (§10.6) — and this field is left as what it always literally said: where
+	// this domain came from. It is what `GET /v1/nodes/{node}/domains` renders, and it is why a
+	// discovered domain is absent from registration but present in inventory.
 	Configured bool `json:"configured"`
 }
 

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"net/http"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -19,7 +20,7 @@ import (
 )
 
 // pair is the fleet most of these tests want: a control plane, a source node with a producing
-// flow in "cameras", and a destination node with "ingest" mapped.
+// flow in "cameras", and a destination node whose output root "ingest" is materialised under.
 type pair struct {
 	*fleet
 
@@ -33,7 +34,7 @@ func newPair(t *testing.T, opts fleetOptions) *pair {
 	f := newFleet(t, opts)
 	p := &pair{fleet: f}
 	p.src = f.addNode("studio-a", nodeOptions{domains: []string{"cameras"}})
-	p.dst = f.addNode("edge-01", nodeOptions{domains: []string{"ingest"}})
+	p.dst = f.addNode("edge-01", nodeOptions{})
 
 	p.flow = p.src.createFlow("cameras", videoFlowDef("Studio A:Camera 1", "video"))
 	p.flow.produce()
@@ -45,9 +46,9 @@ func (p *pair) replicate(name string) api.Request {
 	p.t.Helper()
 
 	return p.request(api.RequestSpec{
-		Name:        name,
-		Source:      api.Source{Node: "studio-a", Domain: "cameras", Select: api.Selector{Flow: p.flow.ID()}},
-		Destination: api.Destination{Node: "edge-01", Domain: "ingest"},
+		Name:         name,
+		Source:       api.Source{Node: "studio-a", Domain: "cameras", Select: api.Selector{Flow: p.flow.ID()}},
+		Destinations: []api.Destination{{Node: "edge-01", Domain: []string{"ingest"}}},
 	})
 }
 
@@ -112,7 +113,9 @@ func TestFullPathFromDiscoveryToRunningSession(t *testing.T) {
 	})
 	path := p.onlyPath()
 	assert.Equal(t, api.FlowAddress{Node: "studio-a", Domain: "cameras", Flow: p.flow.ID()}, path.Source)
-	assert.Equal(t, api.Destination{Node: "edge-01", Domain: "ingest"}, path.Destination)
+	// The *resolved* root, not the one the request spelled: it names none and edge-01 advertises
+	// exactly one (§10.6).
+	assert.Equal(t, api.Destination{Node: "edge-01", Domain: []string{"ingest"}, Root: "fast"}, path.Destination)
 	assert.Equal(t, []string{request.ID}, path.Requests)
 
 	sessionID := p.established()
@@ -138,7 +141,8 @@ func TestFullPathFromDiscoveryToRunningSession(t *testing.T) {
 
 	target := p.dst.worker(sessionID, api.RoleTarget).Spec()
 	initiator := p.src.worker(sessionID, api.RoleInitiator).Spec()
-	assert.Equal(t, p.dst.path("ingest"), target.DomainPath, "the domain name resolved to the destination's own path")
+	assert.Equal(t, p.dst.path("ingest"), target.DomainPath,
+		"the destination domain resolved under this node's output root, not through anything it observes")
 	assert.Equal(t, p.src.path("cameras"), initiator.DomainPath)
 	assert.Equal(t, p.flow.ID(), target.FlowID)
 	assert.Equal(t, target.Interface, initiator.Interface, "both ends run the negotiated config")
@@ -500,14 +504,14 @@ func respaced(body []byte) []byte {
 func TestAGroupHintRequestFollowsTheFlowsThatMatchIt(t *testing.T) {
 	f := newFleet(t, fleetOptions{})
 	src := f.addNode("studio-a", nodeOptions{domains: []string{"cameras"}})
-	f.addNode("edge-01", nodeOptions{domains: []string{"ingest"}})
+	f.addNode("edge-01", nodeOptions{})
 
 	request := f.request(api.RequestSpec{
 		Name: "camera-1",
 		Source: api.Source{Node: "studio-a", Domain: "cameras", Select: api.Selector{
 			GroupHint: &api.GroupHintSelector{Name: "Studio A:Camera 1"},
 		}},
-		Destination: api.Destination{Node: "edge-01", Domain: "ingest"},
+		Destinations: []api.Destination{{Node: "edge-01", Domain: []string{"ingest"}}},
 	})
 
 	// Matching nothing is WAITING, and costs nothing.
@@ -579,7 +583,6 @@ func TestThePathStateFollowsTheFlows(t *testing.T) {
 	f := newFleet(t, fleetOptions{})
 	src := f.addNode("studio-a", nodeOptions{domains: []string{"cameras"}})
 	dst := f.addNode("edge-01", nodeOptions{
-		domains: []string{"ingest"},
 		// The blob is held below to hold the path in ESTABLISHING; the agent must not give up on
 		// the target while the test is looking at it.
 		tweak: func(cfg *agent.Config) { cfg.TargetInfoTimeout = time.Minute },
@@ -587,9 +590,9 @@ func TestThePathStateFollowsTheFlows(t *testing.T) {
 
 	def := videoFlowDef("Studio A:Camera 1", "video")
 	f.request(api.RequestSpec{
-		Name:        "cam1",
-		Source:      api.Source{Node: "studio-a", Domain: "cameras", Select: api.Selector{Flow: def.ID}},
-		Destination: api.Destination{Node: "edge-01", Domain: "ingest"},
+		Name:         "cam1",
+		Source:       api.Source{Node: "studio-a", Domain: "cameras", Select: api.Selector{Flow: def.ID}},
+		Destinations: []api.Destination{{Node: "edge-01", Domain: []string{"ingest"}}},
 	})
 
 	// WAITING: the flow does not exist yet.
@@ -640,6 +643,11 @@ func TestThePathStateFollowsTheFlows(t *testing.T) {
 	// ACTIVE: the destination flow starts advancing. Same mechanism as a producing source —
 	// liveness is head-index movement wherever it is observed, which is what lets one rule serve
 	// both admission and the ACTIVE/PAUSED split.
+	//
+	// This is also the assertion that catches a missing AddDomain on the materialised output
+	// domain (§10.6): the destination domain was created by this request, and if the agent were
+	// not observing it the path could never leave ESTABLISHING — which is a much more confusing
+	// failure than this one.
 	destination := dst.createFlow("ingest", def)
 	destination.produce()
 
@@ -657,6 +665,141 @@ func TestThePathStateFollowsTheFlows(t *testing.T) {
 	})
 	assert.True(t, dst.worker(sessionID, api.RoleTarget).Running(), "PAUSED is a steady state, not a teardown")
 	assert.True(t, src.worker(sessionID, api.RoleInitiator).Running())
+}
+
+// --- 7b. output domains: materialisation, refcounting and chains -------------------------------
+
+// An output domain is created by the first path that targets it and forgotten when the last one
+// goes, on the refcount that already governs paths — so it needs no lifecycle of its own, no
+// create API and no delete API (§10.6).
+//
+// What is actually asserted is the *watch set*, because that is the step that gets left out:
+// §11 derives ACTIVE from the destination flow as reported by the destination agent's own
+// inventory, so a domain this project writes into but does not observe can never leave
+// ESTABLISHING. A flow in the materialised domain reaching the fleet view is that wiring working.
+func TestAnOutputDomainIsRefcountedAcrossRequests(t *testing.T) {
+	f := newFleet(t, fleetOptions{})
+	src := f.addNode("studio-a", nodeOptions{domains: []string{"cameras"}})
+	dst := f.addNode("edge-01", nodeOptions{})
+
+	first := src.createFlow("cameras", videoFlowDef("Studio A:Camera 1", "video"))
+	first.produce()
+	second := src.createFlow("cameras", videoFlowDef("Studio A:Camera 2", "video"))
+	second.produce()
+
+	// Nothing has asked for it yet, so it does not exist. A destination is not provisioned on the
+	// node; it is named by a request.
+	require.NoDirExists(t, dst.path("ingest"))
+
+	replicate := func(name, flowID string) api.Request {
+		return f.request(api.RequestSpec{
+			Name:         name,
+			Source:       api.Source{Node: "studio-a", Domain: "cameras", Select: api.Selector{Flow: flowID}},
+			Destinations: []api.Destination{{Node: "edge-01", Domain: []string{"ingest"}}},
+		})
+	}
+	one := replicate("cam1", first.ID())
+	two := replicate("cam2", second.ID())
+
+	f.eventually("both paths to have a session", func() bool {
+		paths := f.paths().Paths
+		return len(paths) == 2 && paths[0].Session != nil && paths[1].Session != nil
+	})
+
+	// Two paths, one directory: the same name under the same root is the same domain, and the
+	// refcount is simply that two target specs still name it.
+	f.eventually("the destination domain to be materialised", func() bool {
+		info, err := os.Stat(dst.path("ingest"))
+		return err == nil && info.IsDir()
+	})
+
+	// A flow in it, which is what the target worker would have created. It reaches the fleet view
+	// only because the destination agent added the materialised domain to its own watch set.
+	delivered := dst.createFlow("ingest", videoFlowDef("Edge Ingest", "video"))
+	delivered.produce()
+
+	observed := func() bool {
+		for _, flow := range f.flows().Flows {
+			if flow.ID == delivered.ID() && flow.Node == "edge-01" && flow.Domain == "ingest" {
+				return true
+			}
+		}
+		return false
+	}
+	f.eventually("the destination domain to be observed", observed)
+
+	// The first cancellation changes nothing: the other request still names the domain.
+	f.cancel(one.ID)
+	f.eventually("one path to remain", func() bool { return len(f.paths().Paths) == 1 })
+	assert.True(t, observed(), "a domain another path still targets must stay observed")
+
+	// The last one releases it. The directory stays — the SDK removes a flow directory when its
+	// writer is released, so what is left is empty and invisible to discovery — but this node
+	// stops observing it, so it leaves the fleet view.
+	f.cancel(two.ID)
+	f.eventually("the domain to be released once nothing targets it", func() bool { return !observed() })
+	assert.DirExists(t, dst.path("ingest"), "releasing stops observation; it does not delete media directories")
+}
+
+// A→B→C works with no extra design: the middle node's domain is materialised by the first
+// request, which puts it in that agent's watch set, which is what makes it visible as a source for
+// the second — and it exists exactly as long as the first hop does, which is the correct
+// dependency (§10.6).
+func TestAChainUsesAMaterialisedDomainAsItsSource(t *testing.T) {
+	f := newFleet(t, fleetOptions{})
+	a := f.addNode("studio-a", nodeOptions{domains: []string{"cameras"}})
+	b := f.addNode("edge-01", nodeOptions{})
+	f.addNode("edge-02", nodeOptions{})
+
+	flow := a.createFlow("cameras", videoFlowDef("Studio A:Camera 1", "video"))
+	flow.produce()
+
+	f.request(api.RequestSpec{
+		Name:         "a-to-b",
+		Source:       api.Source{Node: "studio-a", Domain: "cameras", Select: api.Selector{Flow: flow.ID()}},
+		Destinations: []api.Destination{{Node: "edge-01", Domain: []string{"mid"}}},
+	})
+	f.eventually("the first hop to establish", func() bool {
+		paths := f.paths().Paths
+		return len(paths) == 1 && paths[0].Session != nil
+	})
+
+	// The middle node's domain exists only because the first request asked for it. The flow in it
+	// is what B's target worker would have created from the definition it was assigned.
+	f.eventually("the middle node's domain to be materialised", func() bool {
+		info, err := os.Stat(b.path("mid"))
+		return err == nil && info.IsDir()
+	})
+	middle := createFlowAt(t, b.path("mid"), videoFlowDef("Studio A:Camera 1", "video"))
+	middle.produce()
+
+	f.eventually("the materialised domain to be a visible source", func() bool {
+		for _, entry := range f.flows().Flows {
+			if entry.ID == middle.ID() && entry.Node == "edge-01" && entry.Domain == "mid" {
+				return entry.Producing
+			}
+		}
+		return false
+	})
+
+	f.request(api.RequestSpec{
+		Name:         "b-to-c",
+		Source:       api.Source{Node: "edge-01", Domain: "mid", Select: api.Selector{Flow: middle.ID()}},
+		Destinations: []api.Destination{{Node: "edge-02", Domain: []string{"ingest"}}},
+	})
+
+	f.eventually("the second hop to establish from the materialised domain", func() bool {
+		paths := f.paths().Paths
+		if len(paths) != 2 {
+			return false
+		}
+		for _, path := range paths {
+			if path.Source.Node == "edge-01" && path.Source.Domain == "mid" {
+				return path.Session != nil && path.Session.Epoch != ""
+			}
+		}
+		return false
+	})
 }
 
 // --- 8. two agents, one node name ----------------------------------------------------------------
@@ -677,7 +820,7 @@ func TestASecondClaimantIsRejectedAndTheHolderIsUndisturbed(t *testing.T) {
 	starts := p.dst.starts()
 
 	// A second agent for edge-01: a copy-pasted config, or an overlapping rollout.
-	impostor := p.addNode("edge-01", nodeOptions{domains: []string{"ingest"}, contested: true})
+	impostor := p.addNode("edge-01", nodeOptions{contested: true})
 
 	p.consistently("the impostor to start nothing", func() bool {
 		return impostor.starts() == 0
@@ -753,7 +896,7 @@ func TestADiscoveredDomainIsASourceAndNeverADestination(t *testing.T) {
 
 	root := searchRoot(t)
 	src := f.addNode("studio-a", nodeOptions{domains: []string{"cameras"}, searchPaths: []string{root}})
-	f.addNode("edge-01", nodeOptions{domains: []string{"ingest"}, searchPaths: []string{root}})
+	f.addNode("edge-01", nodeOptions{searchPaths: []string{root}})
 
 	// A producer creates a domain nobody configured. It is named by its path, which is the one
 	// string certain to be unique on the node — and not a path the API can use, because
@@ -771,25 +914,29 @@ func TestADiscoveredDomainIsASourceAndNeverADestination(t *testing.T) {
 		return false
 	})
 
-	// As a destination it is refused, and INVALID rather than WAITING: it needs a user to change
-	// the node's configuration and will never come good on its own.
+	// As a destination it is refused. A discovered domain is *named by its path*, and a path is
+	// not a domain name at all, so it never reaches the question of whether that domain exists on
+	// the destination node — it is refused structurally (§10.6). Stricter than the check this
+	// replaced, and refused at the API boundary rather than stored as INVALID, which is the
+	// better place for it: nothing is persisted and no reconcile ever sees it.
 	refused := f.do(http.MethodPost, api.PathRequests, api.RequestSpec{
-		Name:        "write-anywhere",
-		Source:      api.Source{Node: "studio-a", Domain: found, Select: api.Selector{Flow: flow.ID()}},
-		Destination: api.Destination{Node: "edge-01", Domain: found},
+		Name:         "write-anywhere",
+		Source:       api.Source{Node: "studio-a", Domain: found, Select: api.Selector{Flow: flow.ID()}},
+		Destinations: []api.Destination{{Node: "edge-01", Domain: []string{found}}},
 	})
 	require.Equal(t, http.StatusBadRequest, refused.status, "body: %s", refused.body)
 
 	var refusal api.Error
 	refused.decode(t, &refusal)
-	assert.Equal(t, string(api.ReasonDomainNotMapped), refusal.Details["reason_code"])
+	assert.Equal(t, api.CodeInvalidRequest, refusal.Code)
+	assert.Contains(t, refusal.Message, "destinations[0].domain")
 	assert.Zero(t, src.starts(), "and nothing may be started for it")
 
 	// The same domain as a *source* is fine, and replicates into a mapped destination.
 	f.request(api.RequestSpec{
-		Name:        "adhoc-in",
-		Source:      api.Source{Node: "studio-a", Domain: found, Select: api.Selector{Flow: flow.ID()}},
-		Destination: api.Destination{Node: "edge-01", Domain: "ingest"},
+		Name:         "adhoc-in",
+		Source:       api.Source{Node: "studio-a", Domain: found, Select: api.Selector{Flow: flow.ID()}},
+		Destinations: []api.Destination{{Node: "edge-01", Domain: []string{"ingest"}}},
 	})
 	f.eventually("a session from the discovered domain", func() bool {
 		paths := f.paths().Paths
@@ -811,7 +958,6 @@ func TestNoSharedFabricIsRefusedAtTheRequest(t *testing.T) {
 
 	src := f.addNode("studio-a", nodeOptions{domains: []string{"cameras"}})
 	f.addNode("edge-01", nodeOptions{
-		domains: []string{"ingest"},
 		capabilities: &api.Capabilities{Fabrics: []api.FabricAttachment{{
 			Provider: api.ProviderTCP,
 			Fabric:   "somewhere-else",
@@ -833,9 +979,9 @@ func TestNoSharedFabricIsRefusedAtTheRequest(t *testing.T) {
 	})
 
 	refused := f.do(http.MethodPost, api.PathRequests, api.RequestSpec{
-		Name:        "across-fabrics",
-		Source:      api.Source{Node: "studio-a", Domain: "cameras", Select: api.Selector{Flow: flow.ID()}},
-		Destination: api.Destination{Node: "edge-01", Domain: "ingest"},
+		Name:         "across-fabrics",
+		Source:       api.Source{Node: "studio-a", Domain: "cameras", Select: api.Selector{Flow: flow.ID()}},
+		Destinations: []api.Destination{{Node: "edge-01", Domain: []string{"ingest"}}},
 	})
 	require.Equal(t, http.StatusBadRequest, refused.status, "body: %s", refused.body)
 

@@ -42,17 +42,23 @@ type AgentOptions struct {
 	Server []string  `help:"URL of the mxl-replicator server. Repeatable for an HA deployment." env:"MXL_REPLICATOR_SERVER"`
 	Auth   AuthFlags `embed:""`
 
-	// Kept byte-compatible with the legacy proxy's flag syntax and `domains:` YAML block,
-	// so the mapping config carries over unchanged (§16).
-	//
-	// A destination domain must be a name that appears here. A raw path is never accepted
-	// from the API — that invariant is what stops the API from being a remote
-	// arbitrary-filesystem-write primitive on every node in the fleet (§7.2, §13).
-	Domains map[string]string `help:"Map a domain name to a local path, e.g. -m cameras=/dev/shm/mxl0. Repeatable." short:"m" name:"map-domain"`
+	// **Input** domains only (§10.6). Kept byte-compatible with the legacy proxy's flag syntax
+	// and `domains:` YAML block, so the mapping config carries over unchanged (§16) — but a
+	// legacy mapping that a subscription used as a *destination* is no longer usable as one, and
+	// becomes a domain name under an output root instead.
+	Domains map[string]string `help:"Map an input domain name to a local path, e.g. -m cameras=/dev/shm/mxl0. Repeatable. Input only: replication destinations are named under an --output-root." short:"m" name:"map-domain"`
 
-	// Optional auto-discovery of unconfigured domains. Discovered domains are reportable as
-	// sources but are never usable as replication destinations, for the reason above.
-	SearchPath []string `help:"Recursively search these paths for MXL domains. Discovered domains can be replication sources but never destinations." name:"search-path"`
+	// Optional auto-discovery of unconfigured input domains. Nothing discovered is ever written
+	// to: this project only writes inside an output root.
+	SearchPath []string `help:"Recursively search these paths for MXL domains. Discovered domains are replication sources; nothing discovered is ever written to." name:"search-path"`
+
+	// The write side, and the whole of the authority the API has over this node's filesystem
+	// (§10.6, §13). No default: a node with none configured is not a replication destination,
+	// which is the right posture for an opt-in that grants the control plane write access.
+	//
+	// A map rather than a repeatable `name=path` list so that a name declared twice is a
+	// configuration error the flag parser catches rather than one this has to detect.
+	OutputRoots map[string]string `help:"Permit replication to create domains under this directory, e.g. --output-root fast=/dev/shm/mxl. Repeatable. Without one this node cannot be a replication destination." name:"output-root"`
 
 	// What this node can be reached on (§10.1). Repeatable, and *added* to any `fabrics:` block
 	// in a configuration file rather than replacing it, so a file describing the hardware can be
@@ -121,6 +127,13 @@ func (c *AgentOptions) resolve() error {
 	maps.Copy(domains, c.Domains)
 	c.Domains = domains
 
+	roots := map[string]string{}
+	for _, root := range loaded.OutputRoots {
+		roots[root.Name] = root.Path
+	}
+	maps.Copy(roots, c.OutputRoots)
+	c.OutputRoots = roots
+
 	c.fabrics = slices.Clone(loaded.Fabrics)
 	for _, raw := range c.Fabric {
 		attachment, err := config.ParseFabric(raw)
@@ -168,12 +181,24 @@ func (c *AgentOptions) Validate() error {
 	}
 
 	for name, path := range c.Domains {
-		if name == "" {
-			return fmt.Errorf("--map-domain: empty domain name for path %q", path)
+		// An input domain name shares a namespace with every output domain on this node, so it
+		// takes the same rule (§10.6). Refused here so the message names the flag.
+		if err := api.ValidDomainName(name); err != nil {
+			return fmt.Errorf("--map-domain: name %q: %w", name, err)
 		}
 		if !filepath.IsAbs(path) {
 			return fmt.Errorf("--map-domain %s: path %q must be absolute", name, path)
 		}
+	}
+
+	// The merged picture, and the only place that has one: roots against each other, against the
+	// input mappings and against the search paths (§10.6). One directory must have exactly one
+	// name on this node, and the message names both sides of any collision.
+	//
+	// The same function the inventory builds its resolver with, so the rule an operator is held
+	// to at parse time and the rule that decides where a target worker writes cannot drift apart.
+	if err := inventory.ValidateRoots(rootList(c.OutputRoots), domainList(c.Domains), c.SearchPath); err != nil {
+		return err
 	}
 
 	return nil
@@ -192,6 +217,7 @@ func (c *AgentOptions) Run(ctx context.Context, logger *slog.Logger) error {
 		"server", c.Server,
 		"domains", len(c.Domains),
 		"search_paths", len(c.SearchPath),
+		"output_roots", len(c.OutputRoots),
 		"fabrics", len(c.fabrics),
 		"port_range", c.PortRange.String(),
 		"worker_binary", c.WorkerBinary,
@@ -258,6 +284,7 @@ func (c *AgentOptions) build(ctx context.Context, logger *slog.Logger) (*agent.A
 	inv, err := inventory.New(inventory.Options{
 		Domains:     domainList(c.Domains),
 		SearchPaths: c.SearchPath,
+		OutputRoots: rootList(c.OutputRoots),
 		IdleAfter:   c.FlowIdleAfter,
 		Logger:      logger.With("module", "inventory"),
 		OnChange:    func() { built.Notify() },
@@ -289,6 +316,9 @@ func (c *AgentOptions) build(ctx context.Context, logger *slog.Logger) (*agent.A
 // anything is assigned to this node — and its versions are not decoration: `target_info` is
 // produced by one node's mxl-fabrics and consumed by another's, so a node pair straddling an mxl
 // version boundary is a compatibility concern neither agent can detect alone.
+// Output roots are deliberately *not* assembled here. They are static agent configuration rather
+// than something libfabric reports, the agent already holds them through its inventory, and it is
+// the agent that adds them to the registration this returns (§10.2, §10.6).
 func (c *AgentOptions) prober(logger *slog.Logger) func(context.Context) (api.Capabilities, error) {
 	return func(ctx context.Context) (api.Capabilities, error) {
 		versions, err := exec.ProbeVersions(ctx, c.WorkerBinary)
@@ -394,15 +424,29 @@ func domainList(domains map[string]string) []inventory.Domain {
 	for name, path := range domains {
 		out = append(out, inventory.Domain{Name: name, Path: path})
 	}
-	slices.SortFunc(out, func(a, b inventory.Domain) int {
-		switch {
-		case a.Name < b.Name:
-			return -1
-		case a.Name > b.Name:
-			return 1
-		default:
-			return 0
-		}
-	})
+	slices.SortFunc(out, func(a, b inventory.Domain) int { return byName(a.Name, b.Name) })
 	return out
+}
+
+func rootList(roots map[string]string) []inventory.Root {
+	out := make([]inventory.Root, 0, len(roots))
+	for name, path := range roots {
+		out = append(out, inventory.Root{Name: name, Path: path})
+	}
+	slices.SortFunc(out, func(a, b inventory.Root) int { return byName(a.Name, b.Name) })
+	return out
+}
+
+// byName keeps both lists deterministic. Not cosmetic: a map iteration order decides which of two
+// overlapping roots is reported as the collision, and an error message that changes between runs
+// is one an operator cannot search for.
+func byName(a, b string) int {
+	switch {
+	case a < b:
+		return -1
+	case a > b:
+		return 1
+	default:
+		return 0
+	}
 }

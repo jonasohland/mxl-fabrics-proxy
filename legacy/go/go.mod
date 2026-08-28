@@ -1,3 +1,9 @@
+// The repository was renamed to mxl-replicator; this module path deliberately was not. The
+// path is the import prefix for every file under legacy/go, so changing it would rewrite an
+// 38 import lines across 15 files of a tree that exists to be deleted at parity — and make
+// git log and git blame useless on it during exactly the window where it is still the
+// production implementation (M1a). Nothing fetches this module; the workspace resolves it by
+// directory. Delete the tree at parity rather than renaming it.
 module github.com/jonasohland/mxl-fabrics-proxy/legacy/go
 
 go 1.26.0

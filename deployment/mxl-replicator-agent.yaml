@@ -1,0 +1,152 @@
+# One agent per node (§6), as a DaemonSet.
+#
+# **No per-node ConfigMap of subscriptions, and no reloader.** That is the shape this replaces:
+# what a node is replicating now lives in the API and is applied with `mxl-replicator apply`, so
+# the only thing left here is provisioning — node name, input domains, output roots, fabric
+# attachments, server URL, port range — which changes when the host is built rather than when a
+# flow is routed (§6.2). That is what collapsed the agent's restart rate down to upgrades and
+# removed the reloader entirely (§6.1).
+#
+# **No node-address init container either.** The agent execs the worker's `--interfaces` probe and
+# asks libfabric what this node actually has, instead of a script guessing from the environment
+# (§10.5). A configured attachment with no matching probe result is a loud startup error rather
+# than a silent drop — the difference between "this node has no verbs" and "someone typo'd ib0".
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: mxl-replicator-agent
+  labels:
+    app.kubernetes.io/name: mxl-replicator
+    app.kubernetes.io/component: agent
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: mxl-replicator
+      app.kubernetes.io/component: agent
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # An agent restart glitches every flow on that node — accepted, and made short rather than
+      # avoided (§6.1). One node at a time keeps the blast radius to one node's flows.
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: mxl-replicator
+        app.kubernetes.io/component: agent
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "2284"
+        prometheus.io/path: /metrics
+    spec:
+      nodeSelector:
+        # Label the nodes that should participate in replication.
+        mxl.ebu.org/mxl-replicator: "true"
+      # The fabric connection is inbound to the *destination* node on a port the agent allocates
+      # from --agent-port-range, so that range has to be reachable on the host (§7.4).
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      terminationGracePeriodSeconds: 30
+      volumes:
+        - name: devshm
+          hostPath:
+            path: /dev/shm
+            type: Directory
+        - name: infiniband
+          hostPath:
+            path: /dev/infiniband
+            type: Directory
+        - name: workdir
+          # Per-worker-instance working directories: a config.json, a metrics socket, and for a
+          # target a target-info.json. emptyDir on purpose — the agent holds no state that has to
+          # survive a restart, and a fresh directory per worker *start* is what keeps a leftover
+          # metrics socket from being a fatal EADDRINUSE (§6, §6.1).
+          emptyDir:
+            medium: Memory
+      containers:
+        - name: agent
+          image: docker.io/jonasohland/mxl-replicator:latest
+          args:
+            - run
+            - --agent
+            - --agent-server
+            - http://mxl-replicator:2283
+            - --agent-listen
+            - 0.0.0.0:2284
+            - --agent-work-dir
+            - /run/mxl-replicator
+            # Input domains: what this node reads from. Never written to (§10.6).
+            - -m
+            - mxl0=/dev/shm/mxl0
+            # Output roots: where replication may create domains. This is the whole of the
+            # authority the API has over this node's filesystem, it is one line of node-local
+            # config, and a node with none configured is not a replication destination at all
+            # (§10.6, §13).
+            - --agent-output-root
+            - fast=/dev/shm/mxl
+            # A fabric attachment is (provider, fabric, address). `fabric` is an operator-assigned
+            # opaque label: two nodes may pair on a provider only if they share it. Provider
+            # availability is not reachability — two nodes both offering verbs may be on different
+            # InfiniBand fabrics (§10.1).
+            - --agent-fabric
+            - provider=verbs,fabric=ib-fabric-a,interface=ib0
+          env:
+            - name: MXL_REPLICATOR_NODE
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: MXL_REPLICATOR_AUTH_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: mxl-replicator-token
+                  key: token
+            # The worker's only environment knob, and the legacy supervisor never plumbed it
+            # through — leaving the debug logging in the transfer loops compiled in but
+            # permanently silent (§12).
+            - name: MXL_LOG_LEVEL
+              value: info
+          ports:
+            - name: http
+              containerPort: 2284
+              hostPort: 2284
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 5
+            timeoutSeconds: 3
+          livenessProbe:
+            # /healthz stays green when a transfer is failing, deliberately: a peer being
+            # unreachable is no reason to restart this agent and drop every other flow on the node
+            # (§11). Failure is made observable through status and metrics instead.
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 500m
+              memory: 256Mi
+            limits:
+              # One process per flow per direction (§14), so this scales with the number of flows
+              # this node replicates. Raise it on a node carrying many.
+              memory: 1Gi
+          securityContext:
+            privileged: true
+            capabilities:
+              add:
+                # Required by the RDMA providers. These gate whether the agent *advertises* an
+                # attachment at all; they never go over the wire (§10.2).
+                - IPC_LOCK
+                - SYS_RESOURCE
+          volumeMounts:
+            - name: devshm
+              mountPath: /dev/shm
+            - name: infiniband
+              mountPath: /dev/infiniband
+            - name: workdir
+              mountPath: /run/mxl-replicator

@@ -88,6 +88,14 @@ type Options struct {
 	// [api.DomainInventory.Configured] travelling with every domain.
 	SearchPaths []string
 
+	// OutputRoots are the directories replication may create domains under (§10.6). Nothing is
+	// discovered into them and nothing here observes them: they are the *write* side, resolved by
+	// [Inventory.Output] from an assignment's root and domain names alone.
+	//
+	// No default. A node with none configured accepts no replication destinations, which is the
+	// right posture for an opt-in that grants filesystem write authority.
+	OutputRoots []Root
+
 	// Interval is the sampling period. Defaults to [DefaultInterval].
 	Interval time.Duration
 
@@ -120,14 +128,30 @@ type Inventory struct {
 	// lookup a discovered domain never enters. byName is what resolves an assignment's domain
 	// *name* to a path, and it is a strict map lookup by design — an agent that fell back to
 	// treating an unmapped name as a path would hand the API the filesystem.
-	static  []Domain
-	byName  map[string]string
-	byPath  map[string]string
-	search  []string
-	watcher *mxl.Watcher
+	static []Domain
+	byName map[string]string
+	byPath map[string]string
+	search []string
+
+	// roots and rootPaths are the output side, and are fixed at construction for the same reason
+	// the input maps are: [Inventory.Output] is a pure function of configuration, and a resolver
+	// that could be widened at runtime would not be one (§10.6).
+	roots     []Root
+	rootPaths map[string]string
 
 	mu      sync.Mutex
 	domains map[string]*domainState // keyed by path
+
+	// materialised is the output domains this node is currently observing because a session
+	// targets them, path → name. Unlike the maps above it changes at runtime, since an output
+	// domain lives exactly as long as a path targets it (§10.6). It is what gives a materialised
+	// domain its short name in [Inventory.AddDomain] — without it a domain this project created
+	// would be reported under its path, like a discovered one.
+	materialised map[string]string
+
+	// watcher is set once [Run] starts and read by [Inventory.Materialise] from the reconcile
+	// goroutine, so it is guarded like everything else here.
+	watcher *mxl.Watcher
 }
 
 type domainState struct {
@@ -169,14 +193,15 @@ type flowState struct {
 // New validates the configuration and builds an inventory. It observes nothing until [Run].
 func New(opts Options) (*Inventory, error) {
 	inv := &Inventory{
-		interval:  opts.Interval,
-		idleAfter: opts.IdleAfter,
-		onChange:  opts.OnChange,
-		log:       opts.Logger,
-		now:       opts.Now,
-		byName:    map[string]string{},
-		byPath:    map[string]string{},
-		domains:   map[string]*domainState{},
+		interval:     opts.Interval,
+		idleAfter:    opts.IdleAfter,
+		onChange:     opts.OnChange,
+		log:          opts.Logger,
+		now:          opts.Now,
+		byName:       map[string]string{},
+		byPath:       map[string]string{},
+		domains:      map[string]*domainState{},
+		materialised: map[string]string{},
 	}
 	if inv.interval <= 0 {
 		inv.interval = DefaultInterval
@@ -195,8 +220,17 @@ func New(opts Options) (*Inventory, error) {
 	}
 
 	for _, domain := range opts.Domains {
-		if domain.Name == "" {
-			return nil, fmt.Errorf("inventory: domain with path %q has no name", domain.Path)
+		// **The same name rule as an output domain's elements**, and it has to be: names are flat
+		// per node, so an input mapping and a rendered output domain live in one namespace
+		// (§10.6). An input name containing a separator could equal a hierarchical output
+		// domain's rendered form — `-m a/b=...` against `domain: a/b` — and the server's
+		// collision check compares those two as strings.
+		//
+		// A tightening on §16's promise that `-m name=/path` carries over byte-compatible: the
+		// *syntax* does, and a name legacy would have accepted but this refuses is now a startup
+		// error rather than a name that works until the day something collides with it.
+		if err := api.ValidDomainName(domain.Name); err != nil {
+			return nil, fmt.Errorf("inventory: domain name %q (path %q): %w", domain.Name, domain.Path, err)
 		}
 		if !filepath.IsAbs(domain.Path) {
 			return nil, fmt.Errorf("inventory: domain %q: path %q is not absolute", domain.Name, domain.Path)
@@ -224,6 +258,14 @@ func New(opts Options) (*Inventory, error) {
 		inv.search = append(inv.search, filepath.Clean(path))
 	}
 
+	// Last, because the overlap rule is checked against the input mappings and search paths above
+	// and needs them cleaned first.
+	roots, rootPaths, err := validateRoots(opts.OutputRoots, inv.static, inv.search)
+	if err != nil {
+		return nil, err
+	}
+	inv.roots, inv.rootPaths = roots, rootPaths
+
 	return inv, nil
 }
 
@@ -244,13 +286,17 @@ func (i *Inventory) Mappings() []api.DomainMapping {
 	return out
 }
 
-// Path resolves a domain name to a local path.
+// Input resolves an *input* domain name to a local path: somewhere this node reads from, and an
+// initiator's source (§10.6).
 //
-// This is the only place a name becomes a path, and it is a strict map lookup over the domains
-// this agent knows: configured mappings, plus domains found under a search path. It never
-// interprets its argument as a path, which is what stops an assignment from naming an arbitrary
-// directory on this host (§7.2, §13).
-func (i *Inventory) Path(name string) (string, bool) {
+// It is a strict map lookup over the domains this agent knows — configured mappings, plus domains
+// found under a search path — and it never interprets its argument as a path, which is what stops
+// an assignment from naming an arbitrary directory on this host (§7.2, §13).
+//
+// The destination side is [Inventory.Output], and the asymmetry is the point: a source is by
+// definition something this agent *observes*, so it is resolved through what has been seen; a
+// destination is something a request *asks for*, so it is resolved from configuration alone.
+func (i *Inventory) Input(name string) (string, bool) {
 	if path, ok := i.byName[name]; ok {
 		return path, true
 	}
@@ -272,6 +318,11 @@ func (i *Inventory) Path(name string) (string, bool) {
 // duplication: it is the single most important invariant in the design, it costs one map lookup,
 // and an agent that trusted the server on it would be one compromised or buggy control plane
 // away from writing into any directory a search path can reach.
+//
+// **Superseded by [Inventory.Output], and removed once assignments carry a root** (§10.6, M10).
+// It is still the destination check the agent applies today, because an assignment has no root to
+// resolve against yet; when it has, a destination stops being an input mapping at all and this
+// goes away rather than being kept alongside.
 func (i *Inventory) Configured(name string) bool {
 	_, ok := i.byName[name]
 	return ok
@@ -301,7 +352,9 @@ func (i *Inventory) Run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("inventory: watch flows: %w", err)
 	}
+	i.mu.Lock()
 	i.watcher = watcher
+	i.mu.Unlock()
 
 	static := make([]string, 0, len(i.static))
 	for _, domain := range i.static {
@@ -342,8 +395,13 @@ func (i *Inventory) AddDomain(path string) {
 	i.mu.Lock()
 	name, configured := i.byPath[path]
 	if !configured {
+		// An output domain this agent materialised: not a search-path find, and named by the
+		// request that asked for it rather than by its path (§10.6).
+		name, configured = i.materialised[path]
+	}
+	if !configured {
 		// A discovered domain is named by its path. That is not a path the API can ever use —
-		// resolution is a map lookup (see [Inventory.Path]) — it is simply the one string that is
+		// resolution is a map lookup (see [Inventory.Input]) — it is simply the one string that is
 		// certainly unique on this node and stable across restarts, and it is what an operator
 		// looking at `GET /v1/flows` needs to see in order to find the thing.
 		name = path

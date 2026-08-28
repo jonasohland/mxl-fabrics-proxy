@@ -75,9 +75,9 @@ func TestProviderPinValidateRejectsTypos(t *testing.T) {
 
 func validSpec() RequestSpec {
 	return RequestSpec{
-		Name:        "studio-a-cam1-to-edge",
-		Source:      Source{Node: "studio-a", Domain: "cameras", Select: Selector{Flow: "5592a23b"}},
-		Destination: Destination{Node: "edge-01", Domain: "ingest"},
+		Name:         "studio-a-cam1-to-edge",
+		Source:       Source{Node: "studio-a", Domain: "cameras", Select: Selector{Flow: "5592a23b"}},
+		Destinations: []Destination{{Node: "edge-01", Domain: []string{"ingest"}}},
 	}
 }
 
@@ -96,9 +96,26 @@ func TestRequestSpecValidate(t *testing.T) {
 		"two selectors": func(s *RequestSpec) {
 			s.Source.Select.GroupHint = &GroupHintSelector{Name: "Studio A"}
 		},
-		"no destination node":   func(s *RequestSpec) { s.Destination.Node = "" },
-		"no destination domain": func(s *RequestSpec) { s.Destination.Domain = "" },
-		"unknown provider":      func(s *RequestSpec) { s.Provider = ProviderPin{Provider("infiniband")} },
+		"no destination node":   func(s *RequestSpec) { s.Destinations[0].Node = "" },
+		"no destination domain": func(s *RequestSpec) { s.Destinations[0].Domain = []string{""} },
+		// A destination domain is a directory this API is asking a node to create, so the name
+		// rule is structural (§10.6). The agent refuses these independently; the server reports
+		// ReasonMalformedDomainName for a stored request that somehow carries one.
+		"traversing destination domain": func(s *RequestSpec) { s.Destinations[0].Domain = []string{"../etc"} },
+		"nested destination domain":     func(s *RequestSpec) { s.Destinations[0].Domain = []string{"a/b"} },
+		"absolute destination domain":   func(s *RequestSpec) { s.Destinations[0].Domain = []string{"/etc"} },
+		"lookalike destination domain":  func(s *RequestSpec) { s.Destinations[0].Domain = []string{"іngest"} },
+		"malformed root":                func(s *RequestSpec) { s.Destinations[0].Root = "../fast" },
+		"unknown provider":              func(s *RequestSpec) { s.Provider = ProviderPin{Provider("infiniband")} },
+		"no destinations":               func(s *RequestSpec) { s.Destinations = nil },
+		"unknown per-destination provider": func(s *RequestSpec) {
+			s.Destinations[0].Provider = ProviderPin{Provider("infiniband")}
+		},
+		// Two entries naming one (node, domain) are the same path written twice, and they can
+		// disagree about the root or the provider — at which point there is no answer to pick.
+		"duplicate destination": func(s *RequestSpec) {
+			s.Destinations = append(s.Destinations, Destination{Node: "edge-01", Domain: []string{"ingest"}, Root: "bulk"})
+		},
 		"negative teardown": func(s *RequestSpec) {
 			negative := Milliseconds(-1)
 			s.IdleTeardown = &negative
@@ -118,13 +135,17 @@ func TestRequestSpecDecodesTheDocumentedBody(t *testing.T) {
 	t.Parallel()
 
 	const body = `{
-	  "name": "studio-a-cam1-to-edge",
+	  "name": "cam1-distribution",
 	  "source": {
 	    "node": "studio-a",
 	    "domain": "cameras",
 	    "select": { "flow": "5592a23b-0974-45bb-9388-89ea81c42537" }
 	  },
-	  "destination": { "node": "edge-01", "domain": "ingest" },
+	  "destinations": [
+	    { "node": "edge-01", "domain": ["ingest"], "root": "fast" },
+	    { "node": "edge-02", "domain": ["studio-a", "cam1"], "root": "fast" },
+	    { "node": "archive-01", "domain": ["capture"], "provider": "tcp" }
+	  ],
 	  "provider": "verbs"
 	}`
 
@@ -132,9 +153,32 @@ func TestRequestSpecDecodesTheDocumentedBody(t *testing.T) {
 	require.NoError(t, json.Unmarshal([]byte(body), &spec))
 	require.NoError(t, spec.Validate())
 
-	assert.Equal(t, "studio-a-cam1-to-edge", spec.Name)
+	assert.Equal(t, "cam1-distribution", spec.Name)
 	assert.Equal(t, "5592a23b-0974-45bb-9388-89ea81c42537", spec.Source.Select.Flow)
 	assert.Equal(t, ProviderPin{ProviderVerbs}, spec.Provider)
+	require.Len(t, spec.Destinations, 3)
+
+	// A destination's own pin overrides the request-level one; the others inherit it. Override
+	// rather than intersect, or "verbs here, tcp there" would be a pin conflict instead of the
+	// ordinary fan-out it is (§10.4).
+	assert.Equal(t, ProviderPin{ProviderVerbs}, spec.ProviderFor(spec.Destinations[0]))
+	assert.Equal(t, ProviderPin{ProviderTCP}, spec.ProviderFor(spec.Destinations[2]))
+	assert.Equal(t, "fast", spec.Destinations[0].Root)
+
+	// A domain is a list of elements on the wire, never a path. `studio-a/cam1` exists only in a
+	// manifest, where the CLI splits it (§10.6).
+	assert.Equal(t, []string{"studio-a", "cam1"}, spec.Destinations[1].Domain)
+	assert.Equal(t, "studio-a/cam1", spec.Destinations[1].DomainName())
+	assert.Equal(t, "edge-02/studio-a/cam1", spec.Destinations[1].Endpoint())
+
+	// The root is optional, and omitting it is the common case: it is only needed by a node
+	// advertising more than one (§10.6). It must stay off the wire when unset, so a request that
+	// named no root is distinguishable from one that named the empty string.
+	spec.Destinations[0].Root = ""
+	require.NoError(t, spec.Validate())
+	encoded, err := json.Marshal(spec.Destinations[0])
+	require.NoError(t, err)
+	assert.NotContains(t, string(encoded), `"root"`)
 }
 
 // Request embeds RequestSpec, so the spec's fields must stay flat on the wire rather than
@@ -151,6 +195,6 @@ func TestRequestFlattensItsSpec(t *testing.T) {
 	assert.Contains(t, raw, "id")
 	assert.Contains(t, raw, "name")
 	assert.Contains(t, raw, "source")
-	assert.Contains(t, raw, "destination")
+	assert.Contains(t, raw, "destinations")
 	assert.NotContains(t, raw, "RequestSpec")
 }

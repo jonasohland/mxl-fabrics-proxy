@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -99,12 +100,75 @@ func TestKnownProvider(t *testing.T) {
 	assert.False(t, KnownProvider(Provider("")))
 }
 
-// A domain the agent merely discovered by a search path must never be usable as a destination,
-// and the field that says so must fail closed for an agent that does not set it (§7.2, §13).
-func TestDomainMappingConfiguredFailsClosed(t *testing.T) {
+// Configured is descriptive now: it says where a domain came from, and nothing keys authority
+// off it (§10.6). An agent that omits it still reports false — "discovered" — which is what
+// GET /v1/nodes/{node}/domains renders.
+func TestDomainMappingConfiguredDefaultsToDiscovered(t *testing.T) {
 	t.Parallel()
 
 	var mapping DomainMapping
 	require.NoError(t, json.Unmarshal([]byte(`{"name":"ingest"}`), &mapping))
 	assert.False(t, mapping.Configured)
+}
+
+// Where the fail-closed direction moved to. Destination authority is now the node's advertised
+// output roots, and a registration that names none is not a replication destination at all —
+// which is both the default and what an older agent, or one whose operator has not opted in,
+// reports (§10.6, §13).
+func TestCapabilitiesWithoutOutputRootsAreNotADestination(t *testing.T) {
+	t.Parallel()
+
+	var caps Capabilities
+	require.NoError(t, json.Unmarshal([]byte(`{"fabrics":[],"sched_prio":true}`), &caps))
+	assert.Empty(t, caps.OutputRoots)
+	assert.Nil(t, caps.FindRoot(""), "the empty root name is not a root")
+	assert.Nil(t, caps.FindRoot("fast"))
+}
+
+func TestCapabilitiesFindRoot(t *testing.T) {
+	t.Parallel()
+
+	caps := Capabilities{OutputRoots: []OutputRoot{
+		{Name: "fast", Path: "/dev/shm/mxl"},
+		{Name: "bulk", Path: "/mnt/nvme/mxl"},
+	}}
+
+	require.NotNil(t, caps.FindRoot("bulk"))
+	assert.Equal(t, "/mnt/nvme/mxl", caps.FindRoot("bulk").Path)
+	assert.Nil(t, caps.FindRoot("slow"))
+
+	// A path is advertised for diagnostics but is never required: the server sends a root *name*
+	// to an agent and the agent resolves it, exactly as with a domain name (§10.2).
+	encoded, err := json.Marshal(OutputRoot{Name: "fast"})
+	require.NoError(t, err)
+	assert.Equal(t, `{"name":"fast"}`, string(encoded))
+}
+
+// The rule every layer defers to, pinned once here because it is shared: the server rejects a
+// request naming something else and the agent independently refuses to resolve it, and the
+// duplication is only worth its keep if the two cannot disagree (§10.6, §13).
+func TestValidDomainName(t *testing.T) {
+	t.Parallel()
+
+	for _, name := range []string{"ingest", "ingest-2", "ingest_2", "a.b", "A1", "0",
+		strings.Repeat("a", MaxDomainNameLen)} {
+		assert.NoError(t, ValidDomainName(name), "%q", name)
+	}
+
+	for _, name := range []string{
+		"", ".", "..", "../etc", "a/b", "/etc", `a\b`,
+		"ingest\x00sh", "ingest sh", "ingest\n",
+		".hidden", "-flag",
+		"ingést",     // non-ASCII
+		"іngest",     // Cyrillic і, a lookalike for a name an operator may legitimately hold
+		"ingest⁄etc", // fraction slash, a lookalike for a separator
+		strings.Repeat("a", MaxDomainNameLen+1),
+	} {
+		assert.Error(t, ValidDomainName(name), "%q", name)
+	}
+
+	// A refused byte is reported as a byte rather than decoded back into the message. These names
+	// are frequently lookalikes for names the rule accepts, and rendering one back to an operator
+	// as though it were ASCII makes the error part of the confusion.
+	assert.Contains(t, ValidDomainName("іngest").Error(), "0xd1")
 }

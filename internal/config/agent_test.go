@@ -29,6 +29,11 @@ domains:
   cameras: /dev/shm/mxl0
 search_paths:
   - /dev/shm
+output_roots:
+  - name: fast
+    path: /dev/shm/mxl
+  - name: bulk
+    path: /mnt/nvme/mxl
 fabrics:
   - provider: verbs
     fabric: ib-fabric-a
@@ -45,6 +50,10 @@ fabrics:
 	assert.Equal(t, []string{"http://ctrl-0:2283", "http://ctrl-1:2283"}, loaded.Server)
 	assert.Equal(t, Domains{"cameras": "/dev/shm/mxl0"}, loaded.Domains)
 	assert.Equal(t, []string{"/dev/shm"}, loaded.SearchPaths)
+	assert.Equal(t, []OutputRoot{
+		{Name: "fast", Path: "/dev/shm/mxl"},
+		{Name: "bulk", Path: "/mnt/nvme/mxl"},
+	}, loaded.OutputRoots)
 	assert.Equal(t, []probe.Attachment{
 		{Provider: api.ProviderVerbs, Fabric: "ib-fabric-a", Interface: "ib0"},
 		{Provider: api.ProviderEFA, Fabric: "vpc1-subnet-a"},
@@ -133,6 +142,9 @@ server: [http://a:2283]
 domains:
   cameras: /dev/shm/mxl0
   ingest: /dev/shm/mxl1
+output_roots:
+  - name: fast
+    path: /dev/shm/mxl
 fabrics:
   - provider: tcp
     fabric: dc1
@@ -142,6 +154,9 @@ fabrics:
 domains:
   ingest: /dev/shm/mxl9
   archive: /dev/shm/mxl2
+output_roots:
+  - name: bulk
+    path: /mnt/nvme/mxl
 fabrics:
   - provider: verbs
     fabric: ib-a
@@ -160,12 +175,20 @@ fabrics:
 	}, loaded.Domains)
 	require.Len(t, loaded.Fabrics, 1)
 	assert.Equal(t, api.ProviderVerbs, loaded.Fabrics[0].Provider)
+
+	// Roots replace rather than merge, like fabrics: the list is one description of what this
+	// node permits writing into, and half-overriding it is never what anyone means.
+	assert.Equal(t, []OutputRoot{{Name: "bulk", Path: "/mnt/nvme/mxl"}}, loaded.OutputRoots)
 }
 
 func TestValidateReportsEveryProblem(t *testing.T) {
 	agent := &Agent{
 		Domains:     Domains{"a": "relative/path"},
 		SearchPaths: []string{"also/relative"},
+		OutputRoots: []OutputRoot{
+			{Name: "fast", Path: "relative/too"},
+			{Name: "../escape", Path: "/dev/shm/mxl"},
+		},
 		Fabrics: []probe.Attachment{
 			{Provider: api.ProviderTCP}, // no fabric label
 			{Provider: api.ProviderTCP, Fabric: "dc1", Address: "10.0.0.1", Device: "eth0"},
@@ -178,6 +201,10 @@ func TestValidateReportsEveryProblem(t *testing.T) {
 	assert.ErrorContains(t, err, "search path")
 	assert.ErrorContains(t, err, "fabrics[0]")
 	assert.ErrorContains(t, err, "fabrics[1]")
+	// Per-entry only here. Whether roots overlap each other, a mapping or a search path needs the
+	// merged file-plus-flags picture, so it is checked once where that exists (§10.6).
+	assert.ErrorContains(t, err, `output root "fast"`)
+	assert.ErrorContains(t, err, "output_roots[1]")
 }
 
 // The flag form exists so that a single-host or development deployment needs no file at all,

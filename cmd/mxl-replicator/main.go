@@ -6,6 +6,21 @@
 //	mxl-replicator run --agent       agent only: every ordinary fleet node
 //	mxl-replicator run --server      server only: a control-plane-only node
 //
+// and the operator-facing verbs beside it, which talk to a running server's user API (§9.1):
+//
+//	mxl-replicator apply    -f studio-a.yaml [--dry-run] [--prune -l show=nab]
+//	mxl-replicator delete   -f studio-a.yaml
+//	mxl-replicator delete   cam1-distribution
+//	mxl-replicator status   [-o json|yaml]
+//	mxl-replicator get      nodes|flows|requests|paths|sessions [filters]
+//	mxl-replicator describe node|flow|request|path|session <name>
+//
+// Three read verbs with three jobs and no overlap: status summarises the fleet and names what is
+// not active, get lists so you can find a name, describe explains one thing in full.
+//
+// Replication is requested by applying a manifest, not by editing a config file on every node:
+// the intent is fleet-scoped and lives in the API (§2).
+//
 // The data plane is a separate binary, mxl-fabrics-proxy-worker, which keeps its name: one
 // process = one flow, one direction, one peer, one role. This process never touches grain
 // data.
@@ -17,6 +32,8 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"slices"
+	"strings"
 	"syscall"
 
 	"github.com/alecthomas/kong"
@@ -33,14 +50,52 @@ type Globals struct {
 
 // CLI is the root command.
 //
-// There is one command. The two roles are selected by flags on it (--server / --agent)
-// rather than being subcommands of their own: they are modules of one binary, they share
-// most of their operational surface, and a node running both is an ordinary deployment
-// rather than a special case. `run` is the default command, so the word itself is optional.
+// Verbs sit at the top level, beside each other. There is no `ctl` grouping and no second binary:
+// the set is small, a grouping noun for it would be ceremony, and a separate CLI would be a build
+// target, an image entry and a packaging story for no gain.
+//
+// `run` is the daemon and is the default command, so the word itself is optional — but see
+// [guardDefaultCommand] for the trap that creates.
+//
+// The two *roles* remain flags on `run` (--server / --agent) rather than subcommands of their
+// own: they are modules of one binary, they share most of their operational surface, and a node
+// running both is an ordinary deployment rather than a special case.
 type CLI struct {
 	Globals
 
 	Run RunCmd `cmd:"" default:"withargs" help:"Run the server role, the agent role, or both."`
+
+	Apply    ApplyCmd    `cmd:"" help:"Apply a manifest of replication requests."`
+	Delete   DeleteCmd   `cmd:"" help:"Cancel replication requests, by manifest or by name."`
+	Status   StatusCmd   `cmd:"" help:"Summarise the fleet and name anything that is not active."`
+	Get      GetCmd      `cmd:"" help:"List nodes, flows, requests, paths or sessions."`
+	Describe DescribeCmd `cmd:"" help:"Show everything known about one node, flow, request, path or session."`
+}
+
+// commands are the verb names, for [guardDefaultCommand].
+var commands = []string{"run", "apply", "delete", "status", "get", "describe"}
+
+// guardDefaultCommand rejects a mistyped verb instead of letting it fall through to `run`.
+//
+// `run` is kong's `default:"withargs"` command, which is what makes `mxl-replicator --agent`
+// work. The cost is that `mxl-replicator aply -f x.yaml` is not an unknown command — it is `run`
+// with a positional argument it does not want, and the error says so in terms of flags that have
+// nothing to do with what was typed.
+func guardDefaultCommand(args []string) error {
+	if len(args) == 0 {
+		return nil
+	}
+	first := args[0]
+	if strings.HasPrefix(first, "-") || slices.Contains(commands, first) {
+		return nil
+	}
+	return fmt.Errorf("unknown command %q; expected one of %s", first, strings.Join(commands, ", "))
+}
+
+// isDaemon reports whether the selected command is the long-running one. kong's Command() is the
+// selected path, so `run` is a prefix of it however the flags were spelled.
+func isDaemon(command string) bool {
+	return command == "run" || strings.HasPrefix(command, "run ")
 }
 
 func main() {
@@ -55,6 +110,8 @@ func main() {
 		kong.ConfigureHelp(kong.HelpOptions{Compact: true}),
 		kong.Vars{"version": version.String()},
 	)
+
+	parser.FatalIfErrorf(guardDefaultCommand(os.Args[1:]))
 
 	kctx, err := parser.Parse(os.Args[1:])
 	parser.FatalIfErrorf(err)
@@ -75,13 +132,24 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	logger.Info("starting", "version", version.String(), "command", kctx.Command())
+	// Only the daemon announces itself. The verbs are foreground commands whose output is the
+	// answer, and a startup banner on stderr is noise in front of it.
+	if isDaemon(kctx.Command()) {
+		logger.Info("starting", "version", version.String(), "command", kctx.Command())
+	}
 
 	kctx.BindTo(ctx, (*context.Context)(nil))
 	kctx.Bind(logger)
 
 	if err := kctx.Run(); err != nil {
-		logger.Error("exiting", "error", err)
+		// A daemon's failure is a log record — it is what an operator will find in the container's
+		// logs. A verb's failure is a message to whoever just typed the command, and dressing it
+		// as a structured log entry buries the sentence that says what to fix.
+		if isDaemon(kctx.Command()) {
+			logger.Error("exiting", "error", err)
+		} else {
+			fmt.Fprintln(os.Stderr, "mxl-replicator: "+err.Error())
+		}
 		os.Exit(1)
 	}
 }

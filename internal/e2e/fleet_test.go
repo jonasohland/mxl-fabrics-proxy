@@ -372,6 +372,11 @@ type nodeOptions struct {
 	// The loopback suite puts them on /dev/shm, where a real MXL domain lives.
 	domainRoot string
 
+	// noOutputRoots makes this node advertise none, so it cannot be a replication destination.
+	// Zero means one root called "fast", which is what lets a request name a destination domain
+	// without spelling a root (§10.6).
+	noOutputRoots bool
+
 	// capabilities overrides what this node advertises. Zero is one tcp attachment on fabric
 	// "dc1" at 127.0.0.1, which pairs with every other default node. Ignored when probe is set.
 	capabilities *api.Capabilities
@@ -402,9 +407,13 @@ type node struct {
 	launcher *fake.Launcher
 	rewriter *assignmentRewriter
 
-	// domains maps the fleet-wide name to this node's local path, which is the mapping the rest
-	// of the system deliberately never sees (§7.2).
+	// domains maps the fleet-wide name of an *input* domain to this node's local path, which is
+	// the mapping the rest of the system deliberately never sees (§7.2).
 	domains map[string]string
+
+	// outputRoot is where output domains are materialised on this node, or empty for a node that
+	// is not a replication destination (§10.6).
+	outputRoot string
 
 	cancel  context.CancelFunc
 	stopped chan struct{}
@@ -431,10 +440,23 @@ func (f *fleet) addNode(name string, opts nodeOptions) *node {
 		mappings = append(mappings, inventory.Domain{Name: domain, Path: path})
 	}
 
+	// A sibling of the input mappings rather than a parent of them: an output root may not
+	// overlap an input mapping, which is the configuration half of one directory having one name
+	// (§10.6). Under `root` so that the loopback suite, which puts its domains on /dev/shm where
+	// a real MXL domain has to live, gets its output root there too.
+	var outputRoots []inventory.Root
+	outputRoot := filepath.Join(root, "out")
+	if opts.noOutputRoots {
+		outputRoot = ""
+	} else {
+		outputRoots = []inventory.Root{{Name: "fast", Path: outputRoot}}
+	}
+
 	var built *agent.Agent
 	inv, err := inventory.New(inventory.Options{
 		Domains:     mappings,
 		SearchPaths: opts.searchPaths,
+		OutputRoots: outputRoots,
 		Interval:    inventoryInterval,
 		IdleAfter:   inventoryIdleAfter,
 		Logger:      discard(),
@@ -471,6 +493,12 @@ func (f *fleet) addNode(name string, opts nodeOptions) *node {
 	}
 	if opts.capabilities != nil {
 		capabilities = *opts.capabilities
+	}
+	// Applied after the override, so a test replacing the fabric list does not accidentally turn
+	// its node into something that cannot receive at all — a different rejection from the one it
+	// is testing.
+	for _, r := range outputRoots {
+		capabilities.OutputRoots = append(capabilities.OutputRoots, api.OutputRoot{Name: r.Name, Path: r.Path})
 	}
 
 	// The fake launcher is built either way: a node driving a real worker keeps it unused, and
@@ -513,14 +541,15 @@ func (f *fleet) addNode(name string, opts nodeOptions) *node {
 	require.NoError(f.t, err)
 
 	n := &node{
-		Agent:    built,
-		t:        f.t,
-		fleet:    f,
-		name:     name,
-		launcher: fakeLauncher,
-		rewriter: rewriter,
-		domains:  domains,
-		stopped:  make(chan struct{}),
+		Agent:      built,
+		t:          f.t,
+		fleet:      f,
+		name:       name,
+		launcher:   fakeLauncher,
+		rewriter:   rewriter,
+		domains:    domains,
+		outputRoot: outputRoot,
+		stopped:    make(chan struct{}),
 	}
 
 	f.mu.Lock()
@@ -587,10 +616,18 @@ func (n *node) stop() {
 }
 
 // path returns this node's local path for a configured domain.
+// path is where a domain name lives on this node: a configured *input* mapping if there is one,
+// otherwise where an output domain of that name is materialised under this node's root (§10.6).
+//
+// The two are different namespaces reached by different code in the agent, and this helper spans
+// them only because a test wants a directory to look in. Nothing in the system resolves a name
+// this way.
 func (n *node) path(domain string) string {
-	path, ok := n.domains[domain]
-	require.True(n.t, ok, "node %s has no domain %q", n.name, domain)
-	return path
+	if path, ok := n.domains[domain]; ok {
+		return path
+	}
+	require.NotEmpty(n.t, n.outputRoot, "node %s has no domain %q and no output root", n.name, domain)
+	return filepath.Join(n.outputRoot, domain)
 }
 
 // worker returns the running fake worker for a session and role, or nil.

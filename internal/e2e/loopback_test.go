@@ -85,7 +85,9 @@ func runLoopback(t *testing.T, provider api.Provider, attachment probe.Attachmen
 
 	f := newFleet(t, fleetOptions{})
 	node := f.addNode("loopback", nodeOptions{
-		domains:    []string{"src", "dst"},
+		// "src" only: the destination is an output domain, materialised under this node's output
+		// root when the target assignment is accepted (§10.6).
+		domains:    []string{"src"},
 		domainRoot: domainRoot,
 		launcher:   launcher,
 		probe:      realProbe(t, workerBinary, "loopback", attachment),
@@ -121,11 +123,11 @@ func runLoopback(t *testing.T, provider api.Provider, attachment probe.Attachmen
 	// pin is honoured or the request fails — it is never substituted (§10.4), so a tcp run that
 	// quietly landed on shm would report a pass for something it did not test.
 	request := f.request(api.RequestSpec{
-		Name:        "loopback-" + string(provider),
-		Source:      api.Source{Node: "loopback", Domain: "src", Select: api.Selector{Flow: definition.id}},
-		Destination: api.Destination{Node: "loopback", Domain: "dst"},
-		Provider:    api.ProviderPin{provider},
-		Labels:      map[string]string{"suite": "e2e"},
+		Name:         "loopback-" + string(provider),
+		Source:       api.Source{Node: "loopback", Domain: "src", Select: api.Selector{Flow: definition.id}},
+		Destinations: []api.Destination{{Node: "loopback", Domain: []string{"dst"}}},
+		Provider:     api.ProviderPin{provider},
+		Labels:       map[string]string{"suite": "e2e"},
 	})
 
 	f.eventually("the path to go ACTIVE", func() bool {

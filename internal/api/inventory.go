@@ -25,8 +25,14 @@ type DomainInventory struct {
 	// business in a per-heartbeat snapshot.
 	Name string `json:"name"`
 
-	// Configured mirrors [DomainMapping.Configured] — explicitly mapped domains may be
-	// replication destinations, discovered ones may not (§7.2).
+	// Configured mirrors [DomainMapping.Configured], and is descriptive for the same reason: it
+	// says where this domain came from — an explicit input mapping, or a search path — and
+	// nothing keys authority off it.
+	//
+	// A materialised output domain reports true. It is not a search-path find, it exists because
+	// a request asked for it, and it appears here at all because the agent adds it to its own
+	// watch set when it accepts the target assignment — which is what makes a chain A→B→C work,
+	// B's domain becoming visible as a source for the second hop (§10.6).
 	Configured bool `json:"configured"`
 
 	Flows []FlowInventory `json:"flows"`
