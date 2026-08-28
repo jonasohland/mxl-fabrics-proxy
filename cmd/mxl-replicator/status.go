@@ -97,7 +97,7 @@ func (c *StatusCmd) Run(ctx context.Context) error {
 		if !node.Live {
 			summary.Unhealthy = append(summary.Unhealthy, Unhealthy{
 				Kind: "node", Name: node.Name, State: "not leased",
-				Reason: "registered, but no agent instance currently holds this node — its workers may still be running",
+				Reason: "no agent holds this node; its workers may still be running",
 			})
 		}
 	}
@@ -124,7 +124,7 @@ func (c *StatusCmd) Run(ctx context.Context) error {
 
 func printSummary(summary Summary) {
 	if summary.Settling {
-		warn("the server has not run its first reconcile yet; this is intent, not what is running")
+		warn("still settling: this is intent, not what is running")
 	}
 
 	fmt.Printf("nodes      %d registered, %d leased\n", summary.Nodes.Registered, summary.Nodes.Leased)
@@ -133,8 +133,8 @@ func printSummary(summary Summary) {
 	fmt.Printf("sessions   %d running\n", summary.Sessions)
 
 	if len(summary.Nodes.NoOutputRoot) > 0 {
-		fmt.Printf("\n%d node(s) advertise no output root and cannot be a replication destination: %s\n",
-			len(summary.Nodes.NoOutputRoot), strings.Join(summary.Nodes.NoOutputRoot, ", "))
+		fmt.Printf("\n%s: no output root, cannot be a destination\n",
+			strings.Join(summary.Nodes.NoOutputRoot, ", "))
 	}
 
 	switch {

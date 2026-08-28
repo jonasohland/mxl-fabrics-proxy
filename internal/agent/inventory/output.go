@@ -86,8 +86,10 @@ func (i *Inventory) Output(root string, elements []string) (string, error) {
 	// under another, and this project would be writing into a domain it advertises as read-only.
 	//
 	// Checked against the **configured** mappings only, which is what keeps this a pure function
-	// of configuration (§10.6). Discovered domains are not consulted and cannot be missed: a
-	// search path may not overlap a root, so nothing discovered is ever inside one.
+	// of configuration (§10.6). Discovered domains are not consulted and cannot be missed:
+	// [prune] hides every root from discovery, so nothing discovered is ever inside one. A search
+	// path *may* now sit above a root, and that premise survives the change — it is held by the
+	// pruning rather than by the overlap rule that used to forbid the layout.
 	if mapped, taken := i.byPath[resolved]; taken {
 		return "", fmt.Errorf("output domain %q under root %q resolves to %s, which this node maps as input domain %q; an input domain is never written to",
 			name, root, resolved, mapped)
@@ -157,6 +159,10 @@ func (i *Inventory) CreateRoots() error {
 // the same order the discoverer would have called them** — this inventory first, the watcher
 // second — so that a flow never arrives for a domain that is not there yet.
 //
+// Driven by hand is also the *whole* of it: this and [Inventory.Release] bypass [prune], which
+// hides every root from discovery, so a materialised domain's lifecycle is owned entirely by the
+// reconciler. Nothing a scan sees can name one, and nothing a scan stops seeing can withdraw one.
+//
 // Idempotent, because the reconcile that calls it runs on every poll.
 func (i *Inventory) Materialise(name, path string) error {
 	if err := os.MkdirAll(path, 0o755); err != nil {
@@ -185,7 +191,9 @@ func (i *Inventory) Materialise(name, path string) error {
 // It does **not** remove the directory. The MXL SDK removes a flow directory when its writer is
 // released, so what is left behind is empty — and an empty directory is invisible to discovery,
 // so it is not reported as a domain, cannot be selected as a source, and appears in no inventory.
-// Re-materialising is an idempotent MkdirAll over it.
+// Re-materialising is an idempotent MkdirAll over it. That now holds even under a search path
+// covering the root, and for a stronger reason: [prune] hides the directory whether it is empty
+// or not, so a leaked directory left holding stale content is not discovered either.
 //
 // Removal order mirrors the add: this inventory forgets the domain first and the watcher's
 // removals then land on nothing, which [Inventory.RemoveFlow] tolerates.
@@ -220,10 +228,15 @@ func ValidateRoots(roots []Root, mappings []Domain, search []string) error {
 // validateRoots checks the operator's roots and builds the lookup [Inventory.Output] uses.
 //
 // The overlap rule is the configuration half of "names are flat per node" (§10.6): one directory
-// must have exactly one name on this node. A root nested in another root, in an input mapping, or
-// under a search path would give a materialised output domain a second identity — a short name
-// through its root and a path-shaped discovered name through the scan — and the fleet-wide
-// inventory would carry one flow at two addresses.
+// must have exactly one name on this node. A root nested in another root, or in an input mapping,
+// would give a materialised output domain a second identity, and the fleet-wide inventory would
+// carry one flow at two addresses.
+//
+// Two containments are permitted, each with the collision it could produce refused somewhere more
+// precise: a root above an input mapping, refused per request by [Inventory.Output], and a search
+// path above a root, refused structurally by [prune]. Both are the same layout — one directory
+// tree holding domains this node reads and domains it writes — and refusing either would refuse a
+// legal arrangement to prevent a case that is already covered.
 func validateRoots(roots []Root, mappings []Domain, search []string) ([]Root, map[string]string, error) {
 	out := make([]Root, 0, len(roots))
 	paths := map[string]string{}
@@ -278,8 +291,31 @@ func validateRoots(roots []Root, mappings []Domain, search []string) ([]Root, ma
 			}
 		}
 		for _, dir := range search {
+			// **A search path may be an ancestor of a root**, which is the same layout the mapping
+			// loop above permits, seen from the other side: `--search-path /dev/shm/mxl` alongside
+			// `--output-root fast=/dev/shm/mxl/replicated` is one MXL area per host, part of it
+			// discovered and part of it written.
+			//
+			// Note the nesting is the *opposite* way round from the mapping case — there the root is
+			// the ancestor, here the search path is — so the two `strictlyContains` calls are not a
+			// copy-paste of each other. What makes both safe is the same thing: the collision they
+			// could produce is refused where it is precise. For a mapping that is
+			// [Inventory.Output]; here it is [prune], which hides every root from discovery, so a
+			// directory inside a root has exactly one name and one owner.
+			if strictlyContains(dir, path) {
+				continue
+			}
+			if filepath.Clean(dir) == path {
+				// Provably a no-op rather than merely redundant: [prune] hides the whole root, so
+				// this search path could never report anything. Refused because it reads as
+				// meaningful configuration.
+				return nil, nil, fmt.Errorf("inventory: output root %q is also search path %q; discovery is pruned at every root, so the search path could never find anything", root.Name, dir)
+			}
 			if overlaps(path, dir) {
-				return nil, nil, fmt.Errorf("inventory: output root %q overlaps search path %q: %q and %q", root.Name, dir, path, dir)
+				// The other direction stays refused, for the reason equality is: a search path
+				// inside a root asks discovery to read the directory replication writes into, which
+				// is the contradiction pruning exists to resolve.
+				return nil, nil, fmt.Errorf("inventory: output root %q contains search path %q: %q and %q", root.Name, dir, path, dir)
 			}
 		}
 
@@ -306,12 +342,18 @@ func overlaps(a, b string) bool {
 		strings.HasPrefix(b, a+string(filepath.Separator))
 }
 
-// strictlyContains reports whether parent is a proper ancestor of child. Equality is *not*
-// containment here: the one case this permits is a root above a domain, and a root that is a
-// domain is a different thing entirely.
-func strictlyContains(parent, child string) bool {
+// within reports whether child is parent or sits beneath it. Boundary-aware, for the reason given
+// on [contain].
+func within(parent, child string) bool {
 	parent, child = filepath.Clean(parent), filepath.Clean(child)
-	return parent != child && strings.HasPrefix(child, parent+string(filepath.Separator))
+	return parent == child || strings.HasPrefix(child, parent+string(filepath.Separator))
+}
+
+// strictlyContains reports whether parent is a proper ancestor of child. Equality is *not*
+// containment here: the cases this permits are a root above a domain and a search path above a
+// root, and in both of those the equal case is a different thing entirely.
+func strictlyContains(parent, child string) bool {
+	return filepath.Clean(parent) != filepath.Clean(child) && within(parent, child)
 }
 
 func rootList(roots []Root) string {

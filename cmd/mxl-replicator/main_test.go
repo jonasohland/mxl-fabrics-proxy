@@ -220,9 +220,16 @@ func TestAgentOutputRootValidation(t *testing.T) {
 			want: `overlaps domain "cameras"`,
 		},
 		{
-			name: "root under a search path",
-			args: []string{"--agent-output-root", "fast=/dev/shm/mxl", "--agent-search-path", "/dev/shm"},
-			want: "overlaps search path",
+			// Discovery is pruned at every root, so a search path that *is* one could never find
+			// anything. Distinct from a search path *above* a root, which is permitted below.
+			name: "root that is a search path",
+			args: []string{"--agent-output-root", "fast=/dev/shm/mxl", "--agent-search-path", "/dev/shm/mxl"},
+			want: "could never find anything",
+		},
+		{
+			name: "root over a search path",
+			args: []string{"--agent-output-root", "fast=/dev/shm/mxl", "--agent-search-path", "/dev/shm/mxl/inner"},
+			want: "contains search path",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -231,9 +238,18 @@ func TestAgentOutputRootValidation(t *testing.T) {
 		})
 	}
 
+	// **A search path may be an ancestor of a root**: one MXL area per host, part of it discovered
+	// and part of it written, which is the layout the pruning exists to make safe (§10.6).
+	_, _, err := parse(t, agentOnly(
+		"--agent-search-path", "/dev/shm/mxl",
+		"--agent-output-root", "fast=/dev/shm/mxl/replicated",
+		"-m", "cameras=/dev/shm/mxl/cameras",
+	)...)
+	assert.NoError(t, err)
+
 	// A sibling whose path is a string prefix of a root's is not an overlap. Same boundary the
 	// destination resolver is careful about, on the configuration side.
-	_, _, err := parse(t, agentOnly(
+	_, _, err = parse(t, agentOnly(
 		"--agent-output-root", "fast=/dev/shm/mxl",
 		"-m", "cameras=/dev/shm/mxl-other",
 	)...)

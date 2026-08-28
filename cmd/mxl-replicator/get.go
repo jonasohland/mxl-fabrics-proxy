@@ -180,7 +180,7 @@ func (c *GetCmd) paths(ctx context.Context, user *client.Client) error {
 		return err
 	}
 	if response.Settling {
-		warn("the server has not run its first reconcile yet; this is intent, not what is running")
+		warn("still settling: this is intent, not what is running")
 	}
 
 	paths := filterPaths(response.Paths, c.Node)

@@ -24,6 +24,14 @@ import (
 // failed, leaves the earlier ones applied, and exits non-zero. Requests are independent durable
 // intent, so a partial apply is a partial success rather than a broken half-state — and stopping
 // at the first failure is what makes the failure findable.
+//
+// **The output is a list, not a table** — `<name> <what happened>` per document, in the shape
+// `kubectl apply` uses. It was padded to a fixed column width and read as a table with a missing
+// header row; it is not one. The second field is prose of unbounded length (`created`, but also
+// `INVALID (unknown_output_root): …`), so no honest heading exists for it, and the padding broke
+// on any name longer than the column anyway. Tabwriter is not the fix either: lines are printed
+// as each POST returns, which is the feedback that matters when a document is about to fail, and
+// a tabwriter would buffer them all until the end. The tables live in `get` and `status`.
 type ApplyCmd struct {
 	Files []string `short:"f" required:"" help:"Manifest file, directory of *.yaml, or - for stdin. Repeatable."`
 
@@ -46,7 +54,7 @@ func (c *ApplyCmd) Run(ctx context.Context) error {
 	// moving video. The selector is the guard, which is also why there is no confirmation prompt:
 	// a prompt in a tool meant to run in CI is a trap, and this has a --dry-run instead.
 	if c.Prune && len(selector) == 0 {
-		return errors.New("--prune requires --selector: pruning everything the manifest does not name would cancel requests it knows nothing about")
+		return errors.New("--prune requires --selector: it is the guard on what may be cancelled")
 	}
 	if !c.Prune && len(selector) > 0 {
 		return errors.New("--selector is only meaningful with --prune")
@@ -81,11 +89,11 @@ func (c *ApplyCmd) Run(ctx context.Context) error {
 
 		applied, err := api.Apply(ctx, spec, c.DryRun)
 		if err != nil {
-			fmt.Printf("%-40s %s\n", spec.Name, applyError(err))
+			fmt.Printf("%s %s\n", spec.Name, applyError(err))
 			failed++
 			continue
 		}
-		fmt.Printf("%-40s %s%s\n", spec.Name, applied.Outcome, statusSuffix(applied.Request.Status))
+		fmt.Printf("%s %s%s\n", spec.Name, applied.Outcome, statusSuffix(applied.Request.Status))
 	}
 
 	if c.Prune {
@@ -119,15 +127,15 @@ func (c *ApplyCmd) prune(ctx context.Context, api *client.Client, selector map[s
 			continue
 		}
 		if c.DryRun {
-			fmt.Printf("%-40s would be pruned\n", request.Name)
+			fmt.Printf("%s would be pruned\n", request.Name)
 			continue
 		}
 		if _, err := api.DeleteRequest(ctx, request.Name); err != nil {
-			fmt.Printf("%-40s prune failed: %s\n", request.Name, err)
+			fmt.Printf("%s prune failed: %s\n", request.Name, err)
 			failed++
 			continue
 		}
-		fmt.Printf("%-40s pruned\n", request.Name)
+		fmt.Printf("%s pruned\n", request.Name)
 	}
 	return failed, nil
 }

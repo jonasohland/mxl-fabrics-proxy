@@ -19,6 +19,9 @@ import (
 //
 // `-f` takes only the **names** from the file and ignores everything else in it, so the manifest
 // that created a set removes it without having to still be accurate about where anything goes.
+//
+// Output is a list of `<name> <what happened>`, matching `apply` — see the note there for why
+// neither verb prints a table.
 type DeleteCmd struct {
 	Files []string `short:"f" help:"Manifest file, directory of *.yaml, or - for stdin. Only the names are read. Repeatable."`
 	Names []string `arg:"" optional:"" help:"Request names to cancel."`
@@ -56,12 +59,12 @@ func (c *DeleteCmd) Run(ctx context.Context) error {
 		found, err := api.DeleteRequest(ctx, name)
 		switch {
 		case err != nil:
-			fmt.Printf("%-40s error: %s\n", name, err)
+			fmt.Printf("%s error: %s\n", name, err)
 			failed++
 		case found:
-			fmt.Printf("%-40s cancelled\n", name)
+			fmt.Printf("%s cancelled\n", name)
 		default:
-			fmt.Printf("%-40s not found\n", name)
+			fmt.Printf("%s not found\n", name)
 		}
 	}
 

@@ -104,7 +104,7 @@ func Destination(spec api.RequestSpec, dst api.Destination, fleet *state.Fleet, 
 			if !node.Value.Capabilities.SchedPrio {
 				return negotiate.Result{}, root, &Result{
 					Code:    api.ReasonSchedPrioUnavailable,
-					Message: fmt.Sprintf("node %q cannot apply sched_prio: it advertises neither CAP_SYS_NICE nor RLIMIT_RTPRIO", node.Value.Node),
+					Message: fmt.Sprintf("node %q cannot apply sched_prio: no CAP_SYS_NICE or RLIMIT_RTPRIO", node.Value.Node),
 				}
 			}
 		}
@@ -144,7 +144,7 @@ func resolveRoot(dst api.Destination, node state.NodeRecord) (string, *Result) {
 	if err := api.ValidDomainElements(dst.Domain); err != nil {
 		return "", &Result{
 			Code:    api.ReasonMalformedDomainName,
-			Message: fmt.Sprintf("destination domain %q is not a usable domain name: %s", dst.DomainName(), err),
+			Message: fmt.Sprintf("invalid destination domain %q: %s", dst.DomainName(), err),
 		}
 	}
 
@@ -156,7 +156,7 @@ func resolveRoot(dst api.Destination, node state.NodeRecord) (string, *Result) {
 	if _, taken := node.Domain(dst.DomainName()); taken {
 		return "", &Result{
 			Code: api.ReasonDomainNameInUse,
-			Message: fmt.Sprintf("node %q already maps %q as an input domain; one name cannot mean two directories on one node",
+			Message: fmt.Sprintf("node %q already maps %q as an input domain",
 				dst.Node, dst.DomainName()),
 		}
 	}
@@ -166,7 +166,7 @@ func resolveRoot(dst api.Destination, node state.NodeRecord) (string, *Result) {
 	case len(roots) == 0:
 		return "", &Result{
 			Code: api.ReasonNoOutputRoot,
-			Message: fmt.Sprintf("node %q advertises no output root, so it cannot be a replication destination; it maps %s as inputs",
+			Message: fmt.Sprintf("node %q advertises no output root; it maps %s as inputs",
 				dst.Node, domainList(node.Domains)),
 		}
 
@@ -178,7 +178,7 @@ func resolveRoot(dst api.Destination, node state.NodeRecord) (string, *Result) {
 			// error carries its own fix.
 			return "", &Result{
 				Code: api.ReasonAmbiguousOutputRoot,
-				Message: fmt.Sprintf("node %q advertises %d output roots (%s) and this request names none; name one",
+				Message: fmt.Sprintf("node %q advertises %d output roots (%s); name one",
 					dst.Node, len(roots), rootList(roots)),
 			}
 		}
@@ -225,7 +225,7 @@ func pathInUse(dst api.Destination, root string, node state.NodeRecord) *Result 
 		}
 		return &Result{
 			Code: api.ReasonDomainPathInUse,
-			Message: fmt.Sprintf("domain %q under output root %q on node %q resolves to %s, which that node maps as input domain %q; an input domain is never written to",
+			Message: fmt.Sprintf("domain %q under root %q on node %q resolves to %s, which it maps as input domain %q",
 				dst.DomainName(), root, dst.Node, resolved, mapping.Name),
 		}
 	}
@@ -303,7 +303,7 @@ func Conflicts(paths []PathRef) map[string]Result {
 			if root, taken := rootFor[endpoint(dst.Node, dst.DomainName())]; taken && root != dst.Root {
 				out[ref.ID] = Result{
 					Code: api.ReasonDomainNameInUse,
-					Message: fmt.Sprintf("domain %q on node %q is already being materialised under output root %q; one name cannot mean two directories on one node",
+					Message: fmt.Sprintf("domain %q on node %q is already materialised under output root %q",
 						dst.DomainName(), dst.Node, root),
 				}
 				continue
@@ -320,7 +320,7 @@ func Conflicts(paths []PathRef) map[string]Result {
 			if outer, nested := nestedDomain(dst, nestable[dst.Node]); nested {
 				out[ref.ID] = Result{
 					Code: api.ReasonDomainNameInUse,
-					Message: fmt.Sprintf("domain %q on node %q nests with %q, which another path already materialises; an output domain cannot contain another",
+					Message: fmt.Sprintf("domain %q on node %q nests with %q, which another path materialises",
 						dst.DomainName(), dst.Node, api.DomainPath(outer)),
 				}
 				continue
@@ -331,7 +331,7 @@ func Conflicts(paths []PathRef) map[string]Result {
 			if existing != src {
 				out[ref.ID] = Result{
 					Code: api.ReasonFlowConflict,
-					Message: fmt.Sprintf("%s/%s already receives flow %s from %s/%s; two producers into one flow corrupts the ring buffer",
+					Message: fmt.Sprintf("%s/%s already receives flow %s from %s/%s",
 						dst.Node, dst.DomainName(), src.Flow, existing.Node, existing.Domain),
 				}
 				continue

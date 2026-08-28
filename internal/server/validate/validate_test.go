@@ -125,7 +125,7 @@ func TestSpecRejections(t *testing.T) {
 				f.Nodes["edge-01"] = entry
 			},
 			want:    api.ReasonNoOutputRoot,
-			message: "cannot be a replication destination",
+			message: "advertises no output root",
 		},
 		{
 			name:    "unknown output root",
@@ -462,7 +462,7 @@ func TestOutputDomainsMayNotNest(t *testing.T) {
 	require.Contains(t, out, "b", "the newer path loses, as every conflict resolves oldest-first")
 	assert.NotContains(t, out, "a")
 	assert.Equal(t, api.ReasonDomainNameInUse, out["b"].Code)
-	assert.Contains(t, out["b"].Message, "cannot contain another")
+	assert.Contains(t, out["b"].Message, "nests with")
 
 	// Both directions: a parent arriving after a child is the same conflict.
 	out = Conflicts([]PathRef{

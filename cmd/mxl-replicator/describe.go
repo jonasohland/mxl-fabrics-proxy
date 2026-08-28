@@ -95,7 +95,7 @@ func printNode(node api.Node, paths []api.Path) {
 	// Registration is durable and survives the agent being down; only the lease goes away. An
 	// expired lease is not proof that this node's workers stopped, which is why the two are
 	// reported separately rather than as one "up" (§4.2, §7.1).
-	live := "no lease — registered but no agent is currently holding this node's identity"
+	live := "no lease"
 	if node.Live {
 		live = "leased by " + node.Instance
 	}
@@ -117,10 +117,10 @@ func printNode(node api.Node, paths []api.Path) {
 	}
 	fmt.Printf("  sched_prio    %t\n", node.Capabilities.SchedPrio)
 	if node.Capabilities.PortRange != "" {
-		fmt.Printf("  port range    %s (inbound, on this host)\n", node.Capabilities.PortRange)
+		fmt.Printf("  port range    %s (inbound)\n", node.Capabilities.PortRange)
 	}
 
-	fmt.Println("\n  Input domains — read from, never written to")
+	fmt.Println("\n  Input domains")
 	if len(node.Domains) == 0 {
 		fmt.Println("    none")
 	}
@@ -135,15 +135,15 @@ func printNode(node api.Node, paths []api.Path) {
 	// The whole of the authority the API has over this node's filesystem (§10.6, §13). A node
 	// with none is not a replication destination at all, and saying so plainly here saves an
 	// operator working it out from an INVALID request later.
-	fmt.Println("\n  Output roots — replication may create domains here")
+	fmt.Println("\n  Output roots")
 	if len(node.Capabilities.OutputRoots) == 0 {
-		fmt.Println("    none — this node cannot be a replication destination")
+		fmt.Println("    none — not a replication destination")
 	}
 	for _, root := range node.Capabilities.OutputRoots {
 		fmt.Printf("    %-24s %s\n", root.Name, root.Path)
 	}
 
-	fmt.Println("\n  Fabric attachments — two nodes pair only on a shared fabric label")
+	fmt.Println("\n  Fabric attachments")
 	if len(node.Capabilities.Fabrics) == 0 {
 		fmt.Println("    none")
 	}
@@ -218,7 +218,7 @@ func printFlow(id string, entries []api.FlowEntry, paths []api.Path) {
 		fmt.Printf("  definition    %s\n", summary)
 	}
 
-	fmt.Printf("\n  Locations — the same flow id on N nodes is what replication produces\n")
+	fmt.Printf("\n  Locations\n")
 	out := tabwriter.NewWriter(os.Stdout, 2, 0, 2, ' ', 0)
 	fmt.Fprintln(out, "  NODE/DOMAIN\tPRODUCING")
 	for _, entry := range entries {
@@ -321,7 +321,7 @@ func printRequest(request api.Request) {
 	fmt.Printf("  source        %s/%s %s\n", request.Source.Node, request.Source.Domain, selectorText(request.Source.Select))
 	fmt.Printf("  created       %s (%s ago)\n", request.CreatedAt.Format(time.RFC3339), since(request.CreatedAt))
 	if !request.Provider.IsEmpty() {
-		fmt.Printf("  provider      %s (honoured or the request fails; never substituted)\n", providerText(request.Provider))
+		fmt.Printf("  provider      %s (pinned)\n", providerText(request.Provider))
 	}
 	if request.IdleTeardown != nil {
 		teardown := "never — workers stay hot"
@@ -362,7 +362,7 @@ func printRequest(request api.Request) {
 	// answer an operator needs and it has no meaning in a one-flow-per-request model (§9.1).
 	fmt.Println()
 	if len(request.Status.Paths) == 0 {
-		fmt.Println("  No paths: the selector matches nothing yet.")
+		fmt.Println("  No paths — the selector matches nothing yet.")
 		return
 	}
 	out = tabwriter.NewWriter(os.Stdout, 2, 0, 2, ' ', 0)
@@ -409,10 +409,10 @@ func printPath(path api.Path) {
 
 	fmt.Println()
 	if path.Session == nil {
-		fmt.Println("  No session: nothing is running on this path yet.")
+		fmt.Println("  No session — nothing is running on this path yet.")
 		return
 	}
-	fmt.Printf("  Session %s — describe session %s for its workers\n", path.Session.ID, path.Session.ID)
+	fmt.Printf("  Session %s\n", path.Session.ID)
 	fmt.Printf("    fabric      %s / %s\n", path.Session.Fabric, path.Session.Interface.Provider)
 	fmt.Printf("    state       %s\n", endpointSummary(*path.Session))
 }
@@ -445,7 +445,7 @@ func printSession(path api.Path) {
 	// lifetime. The library does no negotiation of its own and requires identical values, so this
 	// is one value describing two workers rather than one per side (§5.5, §10.3).
 	fmt.Printf("\n  fabric        %s\n", session.Fabric)
-	fmt.Printf("  provider      %s (pinned for this session's lifetime)\n", session.Interface.Provider)
+	fmt.Printf("  provider      %s (pinned)\n", session.Interface.Provider)
 	fmt.Printf("  interface     %s\n", capsText(session.Interface.CapFlags, session.Interface.MaxMessageSize))
 
 	// A content hash of the target worker's incarnation, not a counter: it has no ordering, only
@@ -453,7 +453,7 @@ func printSession(path api.Path) {
 	// reconnect (§5.2).
 	epoch := session.Epoch
 	if epoch == "" {
-		epoch = "not yet reported — no initiator is assigned until it is"
+		epoch = "not yet reported"
 	}
 	fmt.Printf("  epoch         %s\n", epoch)
 

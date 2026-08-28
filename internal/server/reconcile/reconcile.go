@@ -437,7 +437,7 @@ func negotiatedFor(plan *pathPlan, perPath map[string]negotiate.Result, fleet *s
 	if plan.pinConflict {
 		return negotiate.Result{}, &validate.Result{
 			Code:    api.ReasonPinNotViable,
-			Message: "the requests sharing this path pin providers with nothing in common; one session cannot satisfy both",
+			Message: "the requests sharing this path request incompatible providers",
 		}
 	}
 
@@ -862,11 +862,11 @@ func restartReason(restarts int) string {
 func establishingReason(session *api.Session) string {
 	switch {
 	case session.Target == nil:
-		return "waiting for the destination agent to start its target worker"
+		return "waiting for destination to start the target"
 	case session.Target.State != api.WorkerReady:
 		return "target worker is " + string(session.Target.State)
 	case session.Initiator == nil:
-		return "waiting for the source agent to start its initiator worker"
+		return "waiting for source to start the initiator"
 	default:
 		return "initiator worker is " + string(session.Initiator.State)
 	}

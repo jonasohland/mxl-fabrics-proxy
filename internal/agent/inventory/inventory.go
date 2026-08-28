@@ -35,6 +35,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -86,11 +87,15 @@ type Options struct {
 	// replication *source* but never a destination — that is the invariant that stops the API
 	// being a remote arbitrary-filesystem-write primitive (§7.2, §13), and it is enforced by
 	// [api.DomainInventory.Configured] travelling with every domain.
+	//
+	// A search path may sit above an output root; what it finds inside one is pruned. See [prune]
+	// for why, and for the one thing that costs.
 	SearchPaths []string
 
-	// OutputRoots are the directories replication may create domains under (§10.6). Nothing is
-	// discovered into them and nothing here observes them: they are the *write* side, resolved by
-	// [Inventory.Output] from an assignment's root and domain names alone.
+	// OutputRoots are the directories replication may create domains under (§10.6). They are the
+	// *write* side, resolved by [Inventory.Output] from an assignment's root and domain names
+	// alone, and **a root is written, not read**: [prune] hides every root from discovery, so a
+	// search path may sit above one and nothing inside it is ever reported by a scan.
 	//
 	// No default. A node with none configured accepts no replication destinations, which is the
 	// right posture for an opt-in that grants filesystem write authority.
@@ -354,7 +359,19 @@ func (i *Inventory) Run(ctx context.Context) error {
 	}
 	i.mu.Lock()
 	i.watcher = watcher
+	// A reconcile can materialise a domain before this point, since the agent starts its poll loop
+	// and this loop concurrently. [Inventory.Materialise] would have found a nil watcher, added the
+	// domain here and nowhere else, and — being idempotent on the name it already recorded — would
+	// never have got round to the watcher on a later pass. The domain would then report no flows
+	// for as long as it existed, and its path could never leave ESTABLISHING (§11).
+	pending := slices.Collect(maps.Keys(i.materialised))
 	i.mu.Unlock()
+
+	// Safe in the discoverer's receiver order: the inventory already knows these, which is exactly
+	// what makes it safe for the watcher to start reporting flows in them.
+	for _, path := range pending {
+		watcher.AddDomain(path)
+	}
 
 	static := make([]string, 0, len(i.static))
 	for _, domain := range i.static {
@@ -365,11 +382,15 @@ func (i *Inventory) Run(ctx context.Context) error {
 	// reporting the flows already in it, so a flow never arrives for a domain that is not there
 	// yet. On the way out the order reverses in effect — the domain is forgotten first and the
 	// watcher's removals land on nothing, which [Inventory.RemoveFlow] tolerates.
-	mxl.NewDiscoverer(ctx, &wg, []mxl.DomainReceiver{i, watcher}, i.search, static)
+	//
+	// Both go behind [prune] when this node has output roots, so that the order is preserved for
+	// the domains that are reported and neither receiver sees the ones that are not (§10.6).
+	mxl.NewDiscoverer(ctx, &wg, i.receivers(watcher), i.search, static)
 
 	i.log.Info("observing domains",
 		"configured", len(i.static), "search_paths", len(i.search),
 		"interval", i.interval, "idle_after", i.idleAfter)
+	i.logExclusions()
 
 	ticker := time.NewTicker(i.interval)
 	defer ticker.Stop()

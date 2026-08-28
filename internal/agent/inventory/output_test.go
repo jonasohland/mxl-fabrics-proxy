@@ -1,10 +1,12 @@
 package inventory
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jonasohland/mxl-utils/pkg/testutil"
 	"github.com/stretchr/testify/assert"
@@ -286,7 +288,36 @@ func TestValidateRootsIsTheSameRuleWithoutAnInventory(t *testing.T) {
 		[]string{nested},
 	)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "overlaps search path")
+	assert.Contains(t, err.Error(), "contains search path")
+}
+
+// **A search path may be the parent of a root**, which is the mirror of
+// TestARootMayBeTheParentOfAnInputDomain and the same layout seen from the other side: one MXL
+// area per host, part of it discovered and part of it written (§10.6).
+func TestASearchPathMayBeTheParentOfARoot(t *testing.T) {
+	base := t.TempDir()
+	replicated := filepath.Join(base, "replicated")
+	cameras := filepath.Join(base, "cameras")
+
+	inv, err := New(Options{
+		Domains:     []Domain{{Name: "cameras", Path: cameras}},
+		SearchPaths: []string{base},
+		OutputRoots: []Root{{Name: "local", Path: replicated}},
+		Logger:      discard(),
+	})
+	require.NoError(t, err, "a search path above a root is a legal layout")
+
+	resolved, err := inv.Output("local", []string{"ingest"})
+	require.NoError(t, err)
+	assert.Equal(t, filepath.Join(replicated, "ingest"), resolved)
+
+	// Both permissions at once, since they are the layout people actually write: the search path
+	// covers the root, and the root's parent also holds a mapped input domain.
+	assert.NoError(t, ValidateRoots(
+		[]Root{{Name: "local", Path: replicated}},
+		[]Domain{{Name: "cameras", Path: cameras}},
+		[]string{base},
+	))
 }
 
 func TestRootsAreWhatRegistrationAdvertises(t *testing.T) {
@@ -362,20 +393,24 @@ func TestRootConfigurationIsRefusedWhenItIsAmbiguous(t *testing.T) {
 			want: `overlaps domain "cameras"`,
 		},
 		{
-			name: "root under a search path",
+			// Provably a no-op rather than merely redundant: prune hides the whole root, so this
+			// search path could never report anything.
+			name: "root that is a search path",
 			opts: Options{
 				SearchPaths: []string{base},
-				OutputRoots: []Root{{Name: "fast", Path: nested}},
+				OutputRoots: []Root{{Name: "fast", Path: base}},
 			},
-			want: "overlaps search path",
+			want: "could never find anything",
 		},
 		{
+			// The other direction stays refused: a search path inside a root asks discovery to
+			// read the directory replication writes into.
 			name: "root over a search path",
 			opts: Options{
 				SearchPaths: []string{nested},
 				OutputRoots: []Root{{Name: "fast", Path: base}},
 			},
-			want: "overlaps search path",
+			want: "contains search path",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -394,6 +429,53 @@ func TestRootConfigurationIsRefusedWhenItIsAmbiguous(t *testing.T) {
 		Logger:      discard(),
 	})
 	require.NoError(t, err)
+}
+
+// A domain materialised *before* [Inventory.Run] still reaches the watch set.
+//
+// The agent starts its poll loop and the observe loop concurrently, so a reconcile can land first
+// and find a nil watcher. Materialise adds the domain to this inventory anyway and — being
+// idempotent on the name it recorded — never revisits the watcher, so without the catch-up in Run
+// the domain would report no flows for as long as it existed and its path could never leave
+// ESTABLISHING (§11).
+func TestMaterialiseBeforeRunStillWatches(t *testing.T) {
+	root := t.TempDir()
+	changes := make(chan struct{}, 128)
+
+	inv, err := New(Options{
+		OutputRoots: []Root{{Name: "local", Path: root}},
+		Logger:      discard(),
+		Interval:    5 * time.Millisecond,
+		OnChange: func() {
+			select {
+			case changes <- struct{}{}:
+			default:
+			}
+		},
+	})
+	require.NoError(t, err)
+
+	resolved, err := inv.Output("local", []string{"cam1"})
+	require.NoError(t, err)
+	require.NoError(t, inv.Materialise("cam1", resolved), "before Run, so there is no watcher yet")
+
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		assert.NoError(t, inv.Run(ctx))
+	}()
+	t.Cleanup(func() { cancel(); <-done })
+
+	flow, err := testutil.RandomVideoFlow(resolved)
+	require.NoError(t, err)
+	require.NoError(t, flow.Create())
+
+	h := &harness{Inventory: inv}
+	snapshot := h.eventually(t, "the flow in a domain materialised before Run", func(s []api.DomainInventory) bool {
+		return len(s) == 1 && len(s[0].Flows) == 1
+	})
+	assert.Equal(t, "cam1", snapshot[0].Name)
 }
 
 // **A root may be the parent of an input domain.** One directory holding this node's domains,

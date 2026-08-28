@@ -228,10 +228,32 @@ func (c *AgentOptions) Run(ctx context.Context, logger *slog.Logger) error {
 			"hint", "declare --agent-fabric or a fabrics: block to replicate to other hosts")
 	}
 
+	// Bound before the agent starts, and synchronously. The bind is the one startup step that
+	// fails for a reason outside this process — the port is already taken — and doing it inside
+	// the serve goroutine deferred that error until the goroutine's result was read, which is
+	// after Agent.Run returns, which is at shutdown. The agent ran on looking healthy with no
+	// metrics endpoint at all, and reported the failure when SIGINT finally let it be read.
+	listener, err := net.Listen("tcp", c.Listen)
+	if err != nil {
+		return fmt.Errorf("listen on %s: %w", c.Listen, err)
+	}
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
 	serving := make(chan error, 1)
-	go func() { serving <- c.serve(ctx, logger, built) }()
+	go func() {
+		// Serving stopping early is the same class of failure as never starting: the node is
+		// unobservable. End the agent with it rather than leave it running unscrapable.
+		defer cancel()
+		serving <- c.serve(ctx, logger, built, listener)
+	}()
 
 	err = built.Run(ctx)
+
+	// Before the receive, not after: Agent.Run can return for reasons of its own, and serve is
+	// blocked in Serve until its context ends.
+	cancel()
 
 	if serveErr := <-serving; serveErr != nil && err == nil {
 		err = serveErr
@@ -380,12 +402,14 @@ func (c *AgentOptions) workerLogLevel(ctx context.Context, logger *slog.Logger) 
 	return slog.LevelError
 }
 
-// serve runs the agent's own HTTP surface: health, and this node's metrics.
+// serve runs the agent's own HTTP surface: health, and this node's metrics, on an
+// already-bound listener. Binding is the caller's, so a port collision is a startup error rather
+// than something discovered at shutdown — see Run.
 //
 // The registry is the agent's own rather than the process default, because a combined instance
 // runs a server on a second listener with a second registry and the two expose different things
 // (§4.7).
-func (c *AgentOptions) serve(ctx context.Context, logger *slog.Logger, built *agent.Agent) error {
+func (c *AgentOptions) serve(ctx context.Context, logger *slog.Logger, built *agent.Agent, listener net.Listener) error {
 	registry := metrics.New()
 	registry.MustRegister(built.Collector())
 
@@ -398,11 +422,6 @@ func (c *AgentOptions) serve(ctx context.Context, logger *slog.Logger, built *ag
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"status":"ok"}` + "\n"))
 	})
-
-	listener, err := net.Listen("tcp", c.Listen)
-	if err != nil {
-		return fmt.Errorf("listen on %s: %w", c.Listen, err)
-	}
 
 	server := &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second}
 	go func() {
