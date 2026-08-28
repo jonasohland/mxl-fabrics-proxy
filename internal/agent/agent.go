@@ -107,6 +107,14 @@ type Config struct {
 	BackoffReset      time.Duration
 	TargetInfoTimeout time.Duration
 	StopGrace         time.Duration
+
+	// ScrapeConcurrency is how many worker sockets [Agent.Collector] reads at once.
+	ScrapeConcurrency int
+
+	// WorkerScrapeTimeout and ScrapeTimeout bound one worker's scrape and a whole collection
+	// (§12). The second is the one that keeps wedged workers from costing the endpoint.
+	WorkerScrapeTimeout time.Duration
+	ScrapeTimeout       time.Duration
 }
 
 // Agent is one node's control-plane presence and worker supervisor.
@@ -179,6 +187,11 @@ func New(cfg Config) (*Agent, error) {
 	setDefault(&cfg.BackoffReset, DefaultBackoffReset)
 	setDefault(&cfg.TargetInfoTimeout, DefaultTargetInfoTimeout)
 	setDefault(&cfg.StopGrace, DefaultStopGrace)
+	setDefault(&cfg.WorkerScrapeTimeout, DefaultWorkerScrapeTimeout)
+	setDefault(&cfg.ScrapeTimeout, DefaultScrapeTimeout)
+	if cfg.ScrapeConcurrency <= 0 {
+		cfg.ScrapeConcurrency = DefaultScrapeConcurrency
+	}
 
 	return &Agent{
 		cfg:      cfg,

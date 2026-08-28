@@ -39,6 +39,7 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 			"agent_protocol", registration.Capabilities.Versions.Protocol,
 			"server_protocol", api.ProtocolVersion,
 			"agent_version", registration.Capabilities.Versions.Replicator)
+		s.metrics.registrationsRejected.WithLabelValues("version_skew").Inc()
 		writeError(w, http.StatusBadRequest, api.CodeVersionSkew, err.Error())
 		return
 	}
@@ -77,6 +78,7 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 			// (§7.1).
 			s.logger.Error("rejecting a second claimant for a node name",
 				"node", node, "claimant", registration.Instance, "holder", claimed.holder)
+			s.metrics.registrationsRejected.WithLabelValues("node_claimed").Inc()
 			writeError(w, http.StatusConflict, api.CodeNodeClaimed,
 				"node "+node+" is already claimed by another agent instance",
 				"holder", claimed.holder)

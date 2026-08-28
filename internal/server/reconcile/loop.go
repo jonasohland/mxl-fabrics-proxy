@@ -37,6 +37,52 @@ type LoopOptions struct {
 
 	// Now is the clock, injectable for tests.
 	Now func() time.Time
+
+	// Hooks report what the loop did, for metrics. Optional.
+	Hooks Hooks
+}
+
+// Outcome is how one reconcile pass ended.
+type Outcome string
+
+const (
+	// OutcomeOK is a pass that computed and applied.
+	OutcomeOK Outcome = "ok"
+
+	// OutcomeRefused is the store-wipe guard declining to act: leased agents, no observed state
+	// (plan §4.2). Correct, and invisible without a count — the fleet keeps running on assignments
+	// nobody is rewriting, so nothing else in the system looks wrong.
+	OutcomeRefused Outcome = "refused"
+
+	// OutcomeFailed is a pass that could not read or write the store.
+	OutcomeFailed Outcome = "failed"
+)
+
+// Hooks are the loop's metric callbacks (§12).
+//
+// Callbacks rather than a registry here, so this package stays free of a metrics dependency and
+// its tests can assert on what the loop *decided* without gathering an exposition. Nil functions
+// are not called.
+type Hooks struct {
+	// Pass is called once per completed pass.
+	Pass func(outcome Outcome, took time.Duration)
+
+	// EpochChanged is called once per session seen to change epoch, with the node hosting the
+	// target that produced it. Never called for a session acquiring its first epoch, which is
+	// establishment rather than a transition.
+	EpochChanged func(node string)
+}
+
+func (h Hooks) pass(outcome Outcome, took time.Duration) {
+	if h.Pass != nil {
+		h.Pass(outcome, took)
+	}
+}
+
+func (h Hooks) epochChanged(node string) {
+	if h.EpochChanged != nil {
+		h.EpochChanged(node)
+	}
 }
 
 // Loop runs Compute → Apply whenever anything relevant changes.
@@ -46,6 +92,86 @@ type Loop struct {
 
 	mu      sync.Mutex
 	settled bool
+	leading bool
+
+	// observed is the last completed pass, for metrics (§12), and epochs is what that pass saw
+	// each session's epoch to be.
+	//
+	// Both are leader-local memory, for the same reason [idleTracker] is: the alternative is
+	// putting a continuously-changing value into the store, which is the churn §8.3's sizing
+	// depends on not existing. A leader change resets them, and the first pass after one reports
+	// no epoch transitions — which is right, because this replica did not see one.
+	observed *Observation
+	epochs   map[string]string
+}
+
+// Observation is what one reconcile pass saw, kept so that metrics can be served without a
+// second full read of the store (§12).
+//
+// Counts rather than the objects they were counted from: this is retained between passes, and
+// holding a whole [Result] would keep every path, session and assignment alive for as long as
+// the leader runs.
+type Observation struct {
+	At       time.Time
+	Duration time.Duration
+	Revision int64
+
+	Nodes  int
+	Leases int
+
+	// Versions counts leased agents by what they reported at registration. The fleet's version
+	// spread is something §13.1 asks the server to surface, and it is the server's alone to know
+	// — an agent cannot see another agent's build.
+	Versions map[VersionKey]int
+
+	// Requests, Paths and Workers are counts by status. Every status in each vocabulary is
+	// present, including the zeroes: a state that vanished from the exposition because nothing is
+	// in it reads as a gap in the graph rather than a floor.
+	Requests map[api.State]int
+	Paths    map[api.State]int
+	Workers  map[api.WorkerState]int
+
+	// Frozen is sessions carried forward because an endpoint's agent is not leased — the
+	// mechanism that keeps a control-plane blip from stopping media, worth seeing when it engages.
+	Frozen int
+
+	// EpochChanges counts sessions whose epoch differed from the previous pass, by the node
+	// hosting the target that produced it.
+	//
+	// This is the flapping signal the epoch cannot carry on its own: it is a content hash with no
+	// ordering, so nothing downstream can tell a new incarnation from a reordering without
+	// remembering the old value, and only the reconciler sees every session (§5.2, §12).
+	EpochChanges map[string]int
+}
+
+// VersionKey identifies one build of the agent, for counting the fleet's spread.
+type VersionKey struct {
+	Replicator string
+	Protocol   int
+}
+
+// Observation returns the last completed pass, or nil if this replica has not reconciled — which
+// is the ordinary state of a follower, since only the leader runs a loop.
+func (l *Loop) Observation() *Observation {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.observed
+}
+
+// Leading reports whether this replica is running the reconciler.
+func (l *Loop) Leading() bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.leading
+}
+
+func (l *Loop) lead(leading bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.leading = leading
+	if !leading {
+		l.observed, l.epochs, l.settled = nil, nil, false
+	}
 }
 
 // NewLoop builds a reconcile loop. It does nothing until [Loop.Run] is called, which the server
@@ -85,6 +211,12 @@ func (l *Loop) Config() Config { return l.opts.Config }
 // Run reconciles until ctx ends. It returns nil on cancellation — losing leadership is an
 // ordinary event, not a failure.
 func (l *Loop) Run(ctx context.Context) error {
+	l.lead(true)
+	// Leadership ending drops the observation with it. A demoted replica that kept exporting the
+	// fleet gauges would put a second, frozen copy of every one of them next to the new leader's
+	// live ones, and nothing in the exposition would say which was which (§12).
+	defer l.lead(false)
+
 	for {
 		err := l.session(ctx)
 		switch {
@@ -94,6 +226,7 @@ func (l *Loop) Run(ctx context.Context) error {
 			// A watch that ended, a store that hiccuped. Nothing is torn down when a reconcile
 			// does not happen: the store still holds the assignments the agents are already
 			// running, and they are level-triggered against those.
+			l.opts.Hooks.pass(OutcomeFailed, 0)
 			l.opts.Logger.Warn("reconcile loop restarting", "error", err)
 			select {
 			case <-ctx.Done():
@@ -239,6 +372,8 @@ func reportedCount(fleet *state.Fleet) int {
 
 // once is a single load → compute → apply pass.
 func (l *Loop) once(ctx context.Context) error {
+	started := l.opts.Now()
+
 	fleet, err := state.Load(ctx, l.opts.Store)
 	if err != nil {
 		return err
@@ -254,6 +389,7 @@ func (l *Loop) once(ctx context.Context) error {
 	if len(fleet.Leases) > 0 && len(fleet.Inventory) == 0 {
 		l.opts.Logger.Warn("refusing to reconcile: agents are leased but none has reported inventory",
 			"leased", len(fleet.Leases))
+		l.opts.Hooks.pass(OutcomeRefused, l.opts.Now().Sub(started))
 		return nil
 	}
 
@@ -284,7 +420,101 @@ func (l *Loop) once(ctx context.Context) error {
 			"sessions", len(result.Frozen))
 	}
 
-	return l.publish(ctx, fleet)
+	l.observe(fleet, result, l.opts.Now().Sub(started))
+	if err := l.publish(ctx, fleet); err != nil {
+		return err
+	}
+
+	l.opts.Hooks.pass(OutcomeOK, l.opts.Now().Sub(started))
+	return nil
+}
+
+// observe records what this pass saw.
+//
+// Called after Apply rather than before, so that a pass which failed to write leaves the previous
+// observation in place. A gauge describing a reconcile that did not complete would be worse than
+// a stale one, because the failure counter is what says a pass failed.
+func (l *Loop) observe(fleet *state.Fleet, result *Result, took time.Duration) {
+	l.mu.Lock()
+	previous := l.epochs
+	l.mu.Unlock()
+
+	observation := &Observation{
+		At:           l.opts.Now(),
+		Duration:     took,
+		Revision:     fleet.Revision,
+		Nodes:        len(fleet.Nodes),
+		Leases:       len(fleet.Leases),
+		Versions:     map[VersionKey]int{},
+		Requests:     zeroed(api.States()),
+		Paths:        zeroed(api.States()),
+		Workers:      zeroed(api.WorkerStates()),
+		Frozen:       len(result.Frozen),
+		EpochChanges: map[string]int{},
+	}
+
+	for _, lease := range fleet.Leases {
+		observation.Versions[VersionKey{
+			Replicator: lease.Value.Versions.Replicator,
+			Protocol:   lease.Value.Versions.Protocol,
+		}]++
+	}
+	for _, status := range result.Requests {
+		observation.Requests[status.State]++
+	}
+
+	epochs := make(map[string]string, len(result.Paths))
+	for _, path := range result.Paths {
+		observation.Paths[path.State]++
+		if path.Session == nil {
+			continue
+		}
+		for _, endpoint := range []*api.SessionEndpoint{path.Session.Target, path.Session.Initiator} {
+			if endpoint != nil {
+				observation.Workers[endpoint.State]++
+			}
+		}
+		if path.Session.Epoch == "" {
+			// A target that has died reports no epoch at all until it comes back — its old blob
+			// describes memory registrations that died with it, so the agent clears it (§5.2). The
+			// last known value has to be carried across that gap, or the epoch that arrives when
+			// the target returns looks like a session establishing for the first time and the
+			// restart this metric exists to catch is the one it misses.
+			if was, ok := previous[path.Session.ID]; ok {
+				epochs[path.Session.ID] = was
+			}
+			continue
+		}
+		epochs[path.Session.ID] = path.Session.Epoch
+		if was, seen := previous[path.Session.ID]; seen && was != path.Session.Epoch {
+			// A session first acquiring an epoch is not a transition — it is establishment. Only a
+			// session that had one and now has a different one is a target that restarted.
+			node := targetNode(path)
+			observation.EpochChanges[node]++
+			l.opts.Hooks.epochChanged(node)
+		}
+	}
+
+	l.mu.Lock()
+	l.observed, l.epochs = observation, epochs
+	l.mu.Unlock()
+}
+
+func targetNode(path api.Path) string {
+	if path.Session != nil && path.Session.Target != nil {
+		return path.Session.Target.Node
+	}
+	return path.Destination.Node
+}
+
+// zeroed seeds a count map with every member of a vocabulary, so a status nothing is currently in
+// exports as 0 rather than disappearing.
+func zeroed[T comparable](values []T) map[T]int {
+	out := make(map[T]int, len(values))
+	for _, value := range values {
+		out[value] = 0
+	}
+	return out
 }
 
 // publish records that the reconciler has settled, so that every replica — including the ones

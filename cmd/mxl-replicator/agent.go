@@ -20,6 +20,7 @@ import (
 	"github.com/jonasohland/mxl-replicator/internal/client"
 	"github.com/jonasohland/mxl-replicator/internal/config"
 	"github.com/jonasohland/mxl-replicator/internal/logging"
+	"github.com/jonasohland/mxl-replicator/internal/metrics"
 	"github.com/jonasohland/mxl-replicator/internal/worker/exec"
 )
 
@@ -202,7 +203,7 @@ func (c *AgentOptions) Run(ctx context.Context, logger *slog.Logger) error {
 	}
 
 	serving := make(chan error, 1)
-	go func() { serving <- c.serve(ctx, logger) }()
+	go func() { serving <- c.serve(ctx, logger, built) }()
 
 	err = built.Run(ctx)
 
@@ -349,12 +350,17 @@ func (c *AgentOptions) workerLogLevel(ctx context.Context, logger *slog.Logger) 
 	return slog.LevelError
 }
 
-// serve runs the agent's own HTTP surface.
+// serve runs the agent's own HTTP surface: health, and this node's metrics.
 //
-// Health only, for now. M6 adds /metrics here — the worker counters scraped from the AF_UNIX
-// sockets, labelled and cached, plus the supervisor-level series (§12).
-func (c *AgentOptions) serve(ctx context.Context, logger *slog.Logger) error {
+// The registry is the agent's own rather than the process default, because a combined instance
+// runs a server on a second listener with a second registry and the two expose different things
+// (§4.7).
+func (c *AgentOptions) serve(ctx context.Context, logger *slog.Logger, built *agent.Agent) error {
+	registry := metrics.New()
+	registry.MustRegister(built.Collector())
+
 	mux := http.NewServeMux()
+	mux.Handle("GET /metrics", metrics.Handler(registry, logger.With("module", "metrics")))
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		// Deliberately not a replication health check. The legacy proxy had the right instinct:
 		// a peer being unreachable is no reason to restart this process and drop every other
@@ -376,7 +382,7 @@ func (c *AgentOptions) serve(ctx context.Context, logger *slog.Logger) error {
 		_ = server.Shutdown(shutdownCtx)
 	}()
 
-	logger.Info("serving agent health", "address", listener.Addr().String())
+	logger.Info("serving agent health and metrics", "address", listener.Addr().String())
 	if err := server.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return err
 	}

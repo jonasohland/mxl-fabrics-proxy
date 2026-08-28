@@ -121,6 +121,9 @@ func TestKeyIgnoresIncidentalDifferences(t *testing.T) {
 	for name, mutate := range map[string]func(*Spec){
 		"re-derived service": func(s *Spec) { s.Service = "24999" },
 		"added label":        func(s *Spec) { s.Labels = map[string]string{"tenant": "studio-a"} },
+		// Two names may map to one directory, and only the directory is what the worker runs
+		// against. Renaming the domain relabels a metric; it must not restart a flow.
+		"renamed domain": func(s *Spec) { s.Domain = "cameras-renamed" },
 		"reordered capability flags": func(s *Spec) {
 			s.Interface.CapFlags = []api.CapFlag{api.CapBlockingOperations, api.CapRemoteWrite}
 		},

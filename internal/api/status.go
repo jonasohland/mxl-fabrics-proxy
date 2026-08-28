@@ -78,6 +78,23 @@ const (
 	WorkerFailed WorkerState = "failed"
 )
 
+// States is the whole operator-facing vocabulary, in the order a path moves through it.
+//
+// Exported because a status count has to be able to report a zero: a state nothing is currently
+// in must export as 0 rather than vanish, or a graph shows a gap where it should show a floor
+// (§12).
+func States() []State {
+	return []State{
+		StateWaiting, StateInvalid, StateEstablishing,
+		StatePaused, StateActive, StateDegraded, StateFailed,
+	}
+}
+
+// WorkerStates is the whole agent-facing vocabulary. Same reason as [States].
+func WorkerStates() []WorkerState {
+	return []WorkerState{WorkerStarting, WorkerReady, WorkerFailed}
+}
+
 // FlowAddress is (node, domain, flow-id) (§3).
 //
 // The domain component is required, not decorative: the same flow ID can legitimately exist in

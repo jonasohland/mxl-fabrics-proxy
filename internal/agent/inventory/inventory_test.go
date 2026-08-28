@@ -175,7 +175,7 @@ func (h *harness) settle(t *testing.T, id string) {
 		var head uint64
 		if ok {
 			if flow, ok := domain.flows[id]; ok {
-				head = flow.head
+				head = flow.written.value
 			}
 		}
 		h.mu.Unlock()
@@ -541,22 +541,32 @@ func TestSnapshotOrderIsStable(t *testing.T) {
 // The hysteresis rule in isolation, without a filesystem in the way.
 func TestObserveHysteresis(t *testing.T) {
 	now := time.Unix(0, 0)
-	f := &flowState{}
+	var l liveness
 
-	f.observe(10, now, time.Second)
-	assert.False(t, f.producing, "a baseline claims nothing")
+	l.observe(10, now, time.Second)
+	assert.False(t, l.active, "a baseline claims nothing")
 
-	f.observe(10, now.Add(2*time.Second), time.Second)
-	assert.False(t, f.producing)
+	l.observe(10, now.Add(2*time.Second), time.Second)
+	assert.False(t, l.active)
 
-	f.observe(11, now.Add(3*time.Second), time.Second)
-	assert.True(t, f.producing, "the first movement is enough")
+	l.observe(11, now.Add(3*time.Second), time.Second)
+	assert.True(t, l.active, "the first movement is enough")
 
-	f.observe(11, now.Add(3500*time.Millisecond), time.Second)
-	assert.True(t, f.producing, "still inside the threshold")
+	l.observe(11, now.Add(3500*time.Millisecond), time.Second)
+	assert.True(t, l.active, "still inside the threshold")
 
-	f.observe(11, now.Add(4*time.Second), time.Second)
-	assert.False(t, f.producing, "exactly at the threshold")
+	l.observe(11, now.Add(4*time.Second), time.Second)
+	assert.False(t, l.active, "exactly at the threshold")
+
+	// The same rule drives read activity, and it is the reason the two counters share a type:
+	// LastReadTime is treated as a number that changes when a reader reads, never as a TAI
+	// timestamp compared against a clock (§11.1).
+	l.reset()
+	assert.False(t, l.active, "a reset claims nothing either")
+	l.observe(1_700_000_000_000_000_000, now, time.Second)
+	assert.False(t, l.active)
+	l.observe(1_700_000_000_500_000_000, now.Add(time.Millisecond), time.Second)
+	assert.True(t, l.active)
 }
 
 // mxlsys and mxl are imported for the runtime type and the flow package; keep the compiler

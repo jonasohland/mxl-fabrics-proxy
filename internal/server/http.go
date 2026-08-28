@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/jonasohland/mxl-replicator/internal/api"
+	"github.com/jonasohland/mxl-replicator/internal/metrics"
 	"github.com/jonasohland/mxl-replicator/internal/server/state"
 	"github.com/jonasohland/mxl-replicator/internal/store"
 )
@@ -24,10 +25,16 @@ import (
 func (s *Server) routes() http.Handler {
 	mux := http.NewServeMux()
 
-	// Unauthenticated, and deliberately so: these are for a load balancer and a kubelet, which
-	// are not going to carry a bearer token, and they disclose nothing.
+	// Unauthenticated, and deliberately so: these are for a load balancer, a kubelet and a
+	// Prometheus, none of which is going to carry a bearer token.
+	//
+	// /metrics discloses counts and states, node names and build versions — no domain paths, no
+	// flow definitions and no target_info, which is the set of RDMA rkeys that makes the agent API
+	// the privileged one (§13). An operator who wants it closed anyway puts it behind the same
+	// ingress rule as everything else; the token is not the mechanism for that.
 	mux.HandleFunc("GET /healthz", s.handleHealth)
 	mux.HandleFunc("GET /readyz", s.handleReady)
+	mux.Handle("GET /metrics", metrics.Handler(s.registry, s.logger.With("module", "metrics")))
 
 	agent := http.NewServeMux()
 	agent.HandleFunc("POST "+api.PathRegister, s.handleRegister)

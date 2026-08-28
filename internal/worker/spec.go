@@ -52,6 +52,16 @@ type Spec struct {
 	// node in the fleet (§7.2, §13).
 	DomainPath string
 
+	// Domain is the domain's fleet-wide *name*, the one the assignment carried, kept for metric
+	// labelling (§12). [Spec.DomainPath] is where the worker actually goes.
+	//
+	// It travels rather than being looked up backwards from the path because that lookup is
+	// ambiguous: two configured names may map to one directory, and a metric that guessed
+	// between them would attribute a flow to the wrong one.
+	//
+	// Deliberately excluded from [Spec.Key] — see there.
+	Domain string
+
 	// FlowID is the flow this worker carries. Required for an initiator, which opens an
 	// existing local flow by ID. Optional but usual for a target, which creates its flow from
 	// [Spec.FlowDef] — it is carried there for metric labelling (§12).
@@ -166,8 +176,10 @@ const keyFormatTag = "mxl-replicator/worker/key/v1"
 //   - [Spec.Service] is allocated by this agent, not by the server (§7.4). If the allocator
 //     would pick a different port today than it did an hour ago, that is not a reason to
 //     restart a worker that is bound and moving media.
-//   - [Spec.Labels] are metric labels the worker never reads (WRS §3). They are applied at
-//     scrape time, so a relabelled request must not glitch a flow.
+//   - [Spec.Labels] and [Spec.Domain] exist for metric labelling and the worker reads neither
+//     (WRS §3). They are applied at scrape time, so a relabelled request — or a domain renamed
+//     onto the same directory — must not glitch a flow. [Spec.DomainPath], which is where the
+//     worker actually goes, *is* included.
 //   - [Spec.TargetInfo] is covered by [Spec.Epoch], which is a hash over exactly that blob plus
 //     the target's incarnation nonce, and the pair is verified before a worker is started
 //     (§5.3 step 6). Hashing the blob as well would add a second way for an incidental

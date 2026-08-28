@@ -46,6 +46,11 @@ type unit struct {
 	agent *Agent
 	log   *slog.Logger
 
+	// flow labels the metrics with what kind of media this is, resolved once here and frozen for
+	// the unit's life (§12). Frozen deliberately: a label whose value changes mid-life splits one
+	// series into two, so it must not depend on anything that arrives later.
+	flow flowLabels
+
 	cancel context.CancelFunc
 	done   chan struct{}
 
@@ -56,7 +61,17 @@ type unit struct {
 	reason     string
 	reasonCode api.ReasonCode
 	startedAt  time.Time
-	restarts   []time.Time
+
+	// restarts is the *windowed* list DEGRADED and FAILED are classified from (§15.1); total is
+	// the monotonic count `mxl_worker_restarts` reports. Two representations of one event on
+	// purpose: a counter that decays reads as a reset to `rate()` every time the window slides,
+	// and a total that never decays cannot classify a burst.
+	restarts []time.Time
+	total    uint64
+
+	// handle is the worker currently running, or nil between attempts. Held so that /metrics can
+	// scrape it (§12) — it is the only reader, and the supervision loop is the only writer.
+	handle worker.Handle
 }
 
 func (a *Agent) newUnit(key unitKey, spec worker.Spec) *unit {
@@ -64,6 +79,7 @@ func (a *Agent) newUnit(key unitKey, spec worker.Spec) *unit {
 		key:   key,
 		spec:  spec,
 		agent: a,
+		flow:  a.flowLabelsFor(spec),
 		log: a.log.With(
 			"session", key.Session,
 			"role", string(key.Role),
@@ -160,6 +176,12 @@ func (u *unit) attempt(ctx context.Context) (worker.Exit, bool) {
 	if err != nil {
 		return u.startFailed("start worker: " + err.Error()), true
 	}
+
+	// Published for the metrics collector and withdrawn on every exit from this attempt, so a
+	// scrape never holds a handle to a worker the supervision loop has moved past. A scrape that
+	// races a death is not special — it gets [worker.ErrExited] and contributes nothing.
+	u.setHandle(handle)
+	defer u.setHandle(nil)
 
 	if u.spec.IsTarget() {
 		if !u.captureTargetInfo(ctx, handle, nonce) {
@@ -284,6 +306,7 @@ func (u *unit) died(exit worker.Exit, lived time.Duration) {
 	// no longer exist.
 	u.epoch, u.targetInfo = "", ""
 	u.restarts = append(u.restarts, u.agent.now())
+	u.total++
 }
 
 // status renders this worker as the server sees it (§9.2).
@@ -320,6 +343,30 @@ func (u *unit) status(now time.Time, window time.Duration) api.SessionStatus {
 
 // desired returns the spec this unit is supervising.
 func (u *unit) desired() worker.Spec { return u.spec }
+
+func (u *unit) setHandle(handle worker.Handle) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.handle = handle
+}
+
+// restartCount is the monotonic total for `mxl_worker_restarts`.
+func (u *unit) restartCount() uint64 {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return u.total
+}
+
+// running returns the handle to scrape, or nil when nothing is running.
+//
+// The handle is taken under the lock and used outside it. Holding [unit.mu] across a scrape
+// would put a worker's socket latency in front of every status report this unit produces, and
+// the report loop is the establishment path (§5.3).
+func (u *unit) running() worker.Handle {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return u.handle
+}
 
 func sortSessions(sessions []api.SessionStatus) {
 	slices.SortFunc(sessions, func(a, b api.SessionStatus) int {

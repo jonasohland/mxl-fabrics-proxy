@@ -173,6 +173,7 @@ func (a *Agent) specFor(key unitKey, assignment api.Assignment) (worker.Spec, er
 		SessionID:                   assignment.SessionID,
 		Role:                        assignment.Role,
 		Epoch:                       assignment.Epoch,
+		Domain:                      assignment.Domain,
 		DomainPath:                  domainPath,
 		FlowID:                      assignment.FlowID,
 		FlowDef:                     assignment.FlowDef,

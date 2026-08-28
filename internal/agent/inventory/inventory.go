@@ -151,10 +151,15 @@ type flowState struct {
 
 	flow *mxl.Flow
 
-	head      uint64
-	haveHead  bool
-	lastMove  time.Time
-	producing bool
+	// written tracks head-index movement — the producer is producing, which is what the server
+	// admits on (§11.1). read tracks last-read-time movement, which is agent-local and feeds
+	// `mxl_reader_active` only (§12).
+	//
+	// Both are *deltas* of a counter, never a comparison against the wall clock, and that is what
+	// keeps the TAI epoch out of this: `LastReadTime` is read as a number that changes when a
+	// reader reads, not as a timestamp that means anything on its own.
+	written liveness
+	read    liveness
 
 	// complained suppresses a per-sample log line for a flow that is present but unreadable —
 	// a producer part-way through creating it, most often.
@@ -458,7 +463,7 @@ func (i *Inventory) Snapshot() []api.DomainInventory {
 				ID:         flow.id,
 				Definition: flow.def,
 				GroupHint:  flow.hint,
-				Producing:  flow.producing,
+				Producing:  flow.written.active,
 			})
 		}
 		slices.SortFunc(flows, func(a, b api.FlowInventory) int { return cmpString(a.ID, b.ID) })
@@ -471,6 +476,48 @@ func (i *Inventory) Snapshot() []api.DomainInventory {
 	}
 	slices.SortFunc(out, func(a, b api.DomainInventory) int { return cmpString(a.Name, b.Name) })
 	return out
+}
+
+// Liveness is what one flow looks like to the agent's metrics (§12).
+type Liveness struct {
+	// Writing reports that the flow's head index has advanced recently — for a source flow its
+	// producer is producing, for a destination flow the target worker is delivering. Identical to
+	// the `producing` an inventory snapshot carries.
+	Writing bool
+
+	// Reading reports that something has consumed from the flow recently. Agent-local: no
+	// admission or reconcile decision depends on it, so it is not in a snapshot and never reaches
+	// the server.
+	Reading bool
+
+	// Definition is flow_def.json verbatim, or nil if the flow is not readable yet.
+	Definition json.RawMessage
+}
+
+// Look returns the liveness of one flow, addressed the way a worker spec addresses it: by domain
+// *path* and flow id.
+//
+// By path rather than by name because this is called with a [worker.Spec], where the path is the
+// resolved thing and the name is only a label (§12). Reports false if this agent is not observing
+// the flow — a destination flow in the moment before its target creates it, most often — and the
+// caller emits nothing rather than a zero, since "not observed" and "idle" are different claims.
+func (i *Inventory) Look(domainPath, flowID string) (Liveness, bool) {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+
+	domain, ok := i.domains[domainPath]
+	if !ok {
+		return Liveness{}, false
+	}
+	flow, ok := domain.flows[flowID]
+	if !ok {
+		return Liveness{}, false
+	}
+	return Liveness{
+		Writing:    flow.written.active,
+		Reading:    flow.read.active,
+		Definition: flow.def,
+	}, true
 }
 
 // sample walks every flow once. It reports whether anything a snapshot would show changed.
@@ -492,7 +539,7 @@ func (i *Inventory) sample() bool {
 }
 
 func (i *Inventory) sampleFlow(domain *domainState, flow *flowState, now time.Time) bool {
-	wasProducing, hadDef := flow.producing, flow.def != nil
+	wasProducing, hadDef := flow.written.active, flow.def != nil
 
 	// **Every sample.** A flow deleted and recreated under the same ID is a different data file;
 	// the old mapping keeps working and keeps returning the values it had when the file went
@@ -513,28 +560,48 @@ func (i *Inventory) sampleFlow(domain *domainState, flow *flowState, now time.Ti
 			// let the next sample reopen; the watcher removes it outright if it is really gone.
 			flow.close()
 		} else {
-			flow.observe(runtime.HeadIndex, now, i.idleAfter)
+			flow.written.observe(runtime.HeadIndex, now, i.idleAfter)
+			flow.read.observe(runtime.LastReadTime, now, i.idleAfter)
 		}
 	}
 
-	return flow.producing != wasProducing || (flow.def != nil) != hadDef
+	// Read activity is deliberately absent from this answer. It is not in the snapshot, and a
+	// change signal that included it would report to the server every time a downstream consumer
+	// started or stopped — a store write per flow per consumer, waking every watcher in the fleet
+	// for something no reconcile depends on (§8.3).
+	return flow.written.active != wasProducing || (flow.def != nil) != hadDef
 }
 
-// observe applies the hysteresis: idle → advancing on the first movement, advancing → idle only
-// after the threshold (§11.1).
-func (f *flowState) observe(head uint64, now time.Time, idleAfter time.Duration) {
+// liveness turns a monotonically advancing counter into a coarse, hysteretic "something is
+// touching this" boolean (§11.1).
+//
+// Coarse is the point. A raw counter changes on every sample, and anything derived from one
+// without hysteresis flaps — which for the head index would mean an inventory snapshot that
+// differs every time and a store write per heartbeat, fleet-wide (§6, §8.3).
+type liveness struct {
+	value    uint64
+	seen     bool
+	lastMove time.Time
+	active   bool
+}
+
+// observe applies the hysteresis: idle → active on the first movement, active → idle only after
+// the threshold.
+func (l *liveness) observe(value uint64, now time.Time, idleAfter time.Duration) {
 	switch {
-	case !f.haveHead:
-		// The first sample establishes a baseline and claims nothing. A flow is only ever
-		// declared producing by having been *seen* to advance, never by having a head index at
-		// all — a dormant flow has one too.
-		f.head, f.haveHead, f.lastMove = head, true, now
-	case head != f.head:
-		f.head, f.lastMove, f.producing = head, now, true
-	case now.Sub(f.lastMove) >= idleAfter:
-		f.producing = false
+	case !l.seen:
+		// The first sample establishes a baseline and claims nothing. Activity is only ever
+		// declared by having been *seen* to advance, never by the counter having a value at all —
+		// a dormant flow has one of those too.
+		l.value, l.seen, l.lastMove = value, true, now
+	case value != l.value:
+		l.value, l.lastMove, l.active = value, now, true
+	case now.Sub(l.lastMove) >= idleAfter:
+		l.active = false
 	}
 }
+
+func (l *liveness) reset() { *l = liveness{} }
 
 // refresh reads the flow definition and reopens the mapping. Called with the lock held.
 func (i *Inventory) refresh(flow *flowState) {
@@ -560,7 +627,8 @@ func (i *Inventory) refresh(flow *flowState) {
 		return
 	}
 	flow.flow = opened
-	flow.head, flow.haveHead, flow.producing = 0, false, false
+	flow.written.reset()
+	flow.read.reset()
 }
 
 func (f *flowState) close() {
@@ -568,7 +636,8 @@ func (f *flowState) close() {
 		_ = f.flow.Close()
 		f.flow = nil
 	}
-	f.haveHead, f.producing = false, false
+	f.written.reset()
+	f.read.reset()
 }
 
 func (i *Inventory) closeAll() {

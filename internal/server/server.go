@@ -36,6 +36,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+
 	"github.com/jonasohland/mxl-replicator/internal/api"
 	"github.com/jonasohland/mxl-replicator/internal/server/leader"
 	"github.com/jonasohland/mxl-replicator/internal/server/reconcile"
@@ -113,6 +115,12 @@ type Server struct {
 	// leader is holding should have been torn down.
 	readCfg reconcile.Config
 
+	// registry is this server role's own, never the process default: a combined instance runs an
+	// agent on a second listener with a second registry, and the two expose different things
+	// (§4.7).
+	registry *prometheus.Registry
+	metrics  *controlMetrics
+
 	now     func() time.Time
 	handler http.Handler
 }
@@ -150,8 +158,13 @@ func New(cfg Config) (*Server, error) {
 	readCfg.Now = cfg.Now
 	readCfg.Idle = nil
 
+	// Timed at the seam rather than inside the backends, so sqlite and etcd are measured the same
+	// way (§8.1). Both the handlers and the reconcile loop go through the wrapper.
+	control := newControlMetrics()
+	observed := observe(cfg.Store, control)
+
 	s := &Server{
-		store:       cfg.Store,
+		store:       observed,
 		logger:      cfg.Logger,
 		token:       cfg.Token,
 		listen:      cfg.Listen,
@@ -162,19 +175,22 @@ func New(cfg Config) (*Server, error) {
 		maxLongPoll: cfg.MaxLongPollWait,
 		elector:     cfg.Elector,
 		readCfg:     readCfg,
+		metrics:     control,
 		now:         cfg.Now,
 	}
 
 	s.loop = reconcile.NewLoop(reconcile.LoopOptions{
-		Store:              cfg.Store,
+		Store:              observed,
 		Config:             cfg.Reconcile,
 		Logger:             cfg.Logger.With("module", "reconcile"),
 		Leader:             cfg.Elector.Name(),
 		Heartbeat:          cfg.HeartbeatInterval,
 		SettlingHeartbeats: cfg.SettlingHeartbeats,
 		Now:                cfg.Now,
+		Hooks:              control.reconcileHooks(),
 	})
 
+	s.registerMetrics()
 	s.handler = s.routes()
 	return s, nil
 }
@@ -229,7 +245,14 @@ func (s *Server) Run(ctx context.Context) error {
 		// The reconciler runs only while this replica holds leadership, and its context is
 		// cancelled the moment that ends. Every derived write is a CAS regardless, because a
 		// partitioned leader believes it still leads until its lease expires (§4.6).
-		elected <- s.elector.Run(ctx, s.loop.Run)
+		elected <- s.elector.Run(ctx, func(ctx context.Context) error {
+			// Counted here rather than in the loop because acquiring leadership is the elector's
+			// event, and it is the one that matters: repeated increments are the leader churn §4.4
+			// warns about, which is otherwise invisible — each individual handover reads like an
+			// ordinary startup in the log.
+			s.metrics.leaderChanges.Inc()
+			return s.loop.Run(ctx)
+		})
 	}()
 
 	select {
