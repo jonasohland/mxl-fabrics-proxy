@@ -2,8 +2,9 @@
 //
 // The whole point is the split between two kinds of "not running":
 //
-//   - **INVALID** — needs user action and never resolves by itself. A destination domain that
-//     is not mapped, two nodes with no fabric in common, a pinned provider neither offers.
+//   - **INVALID** — needs user action and never resolves by itself. A destination naming an
+//     area the node does not advertise, or advertises without the `write` grant, two nodes with no
+//     fabric in common, a pinned provider neither offers.
 //     Rejecting these at request time is what stops the API from accumulating requests that sit
 //     in WAITING looking like they might come good.
 //   - **WAITING** — waiting for something that may plausibly appear: a flow that is not being
@@ -18,7 +19,6 @@ package validate
 import (
 	"errors"
 	"fmt"
-	"path"
 	"slices"
 	"sort"
 	"strings"
@@ -46,54 +46,55 @@ func (r Result) String() string { return fmt.Sprintf("%s: %s", r.Code, r.Message
 // but not currently satisfiable is WAITING, and that is decided elsewhere.
 //
 // **Per destination, not per request**, because a request fans out (§9.1) and its destinations
-// fail independently: a node that dropped its output root must not stop the request's other two
+// fail independently: a node that dropped its writable area must not stop the request's other two
 // destinations from establishing new sessions. The caller decides what a failure here means for
 // the request as a whole — at POST it is a rejection, on a stored request it is one INVALID leg
 // alongside working ones.
 //
 // The negotiated result is returned too, because the caller needs it anyway and negotiating
 // twice is how the answer at validation time and the answer at assignment time drift apart.
-func Destination(spec api.RequestSpec, dst api.Destination, fleet *state.Fleet, cfg negotiate.Config) (negotiate.Result, string, *Result) {
+func Destination(spec api.RequestSpec, dst api.Destination, fleet *state.Fleet, cfg negotiate.Config) (negotiate.Result, *Result) {
 	src := spec.Source
 
 	// A session from a (node, domain) to itself would have the initiator and the target reading
 	// and writing one ring buffer. Same node, *different* domain is legitimate and is exactly
-	// what the legacy loopback configuration does.
-	if src.Node == dst.Node && src.Domain == dst.DomainName() {
-		return negotiate.Result{}, "", &Result{
+	// what the loopback configuration does.
+	//
+	// **It applies to a named source only** (§7.2, §10.7). With a name, this is an operator having
+	// written the same string twice — a typo, decidable from the request, and refused. A label
+	// selector matching the destination's own domain is not a typo: it is the selector doing what
+	// it was asked to, and refusing the request would put its author at the mercy of which domains
+	// happen to carry a label. There the pairing is *elided* and the rest of the expansion stands,
+	// which happens in the reconciler, where the expansion is.
+	if src.Domain.Kind() == api.DomainSelectorKindName &&
+		src.Node == dst.Node && src.Domain.Name.Equal(dst.Domain) {
+		return negotiate.Result{}, &Result{
 			Code:    api.ReasonSameEndpoint,
-			Message: fmt.Sprintf("source and destination are both %s/%s", src.Node, src.Domain),
+			Message: fmt.Sprintf("source and destination are both %s/%s", src.Node, dst.DomainName()),
 		}
 	}
 
 	source, ok := fleet.Nodes[src.Node]
 	if !ok {
-		return negotiate.Result{}, "", &Result{
+		return negotiate.Result{}, &Result{
 			Code:    api.ReasonNodeNotRegistered,
 			Message: fmt.Sprintf("source node %q has never registered", src.Node),
 		}
 	}
 	destination, ok := fleet.Nodes[dst.Node]
 	if !ok {
-		return negotiate.Result{}, "", &Result{
+		return negotiate.Result{}, &Result{
 			Code:    api.ReasonNodeNotRegistered,
 			Message: fmt.Sprintf("destination node %q has never registered", dst.Node),
 		}
 	}
 
-	// Resolved before anything else that can fail, and returned even when a *later* check
-	// rejects the request. A path identity carries the resolved root (§10.6), and a shadow path
-	// — the one an INVALID request still owns so that a session already running on it keeps
-	// being reported — has to be the same identity as the real one or the running session is
-	// invisible. Only a root that could not be resolved at all leaves this empty.
-	root, bad := resolveRoot(dst, destination.Value)
-	if bad != nil {
-		return negotiate.Result{}, "", bad
-	}
-	// After the root is resolved, because the check needs the root's directory — and returning the
-	// root regardless, so a shadow path keeps the identity a real path would have had.
-	if bad := pathInUse(dst, root, destination.Value); bad != nil {
-		return negotiate.Result{}, root, bad
+	// *There used to be a resolved output root returned alongside the verdict here*, because a
+	// path identity carried it as a term of its own and a shadow path had to reproduce it exactly.
+	// The area is inside the domain's name now (§10.6), so a destination's identity is complete
+	// the moment the request is read and nothing has to be resolved to build one.
+	if bad := resolveArea(dst, destination.Value); bad != nil {
+		return negotiate.Result{}, bad
 	}
 
 	// Requested but unavailable scheduling priority fails now rather than producing workers that
@@ -102,7 +103,7 @@ func Destination(spec api.RequestSpec, dst api.Destination, fleet *state.Fleet, 
 	if spec.SchedPrio != nil {
 		for _, node := range []state.Entry[state.NodeRecord]{source, destination} {
 			if !node.Value.Capabilities.SchedPrio {
-				return negotiate.Result{}, root, &Result{
+				return negotiate.Result{}, &Result{
 					Code:    api.ReasonSchedPrioUnavailable,
 					Message: fmt.Sprintf("node %q cannot apply sched_prio: no CAP_SYS_NICE or RLIMIT_RTPRIO", node.Value.Node),
 				}
@@ -117,116 +118,55 @@ func Destination(spec api.RequestSpec, dst api.Destination, fleet *state.Fleet, 
 	if err != nil {
 		var negErr *negotiate.Error
 		if errors.As(err, &negErr) {
-			return negotiate.Result{}, root, &Result{Code: negErr.Code, Message: negErr.Message}
+			return negotiate.Result{}, &Result{Code: negErr.Code, Message: negErr.Message}
 		}
-		return negotiate.Result{}, root, &Result{Code: api.ReasonNoSharedFabric, Message: err.Error()}
+		return negotiate.Result{}, &Result{Code: api.ReasonNoSharedFabric, Message: err.Error()}
 	}
 
-	return result, root, nil
+	return result, nil
 }
 
-// resolveRoot decides which output root a destination is materialised under, and is the whole of
-// the authority this API has over a node's filesystem (§10.6, §13, invariant 6).
+// resolveArea checks that a destination names an area the node advertises and grants writing on,
+// and is the whole of the authority this API has over a node's filesystem (§10.6, §13,
+// invariant 6).
 //
-// A destination is always a *name* inside an operator-configured root. A raw path is never
-// accepted, a node that advertises no root is not a destination at all, and the server never
-// picks between roots on the operator's behalf. Without this the API is a remote
+// **A destination is always a name inside an area the operator granted `write` on.** A raw path is
+// never accepted, a node advertising no writable area is not a destination at all, and the server
+// never picks an area on the operator's behalf. Without this the API is a remote
 // arbitrary-filesystem-write primitive on every node in the fleet, and it has to hold regardless
 // of what authentication is configured.
 //
+// *There used to be a third branch here: a node advertising several roots and a request naming
+// none, refused as `ambiguous_output_root`.* It is structurally unreachable now — a destination
+// always names its area, because the area is the first segment of the domain's name (§7.2).
+//
 // The destination agent checks all of this again before it resolves a path. That duplication is
 // deliberate and is the one place in the tree where it earns its keep: it costs a map lookup, and
-// it is the difference between one buggy control plane and files written wherever a root reaches.
-func resolveRoot(dst api.Destination, node state.NodeRecord) (string, *Result) {
+// it is the difference between one buggy control plane and files written wherever an area reaches.
+func resolveArea(dst api.Destination, node state.NodeRecord) *Result {
 	// Structural, and normally caught at POST by [api.RequestSpec.Validate]. Reachable here for a
 	// request written straight into the store, or stored before the rule existed — which must
 	// fail legibly rather than reaching an agent as an assignment.
-	if err := api.ValidDomainElements(dst.Domain); err != nil {
-		return "", &Result{
+	if err := dst.Domain.Valid(); err != nil {
+		return &Result{
 			Code:    api.ReasonMalformedDomainName,
 			Message: fmt.Sprintf("invalid destination domain %q: %s", dst.DomainName(), err),
 		}
 	}
 
-	// Names are flat per node (§10.6). A destination colliding with an input mapping would put
-	// one name over two directories, and every place that carries a single domain string — the
-	// assignment, the path identity, the session identity, the `domain` metric label — would then
-	// be ambiguous. A *discovered* domain cannot collide by construction: it is named by its
-	// path, and a path is not a name this accepts.
-	if _, taken := node.Domain(dst.DomainName()); taken {
-		return "", &Result{
-			Code: api.ReasonDomainNameInUse,
-			Message: fmt.Sprintf("node %q already maps %q as an input domain",
-				dst.Node, dst.DomainName()),
-		}
-	}
-
-	roots := node.Capabilities.OutputRoots
-	switch {
-	case len(roots) == 0:
-		return "", &Result{
-			Code: api.ReasonNoOutputRoot,
-			Message: fmt.Sprintf("node %q advertises no output root, it maps %s as inputs",
-				dst.Node, domainList(node.Domains)),
-		}
-
-	case dst.Root == "":
-		if len(roots) > 1 {
-			// Never a guess. The cost is recorded rather than hidden: a request that worked
-			// becomes ambiguous the day its destination node grows a second root. Taken
-			// deliberately — the single-root case is overwhelmingly the common one, and this
-			// error carries its own fix.
-			return "", &Result{
-				Code: api.ReasonAmbiguousOutputRoot,
-				Message: fmt.Sprintf("node %q advertises %d output roots (%s) and the destination names none",
-					dst.Node, len(roots), rootList(roots)),
-			}
-		}
-		return roots[0].Name, nil
-
-	default:
-		if node.Capabilities.FindRoot(dst.Root) == nil {
-			return "", &Result{
-				Code: api.ReasonUnknownOutputRoot,
-				Message: fmt.Sprintf("node %q advertises no output root %q, it has %s",
-					dst.Node, dst.Root, rootList(roots)),
-			}
-		}
-		return dst.Root, nil
-	}
-}
-
-// pathInUse refuses a destination whose resolved directory is one the node already maps as an
-// input domain (§10.6).
-//
-// This is the case a root being allowed to sit *above* an input mapping leaves open, and the name
-// check above does not cover it: `-m cams=/dev/shm/mxl/cameras` under root `fast=/dev/shm/mxl`
-// collides on the path while the names differ. Left unchecked it would be one directory with two
-// names — an input domain nothing writes to, and an output domain replication writes into.
-//
-// The agent refuses it independently and is the authority, since it holds the ground truth about
-// its own filesystem. This runs so that a request is rejected at POST with a reason naming what to
-// change, rather than being accepted and then failing on the node.
-//
-// Paths are joined with `path`, not `path/filepath`: these describe a *remote* node's filesystem,
-// and the separator that matters is the destination's, not this server's.
-func pathInUse(dst api.Destination, root string, node state.NodeRecord) *Result {
-	advertised := node.Capabilities.FindRoot(root)
-	// Empty is not a failure: the path is advertised for diagnostics only and an agent is entitled
-	// to withhold it (§10.2). The agent's own check still holds.
-	if advertised == nil || advertised.Path == "" {
-		return nil
-	}
-
-	resolved := path.Join(append([]string{advertised.Path}, dst.Domain...)...)
-	for _, mapping := range node.Domains {
-		if mapping.Path == "" || path.Clean(mapping.Path) != resolved {
-			continue
-		}
+	area := node.Capabilities.FindArea(dst.Domain.Area)
+	if area == nil {
 		return &Result{
-			Code: api.ReasonDomainPathInUse,
-			Message: fmt.Sprintf("domain %q under root %q on node %q resolves to %s, which it maps as input domain %q",
-				dst.DomainName(), root, dst.Node, resolved, mapping.Name),
+			Code: api.ReasonUnknownArea,
+			Message: fmt.Sprintf("node %q advertises no area %q, it has %s",
+				dst.Node, dst.Domain.Area, areaList(node.Capabilities.Areas)),
+		}
+	}
+	if !area.Write {
+		return &Result{
+			Code: api.ReasonAreaNotWritable,
+			Message: fmt.Sprintf("node %q advertises area %q but does not grant writing on it",
+				dst.Node, dst.Domain.Area),
 		}
 	}
 	return nil
@@ -258,11 +198,14 @@ type PathRef struct {
 // pairwise check: A→B→C→A is the same mistake spelled longer, and it must not be the case that
 // adding a third hop hides it.
 //
-// **Domain names are flat per node.** Two paths materialising one domain name under two
-// different output roots is one name over two directories (§10.6). It is checked here rather
-// than per request because the two paths need not share a source, a destination flow or a
-// request — `studio-a/cam1 → edge-01/ingest@fast` and `studio-b/cam2 → edge-01/ingest@bulk`
+// **No materialised domain inside another.** `fast/studio-a` and `fast/studio-a/cam1` would make
+// one domain directory a container for another (§10.6). It is checked here rather than per request
+// because the two paths need not share a source, a destination flow or a request —
+// `studio-a/cam1 → edge-01/fast/studio-a` and `studio-b/cam2 → edge-01/fast/studio-a/cam1`
 // collide, and nothing either request can see says so.
+//
+// *A third conflict used to live here: one domain name materialised under two different output
+// roots.* It is unconstructible now that the area is in the name (§7.2, §10.6).
 //
 // Paths are considered in precedence order and a path is rejected only against those already
 // accepted, so an existing path is never invalidated by a newly created one.
@@ -283,48 +226,34 @@ func Conflicts(paths []PathRef) map[string]Result {
 	// Per flow ID, the edges accepted so far, as (node/domain) → set of (node/domain).
 	edges := map[string]map[string][]string{}
 
-	// Which output root each accepted (node, domain) is materialised under.
-	rootFor := map[string]string{}
-
-	// The output domains accepted so far, per node, for the nesting check.
-	nestable := map[string][][]string{}
+	// The domains accepted so far, per node, for the nesting check.
+	nestable := map[string][]api.Domain{}
 
 	for _, ref := range ordered {
 		src, dst := ref.Path.Source, ref.Path.Destination
 		destFlow := api.FlowAddress{Node: dst.Node, Domain: dst.DomainName(), Flow: src.Flow}
 
-		// A path with no resolved root materialises nothing: it is a shadow path, kept only so
-		// that a session already running on it stays reported, and it is already INVALID for
-		// whatever left its root unresolved (§10.6). It therefore neither claims a domain name
-		// nor collides with one — a shadow path that claimed a name would evict the valid path
-		// that is actually going to create the directory. It is still checked for the other two
-		// conflicts below, because a *running* session does hold a destination flow.
-		if dst.Root != "" {
-			if root, taken := rootFor[endpoint(dst.Node, dst.DomainName())]; taken && root != dst.Root {
-				out[ref.ID] = Result{
-					Code: api.ReasonDomainNameInUse,
-					Message: fmt.Sprintf("domain %q on node %q is already materialised under output root %q",
-						dst.DomainName(), dst.Node, root),
-				}
-				continue
+		// **No materialised domain inside another.** `fast/studio-a` and `fast/studio-a/cam1`
+		// would make one domain directory a container for another, which is a shape nothing else
+		// in the design has: the outer one's flows and the inner one's would share a tree, and
+		// removing either is a question with no answer (§10.6).
+		//
+		// An exact slice-prefix test in both directions, which is what the element form is worth
+		// here — the string spelling of this question has to work around `studio-ab` looking like
+		// a child of `studio-a`. Within one area only: two domains in different areas are two
+		// directory trees and cannot nest, whatever their elements look like.
+		//
+		// *The root-collision check that used to sit beside this is gone*, along with the
+		// shadow-path exemption it needed: a destination's identity is complete the moment the
+		// request is read now, so there is no such thing as a path whose area is unresolved
+		// (§10.6).
+		if outer, nested := nestedDomain(dst.Domain, nestable[dst.Node]); nested {
+			out[ref.ID] = Result{
+				Code: api.ReasonDomainNameInUse,
+				Message: fmt.Sprintf("domain %q on node %q nests with %q, which another path materialises",
+					dst.DomainName(), dst.Node, outer),
 			}
-
-			// **No output domain inside another output domain.** `studio-a` and `studio-a/cam1`
-			// would make one domain directory a container for another, which is a shape nothing
-			// else in the design has: the outer one's flows and the inner one's would share a
-			// tree, and removing either is a question with no answer.
-			//
-			// An exact slice-prefix test in both directions, which is what the element form is
-			// worth here — the string spelling of this question has to work around `studio-ab`
-			// looking like a child of `studio-a`.
-			if outer, nested := nestedDomain(dst, nestable[dst.Node]); nested {
-				out[ref.ID] = Result{
-					Code: api.ReasonDomainNameInUse,
-					Message: fmt.Sprintf("domain %q on node %q nests with %q, which another path materialises",
-						dst.DomainName(), dst.Node, api.DomainPath(outer)),
-				}
-				continue
-			}
+			continue
 		}
 
 		if existing, taken := holder[destFlow]; taken {
@@ -356,10 +285,7 @@ func Conflicts(paths []PathRef) map[string]Result {
 		}
 
 		holder[destFlow] = src
-		if dst.Root != "" {
-			rootFor[to] = dst.Root
-			nestable[dst.Node] = append(nestable[dst.Node], dst.Domain)
-		}
+		nestable[dst.Node] = append(nestable[dst.Node], dst.Domain)
 		graph[from] = append(graph[from], to)
 	}
 
@@ -392,41 +318,32 @@ func reaches(graph map[string][]string, from, to string) bool {
 	return false
 }
 
-func rootList(roots []api.OutputRoot) string {
-	if len(roots) == 0 {
+// areaList renders a node's areas for an error message, marking the writable ones — because
+// "this node has no area `fast`" and "it has one but you may not write into it" are different
+// operator problems and the list is where the distinction is cheapest to show.
+func areaList(areas []api.Area) string {
+	if len(areas) == 0 {
 		return "none"
 	}
-	names := make([]string, 0, len(roots))
-	for _, root := range roots {
-		names = append(names, fmt.Sprintf("%q", root.Name))
-	}
-	slices.Sort(names)
-	return strings.Join(names, ", ")
-}
-
-func domainList(domains []api.DomainMapping) string {
-	if len(domains) == 0 {
-		return "no domains at all"
-	}
-	names := make([]string, 0, len(domains))
-	for _, d := range domains {
-		name := fmt.Sprintf("%q", d.Name)
-		if !d.Configured {
-			name += " (discovered)"
+	names := make([]string, 0, len(areas))
+	for _, area := range areas {
+		grants := "read-only"
+		if area.Write {
+			grants = "writable"
 		}
-		names = append(names, name)
+		names = append(names, fmt.Sprintf("%q (%s)", area.Name, grants))
 	}
 	slices.Sort(names)
 	return strings.Join(names, ", ")
 }
 
-// nestedDomain reports whether a destination's domain nests with one already accepted on that
-// node, in either direction, and which one.
-func nestedDomain(dst api.Destination, accepted [][]string) ([]string, bool) {
+// nestedDomain reports whether a domain nests with one already accepted on that node, in either
+// direction, and which one.
+func nestedDomain(domain api.Domain, accepted []api.Domain) (api.Domain, bool) {
 	for _, other := range accepted {
-		if api.NestedIn(dst.Domain, other) || api.NestedIn(other, dst.Domain) {
+		if domain.NestedIn(other) || other.NestedIn(domain) {
 			return other, true
 		}
 	}
-	return nil, false
+	return api.Domain{}, false
 }

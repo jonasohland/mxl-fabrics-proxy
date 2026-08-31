@@ -76,7 +76,7 @@ func TestTheLeaderReportsTheFleet(t *testing.T) {
 	h.fleet()
 	h.reconciling()
 
-	require.Equal(t, http.StatusCreated, h.do(http.MethodPost, api.PathRequests, flowRequestSpec("cam1")).status)
+	require.Equal(t, http.StatusCreated, h.do(http.MethodPost, defaultRequests, flowRequestSpec("cam1")).status)
 
 	var body string
 	require.Eventually(t, func() bool {
@@ -150,7 +150,7 @@ func TestEpochTransitionsAreCounted(t *testing.T) {
 	h.fleet()
 	h.reconciling()
 
-	require.Equal(t, http.StatusCreated, h.do(http.MethodPost, api.PathRequests, flowRequestSpec("cam1")).status)
+	require.Equal(t, http.StatusCreated, h.do(http.MethodPost, defaultRequests, flowRequestSpec("cam1")).status)
 
 	var sessionID string
 	require.Eventually(t, func() bool {

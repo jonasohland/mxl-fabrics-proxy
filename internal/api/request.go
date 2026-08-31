@@ -3,7 +3,6 @@ package api
 import (
 	"bytes"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"slices"
 	"strings"
@@ -89,8 +88,18 @@ func (p ProviderPin) MarshalJSON() ([]byte, error) {
 
 // Source names where to replicate from (§9.1).
 type Source struct {
-	Node   string `json:"node"`
-	Domain string `json:"domain"`
+	// Node is pinned, not selected. Keeping the expansion one node wide is what stops §10.8's
+	// cross-product hazards arriving with domain selectors, and node labels do not exist.
+	Node string `json:"node"`
+
+	// Domain is a **selector**, not a name (§10.7): `{"name": "media/cameras"}` addresses one
+	// domain directly, `{"labels": {…}}` matches by label.
+	//
+	// *This used to be a bare domain name.* A domain name is the domain-level UUID, and a UUID is
+	// rarely what a user means — which is the same argument §9.1 makes one layer down for the flow
+	// selector, arriving at the same answer: selection rather than a rename, because renaming a
+	// domain would re-identify every path through it.
+	Domain DomainSelector `json:"domain"`
 
 	// Select is a selector, not a flow ID — see [Selector].
 	Select Selector `json:"select"`
@@ -109,39 +118,31 @@ type Source struct {
 type Destination struct {
 	Node string `json:"node"`
 
-	// Domain is the output domain to replicate into, created inside [Destination.Root] if it does
-	// not exist yet (§10.6).
+	// Domain is where to replicate into: an **area name and a list of path elements**, never a
+	// path (§10.6). `{"area": "fast", "elements": ["studio-a","cam1"]}` materialises
+	// `<fast>/studio-a/cam1` and renders as `fast/studio-a/cam1`.
 	//
-	// **A list of path elements, not a path.** `["studio-a","cam1"]` materialises
-	// `<root>/studio-a/cam1`. Each element must satisfy [ValidDomainName], and the whole must
-	// satisfy [ValidDomainElements].
+	// *This supersedes a separate `root:` field alongside a bare element list, which could be
+	// omitted on a node advertising exactly one root.* The area is part of the domain's name now,
+	// so omitting it would be omitting half the name — a small verbosity cost, paid to have one
+	// identity grammar for every domain instead of two.
 	//
-	// The element form is the invariant that stops this API being a remote
+	// The structured form is the invariant that stops this API being a remote
 	// arbitrary-filesystem-write primitive on every node in the fleet (§7.2, §13), and it holds
 	// regardless of what authentication is configured. Because no element can contain a separator
-	// or be `..`, joining them onto a root produces exactly `root + "/" + DomainPath(elements)` —
-	// an equality the agent checks on the whole path, with no prefix reasoning and no boundary
-	// case for a separator to hide in. A raw path is never accepted, and there is nothing here for
-	// one to be spelled as.
+	// or be `..`, joining them onto the area's path produces exactly
+	// `area.Path + "/" + join(elements)` — an equality the agent checks on the whole path, with no
+	// prefix reasoning and no boundary case for a separator to hide in. A raw path is never
+	// accepted, and there is nothing here for one to be spelled as.
 	//
-	// A manifest writes it as `domain: studio-a/cam1` and the CLI splits it there. **Nothing else
-	// in the system ever parses a domain string** — see [ValidDomainElements].
+	// A manifest writes it as `domain: fast/studio-a/cam1` and the CLI splits it there. **Nothing
+	// else in the system ever parses a domain string** (§10.6).
 	//
 	// The domain needs no prior existence and has no lifecycle of its own. It is materialised by
 	// the first path that targets it and forgotten when the last one goes, on the refcount that
 	// already governs paths — so there is no create API, no delete API, and no "delete while
 	// referenced" conflict to resolve.
-	Domain []string `json:"domain"`
-
-	// Root names which of the destination node's advertised output roots the domain is created
-	// under (§10.6). Optional when the node advertises exactly one, which is the common case.
-	//
-	// A node with more than one and a request naming none is INVALID, listing the candidates,
-	// rather than being resolved by a guess. The cost is recorded rather than hidden: a request
-	// that worked becomes ambiguous the day its destination node grows a second root. Taken
-	// deliberately — the friendly case is overwhelmingly the common one, and the error carries
-	// its own fix.
-	Root string `json:"root,omitempty"`
+	Domain Domain `json:"domain"`
 
 	// Provider overrides [RequestSpec.Provider] for this destination alone. Empty inherits it.
 	//
@@ -157,14 +158,41 @@ type Destination struct {
 	Provider ProviderPin `json:"provider,omitempty"`
 }
 
-// DomainName renders the domain as the single string everything downstream carries — the
-// assignment, the path and session identity, the `domain` metric label (§10.6).
-func (d Destination) DomainName() string { return DomainPath(d.Domain) }
+// DomainName renders the destination domain as the single string everything downstream carries —
+// the assignment, the path and session identity, the `domain` metric label (§10.6).
+func (d Destination) DomainName() string { return d.Domain.String() }
 
 // Endpoint is the (node, domain) pair this destination names, which is what makes two
-// destinations the same destination. The root is not part of it: two entries naming one domain
-// under two roots are one name over two directories, which is exactly what must be rejected.
-func (d Destination) Endpoint() string { return d.Node + "/" + d.DomainName() }
+// destinations the same destination.
+//
+// *The resolved output root used to be excluded from it deliberately*, because two entries naming
+// one domain under two roots were one name over two directories. The area is inside the domain's
+// name now, so `fast/ingest` and `bulk/ingest` are already two endpoints and there is nothing to
+// exclude.
+func (d Destination) Endpoint() string { return d.Node + DomainSeparator + d.DomainName() }
+
+// RequestID is a request's identity: its namespace and its name (§9.1, §9.3).
+//
+// **Names are scoped to the namespace, not fleet-wide.** A namespace that does not namespace
+// names is half the concept, and the consumer this partition exists for is the one that proves
+// it: a Kubernetes adapter naming requests after pods inherits Kubernetes' own namespacing, so two
+// identically-named pods in two of its namespaces collide here unless the adapter prefixes — and
+// prefixing is exactly what having a namespace should remove.
+//
+// The cost is that every request ID in a URL, a CLI argument or a UI key gains a second
+// component. Nothing downstream is affected, since path identity does not include the request
+// (§5.4).
+type RequestID struct {
+	Namespace string `json:"namespace"`
+	Name      string `json:"name"`
+}
+
+// String renders the pair as `<namespace>/<name>`, which is what a log line, a path's refcount
+// list and a CLI argument carry.
+//
+// Injective, because neither half can contain a separator: [ValidNamespace] refuses one outright
+// and the server's request-name rule does the same (§9.1).
+func (id RequestID) String() string { return id.Namespace + "/" + id.Name }
 
 // RequestSpec is durable user intent: "replicate what this selector matches, from here to
 // there" (§3, §9.1).
@@ -173,8 +201,20 @@ func (d Destination) Endpoint() string { return d.Node + "/" + d.DomainName() }
 // (§11) — a peer being unreachable is no reason to drop the intent, any more than it is a
 // reason to restart and drop every other flow.
 type RequestSpec struct {
-	// Name is a client-supplied idempotency key. POSTing an existing name returns the existing
-	// request rather than creating a second one.
+	// Namespace is the partition this request belongs to, and half of its ID (§9.3).
+	//
+	// **A real property, not a label.** Empty means [DefaultNamespace] to a reader that has a
+	// spec the write path has not touched — a manifest on its way in, a record written before
+	// this field existed — and the server writes it out on every stored request, so the value is
+	// never merely implied.
+	//
+	// It is not a label because a namespace decides which requests may not overlap and what
+	// `--prune` catches, and burying that in a free-text map means an operator's own label
+	// silently becomes a partition key.
+	Namespace string `json:"namespace,omitempty"`
+
+	// Name is a client-supplied idempotency key, unique **within its namespace**. POSTing an
+	// existing name returns the existing request rather than creating a second one.
 	//
 	// Required, which is a plan decision beyond §9.1's "add a name": it makes every create
 	// idempotent rather than only the creates that remembered to opt in. The Kubernetes
@@ -213,84 +253,30 @@ type RequestSpec struct {
 	// Labels ride along into worker metrics as user labels, as the legacy proxy's
 	// subscription labels did (§12).
 	//
-	// One key is reserved and means something to the server: [LabelNamespace]. See
-	// [RequestSpec.Namespace].
+	// `namespace` is an ordinary user label again, now that [RequestSpec.Namespace] is a real
+	// property (§9.3). It stays reserved as a *metric* label, because the session's namespace is
+	// emitted as a dimension of its own (§12) — so a user label of that name is dropped rather
+	// than mangled, exactly as any other colliding one is.
 	Labels map[string]string `json:"labels,omitempty"`
 }
 
-const (
-	// LabelNamespace is the label whose value partitions requests (§7b of the UI handoff).
-	//
-	// It is a label rather than a field of its own because `apply --prune` already takes a
-	// label selector, so `--prune -l namespace=nab` already spells "make the fleet's nab
-	// namespace equal this file" and needs nothing added to say it. A namespace is therefore a
-	// prune scope, a manifest file and a matrix, all the same set.
-	//
-	// Deliberately not called a *group*: that word is taken by the NMOS group hint, which is
-	// the vocabulary of selectors and is unrelated.
-	LabelNamespace = "namespace"
-
-	// DefaultNamespace is where a request with no [LabelNamespace] label lives.
-	//
-	// It is a real namespace and not an exemption — the rule that two requests in one namespace
-	// may not hold one path applies to it exactly as to any other. On a fleet driven from the
-	// CLI it is also where everything is, which is the reason it cannot be exempt: a partition
-	// that most requests sit outside of buys nothing.
-	DefaultNamespace = "default"
-)
-
-// Namespace is the partition this request belongs to.
+// RequestID is this request's identity: its namespace and its name (§9.1).
 //
-// The server fills the label in on write (see [RequestSpec.EnsureNamespace]), so a stored request
-// always carries it. This still defaults, for two readers that see specs the write path has not
-// touched: a record written before the label existed, and a manifest on its way in.
-func (s RequestSpec) Namespace() string {
-	if ns := s.Labels[LabelNamespace]; ns != "" {
-		return ns
-	}
-	return DefaultNamespace
+// An empty namespace reads as [DefaultNamespace], for a spec the write path has not touched yet.
+//
+// Spelled out rather than called `ID`, because [Request] embeds this type and carries an `ID`
+// field of its own — the rendered string — and a method that a field shadows is a method nothing
+// can call.
+func (s RequestSpec) RequestID() RequestID {
+	return RequestID{Namespace: s.NamespaceOrDefault(), Name: s.Name}
 }
 
-// EnsureNamespace writes [DefaultNamespace] into the labels when no namespace is set.
-//
-// Every stored request says which namespace it is in, rather than some saying it and the rest
-// implying it. The implied form is workable for a reader — [RequestSpec.Namespace] defaults — but
-// it makes the label mean two different things depending on which request you are holding, and
-// it makes `--prune -l namespace=default` silently miss exactly the requests that are in it.
-//
-// It has to run before the unchanged comparison (invariant 13), not after: normalising a spec
-// after deciding whether it differs from the stored one would make every apply of a
-// label-less manifest look like a change and write on every pass.
-func (s *RequestSpec) EnsureNamespace() {
-	if s.Labels[LabelNamespace] != "" {
-		return
+// NamespaceOrDefault is the namespace this request is in, defaulting an unset one.
+func (s RequestSpec) NamespaceOrDefault() string {
+	if s.Namespace == "" {
+		return DefaultNamespace
 	}
-	if s.Labels == nil {
-		s.Labels = map[string]string{}
-	}
-	s.Labels[LabelNamespace] = DefaultNamespace
-}
-
-// ValidNamespace checks a namespace name.
-//
-// It lives here rather than in the server because the manifest checks it too, and a namespace a
-// file accepts and a POST rejects is the split that makes `apply --dry-run` less useful than the
-// apply. Constrained where other label values are free text because it names a partition an
-// operator selects, prunes and files manifests by, and ends up in `--prune -l namespace=…` on a
-// command line.
-func ValidNamespace(ns string) error {
-	if ns == "" {
-		return fmt.Errorf("namespace must not be empty: omit it for the %q namespace", DefaultNamespace)
-	}
-	for _, r := range ns {
-		switch {
-		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
-		case r == '-', r == '_':
-		default:
-			return errors.New("namespace may contain only letters, digits, - and _")
-		}
-	}
-	return nil
+	return s.Namespace
 }
 
 // SameAs reports whether two specs are the same intent.
@@ -351,11 +337,19 @@ func (s RequestSpec) Validate() error {
 		}
 	}
 
+	// Empty is legal and means [DefaultNamespace]; anything spelled out is held to the grammar,
+	// because it becomes a URL segment and a store key (§9.3).
+	if s.Namespace != "" {
+		if err := ValidNamespace(s.Namespace); err != nil {
+			return err
+		}
+	}
+
 	if s.Source.Node == "" {
 		return fmt.Errorf("source.node is required")
 	}
-	if s.Source.Domain == "" {
-		return fmt.Errorf("source.domain is required")
+	if err := s.Source.Domain.Validate(); err != nil {
+		return err
 	}
 	if err := s.Source.Select.Validate(); err != nil {
 		return fmt.Errorf("source.select: %w", err)
@@ -374,9 +368,6 @@ func (s RequestSpec) Validate() error {
 		if dst.Node == "" {
 			return fmt.Errorf("%s.node is required", where)
 		}
-		if len(dst.Domain) == 0 {
-			return fmt.Errorf("%s.domain is required", where)
-		}
 		// Structural, and checkable here because it needs no server state: a destination domain is
 		// a directory this API is asking a node to create, so the name rule is part of the request
 		// body rather than a property of the fleet (§10.6).
@@ -385,13 +376,8 @@ func (s RequestSpec) Validate() error {
 		// there. Not redundant: validate runs over *stored* requests on every reconcile, so a
 		// request written straight into the store, or stored before this rule existed, must still
 		// be refused legibly rather than reaching an agent as an assignment.
-		if err := ValidDomainElements(dst.Domain); err != nil {
+		if err := dst.Domain.Valid(); err != nil {
 			return fmt.Errorf("%s.domain %q: %w", where, dst.DomainName(), err)
-		}
-		if dst.Root != "" {
-			if err := ValidDomainName(dst.Root); err != nil {
-				return fmt.Errorf("%s.root %q: %w", where, dst.Root, err)
-			}
 		}
 		if err := dst.Provider.Validate(); err != nil {
 			return fmt.Errorf("%s.%w", where, err)
@@ -414,12 +400,15 @@ func (s RequestSpec) Validate() error {
 
 // Request is a stored request as the API returns it.
 type Request struct {
-	// ID is server-assigned and is what DELETE /v1/requests/{id} takes.
+	// ID is the rendered `<namespace>/<name>` pair (§9.1). Not server-assigned: both halves are
+	// already in the embedded spec, and this is the joinable spelling — it is what a path's
+	// refcount list carries and what a log line prints.
 	ID string `json:"id"`
 
 	RequestSpec
 
 	CreatedAt time.Time     `json:"created_at"`
+	UpdatedAt time.Time     `json:"updated_at,omitzero"`
 	Status    RequestStatus `json:"status"`
 }
 
@@ -446,7 +435,58 @@ type RequestStatus struct {
 	// every reconcile. A selector matching nothing is simply a request with zero paths, which
 	// composes with WAITING at no extra cost (§9.1).
 	Paths []PathStatus `json:"paths"`
+
+	// Excluded is what the expansion left out, **and it is not decoration** (§9.1).
+	//
+	// A path that does not exist has no status to carry a reason, so a flow a selector skipped is
+	// invisible in a paths-only rendering — and §10.7's self-output rule skips flows deliberately,
+	// on a node that is also a replication destination, which is precisely where an operator's
+	// broad selector will meet it. Under the superseded directory-granular rule the whole domain
+	// was absent, which was at least legible as a category; per-flow provenance is finer and
+	// therefore *less* obvious, and this is where that cost is paid back.
+	//
+	// **"Did not match the labels" is not a reason and is never listed**: that set is unbounded
+	// and is the ordinary case.
+	//
+	// Not a []PathStatus, and it must not be modelled as one — an excluded flow is precisely a
+	// flow that produced no path.
+	Excluded []Exclusion `json:"excluded,omitempty"`
+
+	// ExcludedDropped is how many entries the cap discarded. A silent cap here reads as "nothing
+	// else was excluded", which is the one thing this list must not say when it is untrue (§9.1).
+	ExcludedDropped int `json:"excluded_dropped,omitempty"`
 }
+
+// MaxExclusions bounds [RequestStatus.Excluded].
+//
+// It needs a bound — a broad selector against a busy destination node can exclude a lot — and what
+// the number *is* is arbitrary, so it is picked once here rather than at the call site. Sized so
+// that a realistic node's worth of replicated flows fits: past this an operator is reading a
+// summary, not a list, and [RequestStatus.ExcludedDropped] is what tells them so.
+const MaxExclusions = 32
+
+// Exclusion is one flow a request's expansion deliberately left out (§9.1, §10.7).
+type Exclusion struct {
+	Node   string `json:"node"`
+	Domain string `json:"domain"`
+	Flow   string `json:"flow"`
+
+	Reason ExclusionReason `json:"reason"`
+}
+
+// ExclusionReason says why a matched flow produced no path.
+type ExclusionReason string
+
+const (
+	// ExclusionSelfOutput is a flow this node's own target worker is writing (§10.6, §10.7).
+	//
+	// The one reason today. A label selector never matches this project's own output, because a
+	// network of receivers that forward what they receive is exactly where loops come from — and
+	// the topology such a thing settles into is decided by §7.5's precedence rather than by
+	// anything an operator wrote. Naming a domain directly still reaches everything: explicit
+	// chaining is intent, matched chaining is emergence.
+	ExclusionSelfOutput ExclusionReason = "self_output"
+)
 
 // RequestList is GET /v1/requests.
 type RequestList struct {

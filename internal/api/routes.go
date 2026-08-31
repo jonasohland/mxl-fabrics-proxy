@@ -18,11 +18,17 @@ const (
 )
 
 // User API paths.
+//
+// Requests live under their namespace, because `(namespace, name)` is a request's ID (§9.1,
+// §9.3) — so there are two request paths rather than one: the namespaced collection a request is
+// created in and addressed through, and the fleet-wide list, which is a read-only view across
+// every partition and takes `?namespace=` to narrow itself.
 const (
-	PathRequests = UserPrefix + "/requests"
-	PathNodes    = UserPrefix + "/nodes"
-	PathFlows    = UserPrefix + "/flows"
-	PathPaths    = UserPrefix + "/paths"
+	PathNamespaces = UserPrefix + "/namespaces"
+	PathRequests   = UserPrefix + "/requests"
+	PathNodes      = UserPrefix + "/nodes"
+	PathFlows      = UserPrefix + "/flows"
+	PathPaths      = UserPrefix + "/paths"
 )
 
 // Agent API paths that take no node name.
@@ -78,8 +84,26 @@ const (
 	QueryWait = "wait"
 )
 
-// RequestPath is /v1/requests/{id}.
-func RequestPath(id string) string { return PathRequests + "/" + url.PathEscape(id) }
+// QueryNamespace narrows GET /v1/requests to one partition, so the fleet-wide list can answer
+// the namespaced question without a second round trip through
+// /v1/namespaces/{ns}/requests — which returns the same set and exists so that the collection a
+// request is *created* in is the collection it is listed in.
+const QueryNamespace = "namespace"
+
+// NamespacePath is /v1/namespaces/{ns}.
+func NamespacePath(ns string) string { return PathNamespaces + "/" + url.PathEscape(ns) }
+
+// NamespaceRequestsPath is /v1/namespaces/{ns}/requests.
+func NamespaceRequestsPath(ns string) string { return NamespacePath(ns) + "/requests" }
+
+// RequestPath is /v1/namespaces/{ns}/requests/{name}.
+//
+// Escaped on both segments: a namespace is held to a grammar with no separator in it (§9.3) and a
+// request name likewise, but escaping is what makes that a belt rather than a load-bearing
+// assumption in a URL builder.
+func RequestPath(id RequestID) string {
+	return NamespaceRequestsPath(id.Namespace) + "/" + url.PathEscape(id.Name)
+}
 
 // NodePath is /v1/nodes/{node}.
 func NodePath(node string) string { return PathNodes + "/" + url.PathEscape(node) }

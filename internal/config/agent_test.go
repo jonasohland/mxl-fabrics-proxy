@@ -25,15 +25,10 @@ node: edge-01
 server:
   - http://ctrl-0:2283
   - http://ctrl-1:2283
-domains:
-  cameras: /dev/shm/mxl0
-search_paths:
-  - /dev/shm
-output_roots:
-  - name: fast
-    path: /dev/shm/mxl
-  - name: bulk
-    path: /mnt/nvme/mxl
+areas:
+  - {name: media, path: /dev/shm, read: true}
+  - {name: fast,  path: /dev/shm/mxl, read: true, write: true}
+  - {name: bulk,  path: /mnt/nvme/mxl, write: true}
 fabrics:
   - provider: verbs
     fabric: ib-fabric-a
@@ -48,74 +43,30 @@ fabrics:
 
 	assert.Equal(t, "edge-01", loaded.Node)
 	assert.Equal(t, []string{"http://ctrl-0:2283", "http://ctrl-1:2283"}, loaded.Server)
-	assert.Equal(t, Domains{"cameras": "/dev/shm/mxl0"}, loaded.Domains)
-	assert.Equal(t, []string{"/dev/shm"}, loaded.SearchPaths)
-	assert.Equal(t, []OutputRoot{
-		{Name: "fast", Path: "/dev/shm/mxl"},
-		{Name: "bulk", Path: "/mnt/nvme/mxl"},
-	}, loaded.OutputRoots)
+	// **Areas may nest**, and the innermost containing one names a directory (§10.6): `fast` sits
+	// inside `media`, which is the ordinary one-MXL-area-per-host layout rather than an exception
+	// to anything.
+	assert.Equal(t, []api.Area{
+		{Name: "media", Path: "/dev/shm", Read: true},
+		{Name: "fast", Path: "/dev/shm/mxl", Read: true, Write: true},
+		{Name: "bulk", Path: "/mnt/nvme/mxl", Write: true},
+	}, loaded.Areas)
 	assert.Equal(t, []probe.Attachment{
 		{Provider: api.ProviderVerbs, Fabric: "ib-fabric-a", Interface: "ib0"},
 		{Provider: api.ProviderEFA, Fabric: "vpc1-subnet-a"},
 	}, loaded.Fabrics)
 }
 
-// §16: the legacy `domains:` block carries over unchanged, including its `url:` spelling and the
-// per-domain fields that no longer mean anything here.
-func TestLegacyDomainBlockIsAccepted(t *testing.T) {
-	path := write(t, `
-domains:
-  loopback-in:
-    url: mxl:///dev/shm/mxl1
-  loopback-out:
-    url: mxl:///dev/shm/mxl0
-    provider: tcp
-    node: 127.0.0.1
-    labels:
-      studio: a
-  archive:
-    path: /srv/archive/
-  cameras: /dev/shm/mxl2
-`)
-
-	loaded, err := LoadAgent(path)
-	require.NoError(t, err)
-	require.NoError(t, loaded.Validate())
-
-	assert.Equal(t, Domains{
-		"loopback-in":  "/dev/shm/mxl1",
-		"loopback-out": "/dev/shm/mxl0",
-		"archive":      "/srv/archive",
-		"cameras":      "/dev/shm/mxl2",
-	}, loaded.Domains)
+// **The `domains:` block is gone** (§6, §16), and a file that still carries one is refused
+// outright rather than accepted-and-ignored — which is the ordinary unknown-key rule, applied to a
+// key that used to be real. A silently ignored mapping block would be a node whose operator
+// believes it has named its domains and which reports them under whatever the discoverer called
+// them.
+func TestTheDomainsBlockIsNoLongerAccepted(t *testing.T) {
+	_, err := LoadAgent(write(t, "domains:\n  cameras: /dev/shm/mxl0\n"))
+	assert.ErrorContains(t, err, "domains")
 }
 
-func TestDomainBlockRejections(t *testing.T) {
-	for _, tc := range []struct{ name, body, wants string }{
-		{"relative", "domains:\n  a: dev/shm/mxl0\n", "must be absolute"},
-		{"empty", "domains:\n  a: \"\"\n", "empty path"},
-		{"both", "domains:\n  a:\n    url: mxl:///x\n    path: /x\n", "not both"},
-		{"neither", "domains:\n  a:\n    provider: tcp\n", "neither url nor path"},
-		{"wrong scheme", "domains:\n  a:\n    url: file:///x\n", "is not mxl"},
-		{"a list", "domains:\n  - a\n", "expected a mapping"},
-		{"a domain that is a list", "domains:\n  a: [1, 2]\n", "expected a path or a mapping"},
-		{
-			// The legacy config used mxl://host/path for *remote* domains. A domain block names
-			// directories on this host; a remote flow is addressed by (node, domain) now.
-			"remote url",
-			"domains:\n  a:\n    url: mxl://other-host/dev/shm/mxl0\n",
-			"names a host",
-		},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			_, err := LoadAgent(write(t, tc.body))
-			assert.ErrorContains(t, err, tc.wants)
-		})
-	}
-}
-
-// A mistyped top-level key that silently did nothing would present as a node with no
-// connectivity, which reads as missing hardware rather than as a typo.
 func TestUnknownTopLevelKeysAreRejected(t *testing.T) {
 	_, err := LoadAgent(write(t, "fabircs:\n  - provider: tcp\n"))
 	assert.ErrorContains(t, err, "fabircs")
@@ -133,30 +84,22 @@ func TestMissingFileIsReported(t *testing.T) {
 	assert.ErrorContains(t, err, "nope.yaml")
 }
 
-// Maps merge per key, lists replace: a later file adding a domain keeps the earlier ones, but a
-// later `fabrics:` block describes this node's connectivity in full.
+// Lists replace: a later `fabrics:` block describes this node's connectivity in full, and half
+// -overriding one is never what anyone means.
 func TestMergeRules(t *testing.T) {
 	first := write(t, `
 node: edge-01
 server: [http://a:2283]
-domains:
-  cameras: /dev/shm/mxl0
-  ingest: /dev/shm/mxl1
-output_roots:
-  - name: fast
-    path: /dev/shm/mxl
+areas:
+  - {name: fast, path: /dev/shm/mxl, read: true, write: true}
 fabrics:
   - provider: tcp
     fabric: dc1
     address: 10.0.0.1
 `)
 	second := write(t, `
-domains:
-  ingest: /dev/shm/mxl9
-  archive: /dev/shm/mxl2
-output_roots:
-  - name: bulk
-    path: /mnt/nvme/mxl
+areas:
+  - {name: bulk, path: /mnt/nvme/mxl, read: true, write: true}
 fabrics:
   - provider: verbs
     fabric: ib-a
@@ -168,26 +111,20 @@ fabrics:
 
 	assert.Equal(t, "edge-01", loaded.Node, "a key the later file does not mention survives")
 	assert.Equal(t, []string{"http://a:2283"}, loaded.Server)
-	assert.Equal(t, Domains{
-		"cameras": "/dev/shm/mxl0",
-		"ingest":  "/dev/shm/mxl9",
-		"archive": "/dev/shm/mxl2",
-	}, loaded.Domains)
 	require.Len(t, loaded.Fabrics, 1)
 	assert.Equal(t, api.ProviderVerbs, loaded.Fabrics[0].Provider)
 
-	// Roots replace rather than merge, like fabrics: the list is one description of what this
-	// node permits writing into, and half-overriding it is never what anyone means.
-	assert.Equal(t, []OutputRoot{{Name: "bulk", Path: "/mnt/nvme/mxl"}}, loaded.OutputRoots)
+	// Areas replace rather than merge, like fabrics: the list is one description of what this node
+	// permits, and half-overriding it is never what anyone means.
+	assert.Equal(t, []api.Area{{Name: "bulk", Path: "/mnt/nvme/mxl", Read: true, Write: true}}, loaded.Areas)
 }
 
 func TestValidateReportsEveryProblem(t *testing.T) {
 	agent := &Agent{
-		Domains:     Domains{"a": "relative/path"},
-		SearchPaths: []string{"also/relative"},
-		OutputRoots: []OutputRoot{
-			{Name: "fast", Path: "relative/too"},
-			{Name: "../escape", Path: "/dev/shm/mxl"},
+		Areas: []api.Area{
+			{Name: "fast", Path: "relative/too", Read: true},
+			{Name: "../escape", Path: "/dev/shm/mxl", Read: true},
+			{Name: "inert", Path: "/dev/shm/mxl2"},
 		},
 		Fabrics: []probe.Attachment{
 			{Provider: api.ProviderTCP}, // no fabric label
@@ -198,13 +135,44 @@ func TestValidateReportsEveryProblem(t *testing.T) {
 	err := agent.Validate()
 	require.Error(t, err)
 	assert.ErrorContains(t, err, "must be absolute")
-	assert.ErrorContains(t, err, "search path")
 	assert.ErrorContains(t, err, "fabrics[0]")
 	assert.ErrorContains(t, err, "fabrics[1]")
-	// Per-entry only here. Whether roots overlap each other, a mapping or a search path needs the
-	// merged file-plus-flags picture, so it is checked once where that exists (§10.6).
-	assert.ErrorContains(t, err, `output root "fast"`)
-	assert.ErrorContains(t, err, "output_roots[1]")
+	// Per-entry only here. Whether two areas share a path needs the merged file-plus-flags
+	// picture, so it is checked once where that exists (§10.6).
+	assert.ErrorContains(t, err, `area "fast"`)
+	assert.ErrorContains(t, err, "areas[1]")
+	// An area granting neither is a line that does nothing, and an operator who wrote it believes
+	// the node has an area there (§10.6).
+	assert.ErrorContains(t, err, "grants neither read nor write")
+}
+
+// **Areas take grants and there is no default**, because both bits default false in the model: a
+// flag that guessed would be granting this project authority over a host's filesystem on the
+// strength of an omission (§10.6).
+func TestParseArea(t *testing.T) {
+	t.Parallel()
+
+	for value, want := range map[string]api.Area{
+		"media=/dev/shm/mxl:r":            {Name: "media", Path: "/dev/shm/mxl", Read: true},
+		"fast=/dev/shm/mxl/replicated:rw": {Name: "fast", Path: "/dev/shm/mxl/replicated", Read: true, Write: true},
+		"bulk=/mnt/nvme/mxl:w":            {Name: "bulk", Path: "/mnt/nvme/mxl", Write: true},
+		"odd=/mnt/a:b/c:rw":               {Name: "odd", Path: "/mnt/a:b/c", Read: true, Write: true},
+	} {
+		area, err := ParseArea(value)
+		require.NoError(t, err, value)
+		assert.Equal(t, want, area, value)
+	}
+
+	for _, value := range []string{
+		"media",                  // no path
+		"media=/dev/shm/mxl",     // no grants
+		"media=/dev/shm/mxl:",    // no grants, spelled
+		"media=/dev/shm/mxl:x",   // unknown grant
+		"media=/dev/shm/mxl:rwx", // one unknown among the known
+	} {
+		_, err := ParseArea(value)
+		assert.Error(t, err, value)
+	}
 }
 
 // The flag form exists so that a single-host or development deployment needs no file at all,

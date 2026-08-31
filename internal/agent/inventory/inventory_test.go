@@ -93,20 +93,37 @@ func (c *clock) advance(d time.Duration) {
 // harness is an inventory over a temp directory, running for the duration of a test.
 type harness struct {
 	*Inventory
-	clock   *clock
+	clock *clock
+
+	// domain is the source domain's local path; name is its fleet-wide identity, `media/cameras`.
 	domain  string
+	name    string
 	changes chan struct{}
 }
 
 func newHarness(t *testing.T, opts Options) *harness {
 	t.Helper()
 
-	domain := t.TempDir()
+	// The source domain is **discovered**: there are no configured mappings any more (§6), so the
+	// harness gives the inventory a readable area and the tests create flows underneath it. A
+	// domain's name is `<area>/<elements>`, assigned by the innermost containing area (§10.6).
+	areaRoot := t.TempDir()
+	domain := filepath.Join(areaRoot, "cameras")
+	require.NoError(t, os.MkdirAll(domain, 0o755))
+
+	// A seed flow, because mxl-utils' discoverer only reports a directory that already contains
+	// one and rescans on a fixed 7 s period. Without it the domain would not be discovered until
+	// long after a test has created its own flow — and the watcher, which is what delivers a flow
+	// added later, is only attached to domains the discoverer reported.
+	seed, err := testutil.RandomVideoFlow(domain)
+	require.NoError(t, err)
+	require.NoError(t, seed.Create())
+
 	clk := newClock()
 	changes := make(chan struct{}, 128)
 
-	if opts.Domains == nil && opts.SearchPaths == nil {
-		opts.Domains = []Domain{{Name: "cameras", Path: domain}}
+	if opts.Areas == nil {
+		opts.Areas = []api.Area{{Name: "media", Path: areaRoot, Read: true}}
 	}
 	opts.Logger = discard()
 	opts.Now = clk.Now
@@ -135,7 +152,7 @@ func newHarness(t *testing.T, opts Options) *harness {
 		<-done
 	})
 
-	return &harness{Inventory: inv, clock: clk, domain: domain, changes: changes}
+	return &harness{Inventory: inv, clock: clk, domain: domain, name: "media/cameras", changes: changes}
 }
 
 // eventually polls the snapshot until want is satisfied. Sampling is time-driven and the watcher
@@ -155,6 +172,20 @@ func (h *harness) eventually(t *testing.T, what string, want func([]api.DomainIn
 
 	t.Fatalf("timed out waiting for %s; last snapshot: %+v", what, last)
 	return nil
+}
+
+// consistently asserts the snapshot keeps satisfying want for a while, which is how "nothing was
+// reported" is distinguished from "nothing has been reported *yet*".
+func (h *harness) consistently(t *testing.T, what string, d time.Duration, want func([]api.DomainInventory) bool) {
+	t.Helper()
+
+	deadline := time.Now().Add(d)
+	for time.Now().Before(deadline) {
+		if last := h.Snapshot(); !want(last) {
+			t.Fatalf("%s stopped holding; snapshot: %+v", what, last)
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
 }
 
 // settle waits until the sampler has caught up with the last write.
@@ -195,7 +226,7 @@ func (h *harness) settle(t *testing.T, id string) {
 
 func flowOf(snapshot []api.DomainInventory, domain, id string) (api.FlowInventory, bool) {
 	for _, d := range snapshot {
-		if d.Name != domain {
+		if d.Domain.String() != domain {
 			continue
 		}
 		for _, f := range d.Flows {
@@ -207,48 +238,60 @@ func flowOf(snapshot []api.DomainInventory, domain, id string) (api.FlowInventor
 	return api.FlowInventory{}, false
 }
 
-func TestNewRejectsAmbiguousMappings(t *testing.T) {
-	_, err := New(Options{Domains: []Domain{{Name: "a", Path: "relative"}}})
-	assert.ErrorContains(t, err, "not absolute")
+// **The one merged rule left is that no two areas share a path** (§10.6). *This supersedes a table
+// of overlap rules — a search path inside a root, a search path equal to a root, a root above an
+// input mapping.* All of it was arithmetic on a distinction that no longer exists: there is one
+// kind of area, nesting is legal, and the innermost containing one names a directory.
+func TestNewRejectsOnlyWhatItMust(t *testing.T) {
+	t.Parallel()
 
-	_, err = New(Options{Domains: []Domain{{Path: "/dev/shm/mxl0"}}})
-	assert.ErrorContains(t, err, "empty")
+	base := t.TempDir()
+	nested := filepath.Join(base, "replicated")
 
-	// **An input name takes the same rule as an output domain's elements.** Names are flat per
-	// node, so an input mapping and a rendered output domain share one namespace: `-m a/b=...`
-	// against `domain: a/b` would be two things with one address, and the server's collision check
-	// compares exactly those two strings (§10.6).
-	for _, name := range []string{"a/b", "with space", ".hidden", "-flag", "..", "ingést"} {
-		_, err := New(Options{Domains: []Domain{{Name: name, Path: "/dev/shm/mxl0"}}})
-		assert.Error(t, err, "input domain name %q should be refused", name)
+	// **Nesting is legal**, and is the ordinary one-MXL-area-per-host layout.
+	_, err := New(Options{Areas: []api.Area{
+		{Name: "media", Path: base, Read: true},
+		{Name: "fast", Path: nested, Read: true, Write: true},
+	}, Logger: discard()})
+	require.NoError(t, err)
+
+	for name, areas := range map[string][]api.Area{
+		"relative path":     {{Name: "fast", Path: "relative", Read: true}},
+		"filesystem root":   {{Name: "fast", Path: "/", Read: true}},
+		"empty name":        {{Name: "", Path: base, Read: true}},
+		"name with a slash": {{Name: "a/b", Path: base, Read: true}},
+		"no grants":         {{Name: "fast", Path: base}},
+		"name twice": {
+			{Name: "fast", Path: base, Read: true},
+			{Name: "fast", Path: nested, Read: true},
+		},
+		// The one arrangement the innermost-area rule cannot decide.
+		"one path twice": {
+			{Name: "fast", Path: base, Read: true},
+			{Name: "bulk", Path: base, Read: true},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			_, err := New(Options{Areas: areas, Logger: discard()})
+			assert.Error(t, err)
+		})
 	}
-
-	// And the shapes an existing deployment actually uses still work — this tightens §16's
-	// byte-compatible `-m name=/path` promise without breaking the names it was made for.
-	for _, name := range []string{"mxl0", "cameras", "loopback-in", "studio_a", "a.b", "A1"} {
-		_, err := New(Options{Domains: []Domain{{Name: name, Path: "/dev/shm/mxl0"}}})
-		assert.NoError(t, err, "input domain name %q should be accepted", name)
-	}
-
-	_, err = New(Options{Domains: []Domain{{Name: "a", Path: "/x"}, {Name: "a", Path: "/y"}}})
-	assert.ErrorContains(t, err, "mapped twice")
-
-	// Two names for one directory would put one flow in the fleet inventory twice, under two
-	// addresses, and make the reverse lookup ambiguous.
-	_, err = New(Options{Domains: []Domain{{Name: "a", Path: "/x"}, {Name: "b", Path: "/x/"}}})
-	assert.ErrorContains(t, err, "mapped twice")
 }
 
-// A configured domain goes in as a *static* domain, so it stays visible while it is empty —
-// which is exactly what that parameter is for, and what stops a request for a not-yet-created
-// flow reading as "that node has no such domain".
-func TestConfiguredDomainIsVisibleWhileEmpty(t *testing.T) {
-	h := newHarness(t, Options{})
+// **A domain with no flow in it is not reported at all.** mxl-utils' discoverer only ever reports
+// directories that already contain a flow, and with configured mappings gone (§6) there is no
+// static list to keep an empty one visible. That is a real property of the design rather than a
+// fixture detail: §10.7 records it as the cost of naming domains through the API — a labelled
+// domain with no producer is a pending record, not an inventory entry.
+func TestAnEmptyDomainIsNotReported(t *testing.T) {
+	root := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(root, "cameras"), 0o755))
 
-	snapshot := h.eventually(t, "the empty domain", func(s []api.DomainInventory) bool { return len(s) == 1 })
-	assert.Equal(t, "cameras", snapshot[0].Name)
-	assert.True(t, snapshot[0].Configured)
-	assert.Empty(t, snapshot[0].Flows)
+	h := newHarness(t, Options{Areas: []api.Area{{Name: "media", Path: root, Read: true}}})
+
+	h.consistently(t, "nothing to report", 200*time.Millisecond,
+		func(s []api.DomainInventory) bool { return len(s) == 0 })
 }
 
 func TestFlowIsReportedWithItsDefinitionAndGroupHint(t *testing.T) {
@@ -259,11 +302,11 @@ func TestFlowIsReportedWithItsDefinitionAndGroupHint(t *testing.T) {
 	require.NoError(t, flow.Create())
 
 	h.eventually(t, "the flow", func(s []api.DomainInventory) bool {
-		_, ok := flowOf(s, "cameras", flow.ID())
+		_, ok := flowOf(s, h.name, flow.ID())
 		return ok
 	})
 
-	observed, _ := flowOf(h.Snapshot(), "cameras", flow.ID())
+	observed, _ := flowOf(h.Snapshot(), h.name, flow.ID())
 	require.NotNil(t, observed.GroupHint)
 	assert.Equal(t, "video", observed.GroupHint.Type)
 	assert.Contains(t, observed.GroupHint.Name, "Test Flow")
@@ -297,7 +340,7 @@ func TestUnmodelledDefinitionFieldsSurvive(t *testing.T) {
 	require.NoError(t, os.WriteFile(path, patched, 0o644))
 
 	h.eventually(t, "the patched definition", func(s []api.DomainInventory) bool {
-		observed, ok := flowOf(s, "cameras", flow.ID())
+		observed, ok := flowOf(s, h.name, flow.ID())
 		return ok && len(observed.Definition) > 0
 	})
 
@@ -305,7 +348,7 @@ func TestUnmodelledDefinitionFieldsSurvive(t *testing.T) {
 	// Removing and recreating is how a producer republishes, and it is the path that matters.
 	require.NoError(t, flow.Remove())
 	h.eventually(t, "the flow to go away", func(s []api.DomainInventory) bool {
-		_, ok := flowOf(s, "cameras", flow.ID())
+		_, ok := flowOf(s, h.name, flow.ID())
 		return !ok
 	})
 
@@ -313,7 +356,7 @@ func TestUnmodelledDefinitionFieldsSurvive(t *testing.T) {
 	require.NoError(t, os.WriteFile(filepath.Join(h.domain, flow.ID()+".mxl-flow", "flow_def.json"), patched, 0o644))
 
 	h.eventually(t, "the republished definition", func(s []api.DomainInventory) bool {
-		observed, ok := flowOf(s, "cameras", flow.ID())
+		observed, ok := flowOf(s, h.name, flow.ID())
 		if !ok {
 			return false
 		}
@@ -334,15 +377,15 @@ func TestProducingIsHystereticAndDerivedFromHeadIndexDeltas(t *testing.T) {
 	// A flow that merely *has* a head index is not producing. Only having been seen to advance
 	// makes it so — a dormant flow has a head index too.
 	h.eventually(t, "the flow", func(s []api.DomainInventory) bool {
-		_, ok := flowOf(s, "cameras", flow.ID())
+		_, ok := flowOf(s, h.name, flow.ID())
 		return ok
 	})
-	observed, _ := flowOf(h.Snapshot(), "cameras", flow.ID())
+	observed, _ := flowOf(h.Snapshot(), h.name, flow.ID())
 	assert.False(t, observed.Producing)
 
 	stop := keepWriting(t, flow)
 	h.eventually(t, "producing", func(s []api.DomainInventory) bool {
-		observed, ok := flowOf(s, "cameras", flow.ID())
+		observed, ok := flowOf(s, h.name, flow.ID())
 		return ok && observed.Producing
 	})
 	stop()
@@ -351,12 +394,12 @@ func TestProducingIsHystereticAndDerivedFromHeadIndexDeltas(t *testing.T) {
 	// Still producing well before the threshold: a gap between grains is not a stopped producer.
 	h.clock.advance(2 * time.Second)
 	time.Sleep(20 * time.Millisecond)
-	observed, _ = flowOf(h.Snapshot(), "cameras", flow.ID())
+	observed, _ = flowOf(h.Snapshot(), h.name, flow.ID())
 	assert.True(t, observed.Producing, "a pause shorter than the threshold must not flip the bit")
 
 	h.clock.advance(2 * time.Second)
 	h.eventually(t, "not producing", func(s []api.DomainInventory) bool {
-		observed, ok := flowOf(s, "cameras", flow.ID())
+		observed, ok := flowOf(s, h.name, flow.ID())
 		return ok && !observed.Producing
 	})
 
@@ -364,7 +407,7 @@ func TestProducingIsHystereticAndDerivedFromHeadIndexDeltas(t *testing.T) {
 	stop = keepWriting(t, flow)
 	defer stop()
 	h.eventually(t, "producing again", func(s []api.DomainInventory) bool {
-		observed, ok := flowOf(s, "cameras", flow.ID())
+		observed, ok := flowOf(s, h.name, flow.ID())
 		return ok && observed.Producing
 	})
 }
@@ -382,13 +425,13 @@ func TestRepublishedFlowIsReopened(t *testing.T) {
 	require.NoError(t, flow.Create())
 
 	h.eventually(t, "the flow", func(s []api.DomainInventory) bool {
-		_, ok := flowOf(s, "cameras", flow.ID())
+		_, ok := flowOf(s, h.name, flow.ID())
 		return ok
 	})
 
 	stop := keepWriting(t, flow)
 	h.eventually(t, "producing", func(s []api.DomainInventory) bool {
-		observed, ok := flowOf(s, "cameras", flow.ID())
+		observed, ok := flowOf(s, h.name, flow.ID())
 		return ok && observed.Producing
 	})
 	stop()
@@ -402,7 +445,7 @@ func TestRepublishedFlowIsReopened(t *testing.T) {
 	require.NoError(t, replacement.Create())
 
 	h.eventually(t, "the reopened flow to go quiet", func(s []api.DomainInventory) bool {
-		observed, ok := flowOf(s, "cameras", flow.ID())
+		observed, ok := flowOf(s, h.name, flow.ID())
 		return ok && !observed.Producing
 	})
 
@@ -411,7 +454,7 @@ func TestRepublishedFlowIsReopened(t *testing.T) {
 	stop = keepWriting(t, replacement)
 	defer stop()
 	h.eventually(t, "the replacement to be seen producing", func(s []api.DomainInventory) bool {
-		observed, ok := flowOf(s, "cameras", flow.ID())
+		observed, ok := flowOf(s, h.name, flow.ID())
 		return ok && observed.Producing
 	})
 }
@@ -424,23 +467,24 @@ func TestFlowRemovalIsObserved(t *testing.T) {
 	require.NoError(t, flow.Create())
 
 	h.eventually(t, "the flow", func(s []api.DomainInventory) bool {
-		_, ok := flowOf(s, "cameras", flow.ID())
+		_, ok := flowOf(s, h.name, flow.ID())
 		return ok
 	})
 
 	require.NoError(t, flow.Remove())
 	h.eventually(t, "the flow to go away", func(s []api.DomainInventory) bool {
-		_, ok := flowOf(s, "cameras", flow.ID())
+		_, ok := flowOf(s, h.name, flow.ID())
 		return !ok
 	})
 
-	// The domain itself is configured, so it stays.
+	// The domain itself stays, because the harness's seed flow is still in it.
 	assert.Len(t, h.Snapshot(), 1)
 }
 
-// A discovered domain is a source and never a destination, which is the invariant that stops the
-// API being a remote arbitrary-filesystem-write primitive (§7.2, §13).
-func TestDiscoveredDomainsAreSourcesOnly(t *testing.T) {
+// **A domain is named by its innermost containing area**, and that is its identity for life
+// (§10.6). Hierarchy under the area survives into the name, which is what makes one grammar work
+// for a discovered domain and a materialised one alike.
+func TestADomainIsNamedByItsInnermostArea(t *testing.T) {
 	root := t.TempDir()
 	found := filepath.Join(root, "nested", "domain")
 	require.NoError(t, os.MkdirAll(found, 0o755))
@@ -449,65 +493,81 @@ func TestDiscoveredDomainsAreSourcesOnly(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, flow.Create())
 
-	h := newHarness(t, Options{SearchPaths: []string{root}})
+	h := newHarness(t, Options{Areas: []api.Area{{Name: "media", Path: root, Read: true}}})
 
 	snapshot := h.eventually(t, "the discovered domain", func(s []api.DomainInventory) bool {
 		return len(s) == 1 && len(s[0].Flows) == 1
 	})
-	assert.False(t, snapshot[0].Configured)
-	assert.Equal(t, found, snapshot[0].Name, "a discovered domain is named by its path")
+	assert.Equal(t, api.Domain{Area: "media", Elements: []string{"nested", "domain"}}, snapshot[0].Domain)
+	assert.Equal(t, "media/nested/domain", snapshot[0].Domain.String())
 
-	assert.False(t, h.Configured(found))
-	path, ok := h.Input(found)
-	assert.True(t, ok, "a discovered domain still resolves, so it can be an initiator's source")
+	path, ok := h.Lookup(snapshot[0].Domain)
+	assert.True(t, ok, "an observed domain resolves, so it can be an initiator's source")
 	assert.Equal(t, found, path)
 
-	// Registration advertises configured mappings only: it is durable state, and discovery comes
-	// and goes with whatever a producer created.
-	assert.Empty(t, h.Mappings())
+	// The destination side is a different function entirely, and it consults no observed state:
+	// [Inventory.Resolve] answers from the node's own area table and the assignment's structure
+	// alone. That asymmetry is a property of *resolution* rather than of the directory (§10.6).
+	_, err = h.Resolve(api.Domain{Area: "media", Elements: []string{"ingest"}})
+	assert.ErrorContains(t, err, "does not grant writing")
 }
 
-// Resolution is a strict map lookup. An agent that fell back to treating an unmapped name as a
-// path would hand the API the filesystem.
-func TestPathResolutionNeverInterpretsAName(t *testing.T) {
-	h := newHarness(t, Options{Domains: []Domain{{Name: "cameras", Path: t.TempDir()}}})
+// **Longest prefix wins.** `media` being an ancestor of `fast` produces nothing to disambiguate:
+// a directory inside `fast` is `fast/...` and never `media/replicated/...`, because `fast`
+// contains it more tightly (§10.6).
+func TestTheInnermostAreaWins(t *testing.T) {
+	outer := t.TempDir()
+	inner := filepath.Join(outer, "replicated")
+	found := filepath.Join(inner, "ingest")
+	require.NoError(t, os.MkdirAll(found, 0o755))
 
-	_, ok := h.Input("/etc")
-	assert.False(t, ok)
-	_, ok = h.Input("../../etc")
-	assert.False(t, ok)
-	_, ok = h.Input("unmapped")
-	assert.False(t, ok)
+	flow, err := testutil.RandomVideoFlow(found)
+	require.NoError(t, err)
+	require.NoError(t, flow.Create())
 
-	assert.True(t, h.Configured("cameras"))
-	assert.False(t, h.Configured("/etc"))
-}
+	h := newHarness(t, Options{Areas: []api.Area{
+		{Name: "media", Path: outer, Read: true},
+		{Name: "fast", Path: inner, Read: true, Write: true},
+	}})
 
-func TestMappingsAreWhatRegistrationAdvertises(t *testing.T) {
-	a, b := t.TempDir(), t.TempDir()
-	inv, err := New(Options{
-		Domains: []Domain{{Name: "ingest", Path: b}, {Name: "cameras", Path: a}},
-		Logger:  discard(),
+	snapshot := h.eventually(t, "the discovered domain", func(s []api.DomainInventory) bool {
+		return len(s) == 1
 	})
-	require.NoError(t, err)
+	assert.Equal(t, "fast/ingest", snapshot[0].Domain.String())
 
-	assert.Equal(t, []api.DomainMapping{
-		{Name: "cameras", Path: a, Configured: true},
-		{Name: "ingest", Path: b, Configured: true},
-	}, inv.Mappings())
+	// And it is the *same* name the reconciler would have materialised it under, which is the
+	// property that makes un-pruning affordable: the two namers cannot disagree (§10.6).
+	resolved, err := h.Resolve(api.Domain{Area: "fast", Elements: []string{"ingest"}})
+	require.NoError(t, err)
+	assert.Equal(t, found, resolved)
 }
 
-func TestCreateDomainsPreCreatesConfiguredPaths(t *testing.T) {
+// An area's own directory is not a domain — a domain has at least one element (§10.6).
+func TestAnAreasOwnDirectoryIsNotADomain(t *testing.T) {
 	root := t.TempDir()
-	path := filepath.Join(root, "does", "not", "exist", "yet")
-
-	inv, err := New(Options{Domains: []Domain{{Name: "ingest", Path: path}}, Logger: discard()})
+	flow, err := testutil.RandomVideoFlow(root)
 	require.NoError(t, err)
-	require.NoError(t, inv.CreateDomains())
+	require.NoError(t, flow.Create())
 
-	info, err := os.Stat(path)
-	require.NoError(t, err)
-	assert.True(t, info.IsDir())
+	h := newHarness(t, Options{Areas: []api.Area{{Name: "media", Path: root, Read: true}}})
+
+	h.consistently(t, "nothing to report", 200*time.Millisecond,
+		func(s []api.DomainInventory) bool { return len(s) == 0 })
+}
+
+// Resolution is a strict map lookup over the domains this agent is *observing*. An agent that
+// fell back to treating an unobserved name as a path would hand the API the filesystem.
+func TestPathResolutionNeverInterpretsAName(t *testing.T) {
+	h := newHarness(t, Options{})
+
+	for _, domain := range []api.Domain{
+		{Area: "media", Elements: []string{"unobserved"}},
+		{Area: "nowhere", Elements: []string{"cameras"}},
+		{Area: "media", Elements: []string{"..", "..", "etc"}},
+	} {
+		_, ok := h.Lookup(domain)
+		assert.False(t, ok, "domain %q must not resolve", domain)
+	}
 }
 
 // A flow directory that exists before its definition does is a producer part-way through
@@ -519,11 +579,14 @@ func TestFlowWithoutADefinitionIsNotReported(t *testing.T) {
 	dir := filepath.Join(h.domain, "5592a23b-0974-45bb-9388-89ea81c42537.mxl-flow")
 	require.NoError(t, os.MkdirAll(dir, 0o755))
 
-	// Give the watcher and a few samples time to see it and decline to report it.
+	// Give the watcher and a few samples time to see it and decline to report it. The harness's
+	// seed flow is still there, so what is asserted is that this one did not join it.
 	time.Sleep(60 * time.Millisecond)
 	snapshot := h.Snapshot()
 	require.Len(t, snapshot, 1)
-	assert.Empty(t, snapshot[0].Flows)
+	for _, flow := range snapshot[0].Flows {
+		assert.NotEqual(t, "5592a23b-0974-45bb-9388-89ea81c42537", flow.ID)
+	}
 }
 
 // The snapshot is compared against the previous one before it is reported, so a stable order is
@@ -537,8 +600,9 @@ func TestSnapshotOrderIsStable(t *testing.T) {
 		require.NoError(t, flow.Create())
 	}
 
+	// Six, counting the harness's seed flow.
 	h.eventually(t, "all five flows", func(s []api.DomainInventory) bool {
-		return len(s) == 1 && len(s[0].Flows) == 5
+		return len(s) == 1 && len(s[0].Flows) == 6
 	})
 
 	first, err := json.Marshal(h.Snapshot())
@@ -591,3 +655,186 @@ var (
 	_ = mxlsys.FlowRuntimeInfo{}
 	_ = mxl.ErrMissingGroupHint
 )
+
+// --- the union: discovery and materialisation (§10.6) ------------------------------------------
+
+// **A directory reported by discovery *and* materialised by the reconciler resolves to one name
+// and one inventory entry, in both orders.** That is what the innermost-area naming rule buys, and
+// it is what makes un-pruning affordable: the two namers cannot disagree, so there is nothing to
+// arbitrate.
+//
+// The second order is the case pruning existed for — a leftover directory holding a flow,
+// discovered *before* the assignment that materialises it. Under the old rule it kept its
+// path-shaped name through materialisation and the server, which matches a session's destination
+// by name, left the path in ESTABLISHING with nothing explaining why (§10.6).
+func TestDiscoveryAndMaterialisationAgreeOnOneName(t *testing.T) {
+	t.Run("materialised first", func(t *testing.T) {
+		root := t.TempDir()
+		h := newHarness(t, Options{Areas: []api.Area{{Name: "fast", Path: root, Read: true, Write: true}}})
+
+		resolved, err := h.Resolve(api.Domain{Area: "fast", Elements: []string{"cam1"}})
+		require.NoError(t, err)
+		require.NoError(t, h.Materialise(resolved))
+
+		flow, err := testutil.RandomVideoFlow(resolved)
+		require.NoError(t, err)
+		require.NoError(t, flow.Create())
+
+		snapshot := h.eventually(t, "the flow", func(s []api.DomainInventory) bool {
+			return len(s) == 1 && len(s[0].Flows) == 1
+		})
+		assert.Equal(t, "fast/cam1", snapshot[0].Domain.String())
+	})
+
+	t.Run("discovered first", func(t *testing.T) {
+		root := t.TempDir()
+		stale := filepath.Join(root, "cam1")
+		require.NoError(t, os.MkdirAll(stale, 0o755))
+		flow, err := testutil.RandomVideoFlow(stale)
+		require.NoError(t, err)
+		require.NoError(t, flow.Create())
+
+		h := newHarness(t, Options{Areas: []api.Area{{Name: "fast", Path: root, Read: true, Write: true}}})
+
+		// Discovered like any other domain — **not pruned** — and already carrying the name the
+		// reconciler is about to materialise it under.
+		snapshot := h.eventually(t, "the leftover domain", func(s []api.DomainInventory) bool {
+			return len(s) == 1
+		})
+		assert.Equal(t, "fast/cam1", snapshot[0].Domain.String())
+
+		resolved, err := h.Resolve(api.Domain{Area: "fast", Elements: []string{"cam1"}})
+		require.NoError(t, err)
+		require.NoError(t, h.Materialise(resolved))
+
+		// One entry, one name, and the flow that was already there.
+		snapshot = h.Snapshot()
+		require.Len(t, snapshot, 1)
+		assert.Equal(t, "fast/cam1", snapshot[0].Domain.String())
+		require.Len(t, snapshot[0].Flows, 1)
+	})
+}
+
+// **RemoveDomain must not evict a materialised domain**, and this is the one correctness-critical
+// line in the un-pruning (§10.6). The discoverer only reports directories that currently contain a
+// flow, so an unconditional removal would forget a domain the instant its last flow was released —
+// while a live session still targeted it.
+//
+// Driven through the receiver directly rather than by waiting out the discoverer's 7 s rescan: the
+// property under test is the union, not the scan interval.
+func TestAMaterialisedDomainSurvivesDiscoveryLettingGo(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	h := newHarness(t, Options{Areas: []api.Area{{Name: "fast", Path: root, Read: true, Write: true}}})
+
+	resolved, err := h.Resolve(api.Domain{Area: "fast", Elements: []string{"cam1"}})
+	require.NoError(t, err)
+	require.NoError(t, h.Materialise(resolved))
+	h.AddDomain(resolved) // as a scan that saw its flow would
+
+	require.Len(t, h.Snapshot(), 1)
+
+	// The scan stops seeing it — its last flow was released. The reconciler still holds it.
+	h.RemoveDomain(resolved)
+	assert.Len(t, h.Snapshot(), 1, "a live session still targets this domain")
+
+	// And it leaves only when both have let go.
+	h.Release(resolved)
+	assert.Empty(t, h.Snapshot())
+}
+
+// The mirror: a domain some *other* actor still has a flow in stays visible after the reconciler
+// releases it. It is an ordinary domain that this project happens to have created, which is the
+// widening un-pruning is for — a leaked directory is discovered rather than hidden (§10.6).
+func TestReleaseDoesNotHideADomainDiscoveryStillReports(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	h := newHarness(t, Options{Areas: []api.Area{{Name: "fast", Path: root, Read: true, Write: true}}})
+
+	resolved, err := h.Resolve(api.Domain{Area: "fast", Elements: []string{"cam1"}})
+	require.NoError(t, err)
+	require.NoError(t, h.Materialise(resolved))
+	h.AddDomain(resolved)
+
+	h.Release(resolved)
+	require.Len(t, h.Snapshot(), 1, "discovery still reports it")
+	assert.Equal(t, "fast/cam1", h.Snapshot()[0].Domain.String())
+
+	h.RemoveDomain(resolved)
+	assert.Empty(t, h.Snapshot())
+}
+
+// **An area repointed to a different directory keeps every domain identity on the node**, so
+// paths and sessions survive the restart rather than rebuilding (§5.4, §10.6). That is the thing
+// the area name buys over path-as-identity, and it is invisible unless it is asserted.
+func TestRepointingAnAreaKeepsEveryDomainIdentity(t *testing.T) {
+	t.Parallel()
+
+	names := func(t *testing.T, path string) []string {
+		t.Helper()
+
+		domain := filepath.Join(path, "cam1")
+		require.NoError(t, os.MkdirAll(domain, 0o755))
+		flow, err := testutil.RandomVideoFlow(domain)
+		require.NoError(t, err)
+		require.NoError(t, flow.Create())
+
+		h := newHarness(t, Options{Areas: []api.Area{{Name: "media", Path: path, Read: true}}})
+		snapshot := h.eventually(t, "the domain", func(s []api.DomainInventory) bool { return len(s) == 1 })
+		return []string{snapshot[0].Domain.String()}
+	}
+
+	before := names(t, t.TempDir())
+	after := names(t, t.TempDir())
+	assert.Equal(t, []string{"media/cam1"}, before)
+	assert.Equal(t, before, after, "the directory moved; the identity did not")
+}
+
+// --- provenance (§6, §10.6) --------------------------------------------------------------------
+
+// `replicated` is true exactly while one of this agent's own target workers is writing that flow,
+// and it is what keeps a label selector from matching this project's own output (§10.7).
+//
+// It is **pushed from the running workers**, so this test drives it the way the agent's reconcile
+// does rather than inferring it from anything on disk.
+func TestReplicatedTracksTheRunningTargetWorkers(t *testing.T) {
+	h := newHarness(t, Options{})
+
+	flow, err := testutil.RandomVideoFlow(h.domain)
+	require.NoError(t, err)
+	require.NoError(t, flow.Create())
+
+	h.eventually(t, "the flow", func(s []api.DomainInventory) bool {
+		_, ok := flowOf(s, h.name, flow.ID())
+		return ok
+	})
+
+	observed, _ := flowOf(h.Snapshot(), h.name, flow.ID())
+	assert.False(t, observed.Replicated, "nothing on this node is writing it")
+
+	h.SetReplicated(map[FlowRef]struct{}{{DomainPath: h.domain, FlowID: flow.ID()}: {}})
+	observed, _ = flowOf(h.Snapshot(), h.name, flow.ID())
+	assert.True(t, observed.Replicated)
+
+	// A sibling flow in the same domain, written locally, is unaffected — which is the precision
+	// the per-flow rule buys over the directory-granular one it replaces (§10.7).
+	sibling, err := testutil.RandomVideoFlow(h.domain)
+	require.NoError(t, err)
+	require.NoError(t, sibling.Create())
+
+	h.eventually(t, "the sibling", func(s []api.DomainInventory) bool {
+		_, ok := flowOf(s, h.name, sibling.ID())
+		return ok
+	})
+	observed, _ = flowOf(h.Snapshot(), h.name, sibling.ID())
+	assert.False(t, observed.Replicated)
+
+	// **Provenance and production go absent together**, which is what makes the gap safe: the
+	// worker stopping is what takes the flag away, and the same stop is what stops the flow
+	// advancing (§10.6, §11.1).
+	h.SetReplicated(nil)
+	observed, _ = flowOf(h.Snapshot(), h.name, flow.ID())
+	assert.False(t, observed.Replicated)
+}

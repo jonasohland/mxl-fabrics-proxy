@@ -8,12 +8,13 @@
 //
 // and the operator-facing verbs beside it, which talk to a running server's user API (§9.1):
 //
-//	mxl-replicator apply    -f studio-a.yaml [--dry-run] [--prune -l show=nab]
+//	mxl-replicator apply    -f studio-a.yaml [--dry-run] [--prune -n nab [-l show=x]]
 //	mxl-replicator delete   -f studio-a.yaml
-//	mxl-replicator delete   cam1-distribution
+//	mxl-replicator delete   [-n nab] cam1-distribution
+//	mxl-replicator label    domain studio-a:media/cameras role=cameras role-
 //	mxl-replicator status   [-o json|yaml]
-//	mxl-replicator get      nodes|flows|requests|paths|sessions [filters]
-//	mxl-replicator describe node|flow|request|path|session <name>
+//	mxl-replicator get      nodes|flows|requests|paths|sessions|namespaces [filters]
+//	mxl-replicator describe node|flow|request|path|session|namespace <name>
 //
 // Three read verbs with three jobs and no overlap: status summarises the fleet and names what is
 // not active, get lists so you can find a name, describe explains one thing in full.
@@ -67,13 +68,28 @@ type CLI struct {
 
 	Apply    ApplyCmd    `cmd:"" help:"Apply a manifest of replication requests."`
 	Delete   DeleteCmd   `cmd:"" help:"Cancel replication requests, by manifest or by name."`
+	Label    LabelCmd    `cmd:"" help:"Attach or remove labels on one node's domain."`
 	Status   StatusCmd   `cmd:"" help:"Summarise the fleet and name anything that is not active."`
-	Get      GetCmd      `cmd:"" help:"List nodes, flows, requests, paths or sessions."`
-	Describe DescribeCmd `cmd:"" help:"Show everything known about one node, flow, request, path or session."`
+	Get      GetCmd      `cmd:"" help:"List nodes, flows, requests, paths, sessions or namespaces."`
+	Describe DescribeCmd `cmd:"" help:"Show everything known about one node, flow, request, path, session or namespace."`
 }
 
-// commands are the verb names, for [guardDefaultCommand].
-var commands = []string{"run", "apply", "delete", "status", "get", "describe"}
+// commandNames are the verb names, for [guardDefaultCommand].
+//
+// **Read out of kong's model rather than written down.** A hand-maintained copy of [CLI]'s fields
+// is a list that has to be edited in step with a struct that does not mention it, and the failure
+// when it is not is silent and confusing: the new verb is not rejected as unknown, it falls through
+// to `run` and is diagnosed as a positional argument that command does not want. `label` shipped
+// missing from the list and did exactly that.
+func commandNames(app *kong.Application) []string {
+	var names []string
+	for _, child := range app.Children {
+		if child.Type == kong.CommandNode {
+			names = append(names, child.Name)
+		}
+	}
+	return names
+}
 
 // guardDefaultCommand rejects a mistyped verb instead of letting it fall through to `run`.
 //
@@ -81,7 +97,7 @@ var commands = []string{"run", "apply", "delete", "status", "get", "describe"}
 // work. The cost is that `mxl-replicator aply -f x.yaml` is not an unknown command — it is `run`
 // with a positional argument it does not want, and the error says so in terms of flags that have
 // nothing to do with what was typed.
-func guardDefaultCommand(args []string) error {
+func guardDefaultCommand(commands, args []string) error {
 	if len(args) == 0 {
 		return nil
 	}
@@ -111,7 +127,7 @@ func main() {
 		kong.Vars{"version": version.String()},
 	)
 
-	parser.FatalIfErrorf(guardDefaultCommand(os.Args[1:]))
+	parser.FatalIfErrorf(guardDefaultCommand(commandNames(parser.Model), os.Args[1:]))
 
 	kctx, err := parser.Parse(os.Args[1:])
 	parser.FatalIfErrorf(err)

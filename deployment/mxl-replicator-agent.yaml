@@ -75,15 +75,20 @@ spec:
             - 0.0.0.0:2284
             - --agent-work-dir
             - /run/mxl-replicator
-            # Input domains: what this node reads from. Never written to (§10.6).
-            - -m
-            - mxl0=/dev/shm/mxl0
-            # Output roots: where replication may create domains. This is the whole of the
-            # authority the API has over this node's filesystem, it is one line of node-local
-            # config, and a node with none configured is not a replication destination at all
-            # (§10.6, §13).
-            - --agent-output-root
-            - fast=/dev/shm/mxl
+            # Areas: the directories this node has designated as somewhere MXL domains live, each
+            # with two independent grants. `r` is the whole of this project's authority to discover
+            # and observe domains under that directory; `w` is the whole of its authority to create
+            # them. Between them they are the whole of the API's authority over this node's
+            # filesystem, they are node-local config the API cannot set, and a node with no
+            # writable area is not a replication destination at all (§10.6, §13).
+            #
+            # A domain inside an area is addressed fleet-wide as `<area>/<elements>` — so a
+            # directory `/dev/shm/mxl/ingest` here is `fast/ingest`, and that is its identity for
+            # life. Areas may nest; the innermost containing one names a directory.
+            - --agent-area
+            - media=/dev/shm/mxl0:r
+            - --agent-area
+            - fast=/dev/shm/mxl:rw
             # A fabric attachment is (provider, fabric, address). `fabric` is an operator-assigned
             # opaque label: two nodes may pair on a provider only if they share it. Provider
             # availability is not reachability — two nodes both offering verbs may be on different

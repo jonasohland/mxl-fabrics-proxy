@@ -24,9 +24,28 @@
 //     trading the churn §11.1 exists to eliminate for a slower version of the same thing. Rate
 //     and head index belong in metrics (§12).
 //
-// Every flow in every mapped domain is observed, not only flows with sessions: admission (§11.1)
+// Every flow in every observed domain is watched, not only flows with sessions: admission (§11.1)
 // needs the liveness of flows nothing is replicating yet, and the destination flow's liveness is
 // what ACTIVE is derived from.
+//
+// # Domains are discovered, never configured, and named by their area
+//
+// *This package used to take a list of operator-configured name→path mappings, hold them as the
+// discoverer's `static` list, and resolve an assignment's domain name through them.* All of that
+// is gone (§6, §16): a domain is found under a readable **area**, or materialised by the
+// reconciler, and either way its fleet-wide name is `<area>/<elements>` — assigned by the
+// innermost containing area (§10.6). What it is *called* beyond that identity is decided through
+// the API, as labels (§10.7).
+//
+// # Discovery is not pruned, and membership is a union
+//
+// *This package used to hide everything inside an output root from discovery*, so that a
+// directory under one had exactly one name and one owner. The naming rule removes the need: both
+// namers produce the same string, so there is nothing to arbitrate. What survives is the
+// withdrawal half, and it is done by **union** rather than by hiding — a domain is in inventory if
+// discovery reports it *or* the reconciler materialised it and has not released it, and it leaves
+// only when both say no. Without that, an unpruned withdrawal would forget a materialised domain
+// the instant its last flow was released, while a session still targeted it (§10.6).
 package inventory
 
 import (
@@ -39,6 +58,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -65,41 +85,19 @@ const (
 	DefaultIdleAfter = 3 * time.Second
 )
 
-// Domain is one configured name→path mapping (§6.2).
-type Domain struct {
-	// Name is how the domain is addressed fleet-wide. Paths are agent-local and are never
-	// accepted from the API (§7.2, §13).
-	Name string
-
-	// Path is the local filesystem path.
-	Path string
-}
-
 // Options configures an [Inventory].
 type Options struct {
-	// Domains are the operator's explicit mappings. They go in as the discoverer's *static*
-	// domains, which is exactly what that parameter is for: reported once at construction and
-	// never retracted by scanning, so a configured domain stays visible while it is temporarily
-	// empty.
-	Domains []Domain
-
-	// SearchPaths are recursively scanned for unconfigured domains. A discovered domain can be a
-	// replication *source* but never a destination — that is the invariant that stops the API
-	// being a remote arbitrary-filesystem-write primitive (§7.2, §13), and it is enforced by
-	// [api.DomainInventory.Configured] travelling with every domain.
+	// Areas are the directories this node has designated as somewhere MXL domains live, each
+	// granting reading, writing or both (§10.6).
 	//
-	// A search path may sit above an output root; what it finds inside one is pruned. See [prune]
-	// for why, and for the one thing that costs.
-	SearchPaths []string
-
-	// OutputRoots are the directories replication may create domains under (§10.6). They are the
-	// *write* side, resolved by [Inventory.Output] from an assignment's root and domain names
-	// alone, and **a root is written, not read**: [prune] hides every root from discovery, so a
-	// search path may sit above one and nothing inside it is ever reported by a scan.
+	// `read` is where domains are discovered from; `write` is where replication may create them.
+	// Neither implies the other and both default false, so a node with no readable area offers no
+	// sources and one with no writable area accepts no destinations — one default, applied per
+	// direction: access to a node's filesystem is opt-in.
 	//
-	// No default. A node with none configured accepts no replication destinations, which is the
-	// right posture for an opt-in that grants filesystem write authority.
-	OutputRoots []Root
+	// **Areas may nest**, and the innermost containing one names a directory. Equal paths are
+	// refused; nothing else is, because nothing else is ambiguous (§10.6).
+	Areas []api.Area
 
 	// Interval is the sampling period. Defaults to [DefaultInterval].
 	Interval time.Duration
@@ -129,30 +127,34 @@ type Inventory struct {
 	log       *slog.Logger
 	now       func() time.Time
 
-	// static and byPath are fixed at construction: the configured mappings, and the reverse
-	// lookup a discovered domain never enters. byName is what resolves an assignment's domain
-	// *name* to a path, and it is a strict map lookup by design — an agent that fell back to
-	// treating an unmapped name as a path would hand the API the filesystem.
-	static []Domain
-	byName map[string]string
-	byPath map[string]string
-	search []string
-
-	// roots and rootPaths are the output side, and are fixed at construction for the same reason
-	// the input maps are: [Inventory.Output] is a pure function of configuration, and a resolver
-	// that could be widened at runtime would not be one (§10.6).
-	roots     []Root
-	rootPaths map[string]string
+	// areas and byArea are fixed at construction, and are what every name on this node is derived
+	// from: [Inventory.nameFor] for a directory's identity and [Inventory.Resolve] for a
+	// destination's path. A resolver that could be widened at runtime would not be a pure function
+	// of configuration (§10.6).
+	areas  []api.Area
+	byArea map[string]api.Area
 
 	mu      sync.Mutex
 	domains map[string]*domainState // keyed by path
 
-	// materialised is the output domains this node is currently observing because a session
-	// targets them, path → name. Unlike the maps above it changes at runtime, since an output
-	// domain lives exactly as long as a path targets it (§10.6). It is what gives a materialised
-	// domain its short name in [Inventory.AddDomain] — without it a domain this project created
-	// would be reported under its path, like a discovered one.
-	materialised map[string]string
+	// discovered and materialised are the two halves of the union (§10.6). A domain is in
+	// [Inventory.domains] if either holds it, and leaves only when both have let go.
+	//
+	// They are kept apart rather than refcounted because they are withdrawn by different parties
+	// on different schedules: discovery drops a directory the moment its last flow goes, while the
+	// reconciler holds one for exactly as long as a session targets it.
+	discovered   map[string]struct{}
+	materialised map[string]struct{}
+
+	// replicated is the set of flows this node's own target workers are writing, pushed in by the
+	// agent's reconcile (§6, §10.6). It is what [api.FlowInventory.Replicated] reports.
+	//
+	// **Pushed rather than pulled**, and derived from *running workers* rather than from the
+	// assignment set: §10.6's safety argument is that provenance and production go absent
+	// together, and that only holds if the flag tracks the worker. A provider func would avoid a
+	// write path into this state from the reconcile goroutine; a push avoids this package holding
+	// a reference back into the agent, which is the worse of the two couplings.
+	replicated map[FlowRef]struct{}
 
 	// watcher is set once [Run] starts and read by [Inventory.Materialise] from the reconcile
 	// goroutine, so it is guarded like everything else here.
@@ -160,9 +162,8 @@ type Inventory struct {
 }
 
 type domainState struct {
-	name       string
-	configured bool
-	flows      map[string]*flowState
+	name  api.Domain
+	flows map[string]*flowState
 }
 
 // flowState is one observed flow and everything needed to keep observing it.
@@ -203,10 +204,10 @@ func New(opts Options) (*Inventory, error) {
 		onChange:     opts.OnChange,
 		log:          opts.Logger,
 		now:          opts.Now,
-		byName:       map[string]string{},
-		byPath:       map[string]string{},
 		domains:      map[string]*domainState{},
-		materialised: map[string]string{},
+		discovered:   map[string]struct{}{},
+		materialised: map[string]struct{}{},
+		replicated:   map[FlowRef]struct{}{},
 	}
 	if inv.interval <= 0 {
 		inv.interval = DefaultInterval
@@ -224,132 +225,49 @@ func New(opts Options) (*Inventory, error) {
 		inv.onChange = func() {}
 	}
 
-	for _, domain := range opts.Domains {
-		// **The same name rule as an output domain's elements**, and it has to be: names are flat
-		// per node, so an input mapping and a rendered output domain live in one namespace
-		// (§10.6). An input name containing a separator could equal a hierarchical output
-		// domain's rendered form — `-m a/b=...` against `domain: a/b` — and the server's
-		// collision check compares those two as strings.
-		//
-		// A tightening on §16's promise that `-m name=/path` carries over byte-compatible: the
-		// *syntax* does, and a name legacy would have accepted but this refuses is now a startup
-		// error rather than a name that works until the day something collides with it.
-		if err := api.ValidDomainName(domain.Name); err != nil {
-			return nil, fmt.Errorf("inventory: domain name %q (path %q): %w", domain.Name, domain.Path, err)
-		}
-		if !filepath.IsAbs(domain.Path) {
-			return nil, fmt.Errorf("inventory: domain %q: path %q is not absolute", domain.Name, domain.Path)
-		}
-
-		path := filepath.Clean(domain.Path)
-		if existing, ok := inv.byName[domain.Name]; ok {
-			return nil, fmt.Errorf("inventory: domain %q is mapped twice, to %q and %q", domain.Name, existing, path)
-		}
-		if existing, ok := inv.byPath[path]; ok {
-			// Two names for one directory would make the reverse lookup ambiguous, and would
-			// let one flow appear twice in the fleet-wide inventory under two addresses.
-			return nil, fmt.Errorf("inventory: path %q is mapped twice, as %q and %q", path, existing, domain.Name)
-		}
-
-		inv.byName[domain.Name] = path
-		inv.byPath[path] = domain.Name
-		inv.static = append(inv.static, Domain{Name: domain.Name, Path: path})
-	}
-
-	for _, path := range opts.SearchPaths {
-		if !filepath.IsAbs(path) {
-			return nil, fmt.Errorf("inventory: search path %q is not absolute", path)
-		}
-		inv.search = append(inv.search, filepath.Clean(path))
-	}
-
-	// Last, because the overlap rule is checked against the input mappings and search paths above
-	// and needs them cleaned first.
-	roots, rootPaths, err := validateRoots(opts.OutputRoots, inv.static, inv.search)
+	areas, byArea, err := validateAreas(opts.Areas)
 	if err != nil {
 		return nil, err
 	}
-	inv.roots, inv.rootPaths = roots, rootPaths
+	inv.areas, inv.byArea = areas, byArea
 
 	return inv, nil
 }
 
-// Mappings returns the configured domains as they are advertised at registration (§10.2).
-//
-// **Configured mappings only.** Discovered domains are deliberately absent: registration is
-// durable desired state and changes only when the operator changes the node's configuration,
-// whereas discovery comes and goes with whatever a producer happens to have created. A
-// discovered domain reaches the server through the *inventory* snapshot instead, with
-// Configured false — which is where high-churn observations belong (§4), and which is all the
-// server needs, since a discovered domain is only ever a source.
-func (i *Inventory) Mappings() []api.DomainMapping {
-	out := make([]api.DomainMapping, 0, len(i.static))
-	for _, domain := range i.static {
-		out = append(out, api.DomainMapping{Name: domain.Name, Path: domain.Path, Configured: true})
+// readable returns the paths discovery scans: every area granting `read` (§10.6).
+func (i *Inventory) readable() []string {
+	var out []string
+	for _, area := range i.areas {
+		if area.Read {
+			out = append(out, area.Path)
+		}
 	}
-	slices.SortFunc(out, func(a, b api.DomainMapping) int { return cmpString(a.Name, b.Name) })
+	slices.Sort(out)
 	return out
 }
 
-// Input resolves an *input* domain name to a local path: somewhere this node reads from, and an
+// Lookup resolves an observed domain to its local path: somewhere this node reads from, and an
 // initiator's source (§10.6).
 //
-// It is a strict map lookup over the domains this agent knows — configured mappings, plus domains
-// found under a search path — and it never interprets its argument as a path, which is what stops
-// an assignment from naming an arbitrary directory on this host (§7.2, §13).
+// It is a strict map lookup over the domains this agent is currently observing, keyed on the
+// canonical `(area, elements)` identity, and it cannot be handed a path-shaped string at all —
+// which is what stops an assignment from naming an arbitrary directory on this host (§7.2, §13).
 //
-// The destination side is [Inventory.Output], and the asymmetry is the point: a source is by
+// The destination side is [Inventory.Resolve], and the asymmetry is the point: a source is by
 // definition something this agent *observes*, so it is resolved through what has been seen; a
 // destination is something a request *asks for*, so it is resolved from configuration alone.
-func (i *Inventory) Input(name string) (string, bool) {
-	if path, ok := i.byName[name]; ok {
-		return path, true
-	}
-
+func (i *Inventory) Lookup(domain api.Domain) (string, bool) {
 	i.mu.Lock()
 	defer i.mu.Unlock()
-	for path, domain := range i.domains {
-		if domain.name == name {
+	for path, observed := range i.domains {
+		if observed.name.Equal(domain) {
 			return path, true
 		}
 	}
 	return "", false
 }
 
-// Configured reports whether a domain name is an explicitly mapped one, and therefore usable as
-// a replication destination (§7.2).
-//
-// The server validates this too, and is the authority. Checking it again here is deliberate
-// duplication: it is the single most important invariant in the design, it costs one map lookup,
-// and an agent that trusted the server on it would be one compromised or buggy control plane
-// away from writing into any directory a search path can reach.
-//
-// **Superseded by [Inventory.Output], and removed once assignments carry a root** (§10.6, M10).
-// It is still the destination check the agent applies today, because an assignment has no root to
-// resolve against yet; when it has, a destination stops being an input mapping at all and this
-// goes away rather than being kept alongside.
-func (i *Inventory) Configured(name string) bool {
-	_, ok := i.byName[name]
-	return ok
-}
-
-// CreateDomains pre-creates the configured domain directories (§6.1).
-//
-// At startup rather than at assignment time: the worker does not create its domain directory
-// (WRS §5.1), and doing it here keeps it off the establishment path that §6.1 wants inside
-// 1–2 s. A directory that cannot be created is reported rather than left to fail later as a
-// target worker dying before its metrics socket exists.
-func (i *Inventory) CreateDomains() error {
-	var errs []error
-	for _, domain := range i.static {
-		if err := os.MkdirAll(domain.Path, 0o755); err != nil {
-			errs = append(errs, fmt.Errorf("create domain %q at %s: %w", domain.Name, domain.Path, err))
-		}
-	}
-	return errors.Join(errs...)
-}
-
-// Run observes until ctx ends, then releases every mapping.
+// Run observes until ctx ends, then closes every mapping.
 func (i *Inventory) Run(ctx context.Context) error {
 	var wg sync.WaitGroup
 
@@ -373,24 +291,21 @@ func (i *Inventory) Run(ctx context.Context) error {
 		watcher.AddDomain(path)
 	}
 
-	static := make([]string, 0, len(i.static))
-	for _, domain := range i.static {
-		static = append(static, domain.Path)
-	}
-
 	// Receiver order matters: this inventory learns of a domain before the watcher starts
 	// reporting the flows already in it, so a flow never arrives for a domain that is not there
 	// yet. On the way out the order reverses in effect — the domain is forgotten first and the
 	// watcher's removals land on nothing, which [Inventory.RemoveFlow] tolerates.
 	//
-	// Both go behind [prune] when this node has output roots, so that the order is preserved for
-	// the domains that are reported and neither receiver sees the ones that are not (§10.6).
-	mxl.NewDiscoverer(ctx, &wg, i.receivers(watcher), i.search, static)
+	// **Nothing is filtered.** *There used to be a `prune` receiver in front of these, hiding
+	// every output root from discovery.* Discovery now reports every domain in every readable
+	// area, including one this project materialised and one it is currently writing into (§10.6);
+	// the guard against replication feeding itself lives on the flow instead (§10.7).
+	//
+	// No static list: every domain this node has is one the discoverer finds under a readable
+	// area, or one the reconciler materialised and drives in by hand (§6, §10.6).
+	mxl.NewDiscoverer(ctx, &wg, []mxl.DomainReceiver{i, watcher}, i.readable(), nil)
 
-	i.log.Info("observing domains",
-		"configured", len(i.static), "search_paths", len(i.search),
-		"interval", i.interval, "idle_after", i.idleAfter)
-	i.logExclusions()
+	i.logAreas()
 
 	ticker := time.NewTicker(i.interval)
 	defer ticker.Stop()
@@ -409,40 +324,108 @@ func (i *Inventory) Run(ctx context.Context) error {
 	}
 }
 
-// AddDomain implements [mxl.DomainReceiver].
+// logAreas says what this node's areas are, with their grants and their nesting, once at startup.
+//
+// Not decoration: the naming rule is longest-prefix over areas that may nest (§10.6), so an
+// operator who cannot see the table cannot predict what a domain will be called. §10.6 asks for
+// this line explicitly, in place of the exclusion list pruning used to print.
+func (i *Inventory) logAreas() {
+	for _, area := range i.areas {
+		grants := make([]string, 0, 2)
+		if area.Read {
+			grants = append(grants, "read")
+		}
+		if area.Write {
+			grants = append(grants, "write")
+		}
+
+		var inside string
+		for _, other := range i.areas {
+			// Only a proper ancestor matters, and only the innermost one: equal paths are refused
+			// at startup, so whichever area contains this one most tightly is the one whose names
+			// this area takes over.
+			if other.Name == area.Name || !within(other.Path, area.Path) || other.Path == area.Path {
+				continue
+			}
+			if inside == "" || len(i.byArea[inside].Path) < len(other.Path) {
+				inside = other.Name
+			}
+		}
+
+		i.log.Info("area",
+			"name", area.Name, "path", area.Path,
+			"grants", strings.Join(grants, "+"), "inside", inside)
+	}
+
+	i.log.Info("observing domains",
+		"areas", len(i.areas), "readable", len(i.readable()),
+		"interval", i.interval, "idle_after", i.idleAfter)
+}
+
+// AddDomain implements [mxl.DomainReceiver]: the **discovery** half of the union (§10.6).
 func (i *Inventory) AddDomain(path string) {
 	path = filepath.Clean(path)
 
 	i.mu.Lock()
-	name, configured := i.byPath[path]
-	if !configured {
-		// An output domain this agent materialised: not a search-path find, and named by the
-		// request that asked for it rather than by its path (§10.6).
-		name, configured = i.materialised[path]
-	}
-	if !configured {
-		// A discovered domain is named by its path. That is not a path the API can ever use —
-		// resolution is a map lookup (see [Inventory.Input]) — it is simply the one string that is
-		// certainly unique on this node and stable across restarts, and it is what an operator
-		// looking at `GET /v1/flows` needs to see in order to find the thing.
-		name = path
-	}
-	if _, exists := i.domains[path]; exists {
-		i.mu.Unlock()
-		return
-	}
-	i.domains[path] = &domainState{name: name, configured: configured, flows: map[string]*flowState{}}
+	i.discovered[path] = struct{}{}
 	i.mu.Unlock()
 
-	i.log.Info("domain appeared", "domain", name, "path", path, "configured", configured)
-	i.onChange()
+	i.add(path)
 }
 
-// RemoveDomain implements [mxl.DomainReceiver].
+// RemoveDomain implements [mxl.DomainReceiver]: the discovery half again.
+//
+// **It must not evict a materialised domain**, and that is the one correctness-critical line in
+// the un-pruning (§10.6). The discoverer only reports directories that currently contain a flow,
+// so an unconditional removal would forget a domain the instant its last flow was released — while
+// a live session still targeted it, and with nothing to bring it back until a producer put a flow
+// there. `materialised` is no longer "how a domain gets its short name"; it is purely membership
+// this agent holds independently of scanning.
 func (i *Inventory) RemoveDomain(path string) {
 	path = filepath.Clean(path)
 
 	i.mu.Lock()
+	delete(i.discovered, path)
+	i.mu.Unlock()
+
+	i.remove(path)
+}
+
+// add brings a directory into inventory under the name [Inventory.nameFor] gives it. Idempotent.
+func (i *Inventory) add(path string) {
+	name, named := i.nameFor(path)
+	if !named {
+		// Outside every area, or an area's own directory rather than a domain inside one. Reported
+		// at debug because the discoverer never produces one — it scans the areas themselves — so
+		// this is only reachable through a caller that resolved a path some other way.
+		i.log.Debug("ignoring a directory that is in no area", "path", path)
+		return
+	}
+
+	i.mu.Lock()
+	if _, exists := i.domains[path]; exists {
+		i.mu.Unlock()
+		return
+	}
+	i.domains[path] = &domainState{name: name, flows: map[string]*flowState{}}
+	i.mu.Unlock()
+
+	i.log.Info("domain appeared", "domain", name.String(), "path", path)
+	i.onChange()
+}
+
+// remove drops a directory from inventory, unless the other half of the union still holds it. It
+// reports whether it actually removed anything.
+func (i *Inventory) remove(path string) bool {
+	i.mu.Lock()
+	if _, held := i.discovered[path]; held {
+		i.mu.Unlock()
+		return false
+	}
+	if _, held := i.materialised[path]; held {
+		i.mu.Unlock()
+		return false
+	}
 	domain, ok := i.domains[path]
 	if ok {
 		for _, flow := range domain.flows {
@@ -453,10 +436,11 @@ func (i *Inventory) RemoveDomain(path string) {
 	i.mu.Unlock()
 
 	if !ok {
-		return
+		return false
 	}
-	i.log.Info("domain went away", "domain", domain.name, "path", path)
+	i.log.Info("domain went away", "domain", domain.name.String(), "path", path)
 	i.onChange()
+	return true
 }
 
 // AddFlow implements [mxl.FlowReceiver]. The domain is a path, as mxl-utils reports it.
@@ -490,7 +474,7 @@ func (i *Inventory) AddFlow(domainPath, id string) {
 	name, readable := domain.name, flow.def != nil
 	i.mu.Unlock()
 
-	i.log.Debug("flow appeared", "domain", name, "flow", id, "readable", readable)
+	i.log.Debug("flow appeared", "domain", name.String(), "flow", id, "readable", readable)
 	i.onChange()
 }
 
@@ -514,7 +498,7 @@ func (i *Inventory) RemoveFlow(domainPath, id string) {
 	if !ok {
 		return
 	}
-	i.log.Debug("flow went away", "domain", domain.name, "flow", id)
+	i.log.Debug("flow went away", "domain", domain.name.String(), "flow", id)
 	i.onChange()
 }
 
@@ -538,23 +522,56 @@ func (i *Inventory) Snapshot() []api.DomainInventory {
 				// flow anyone can replicate. It appears once it is.
 				continue
 			}
+			_, replicated := i.replicated[FlowRef{DomainPath: flow.path, FlowID: flow.id}]
 			flows = append(flows, api.FlowInventory{
 				ID:         flow.id,
 				Definition: flow.def,
 				GroupHint:  flow.hint,
 				Producing:  flow.written.active,
+				Replicated: replicated,
 			})
 		}
 		slices.SortFunc(flows, func(a, b api.FlowInventory) int { return cmpString(a.ID, b.ID) })
 
-		out = append(out, api.DomainInventory{
-			Name:       domain.name,
-			Configured: domain.configured,
-			Flows:      flows,
-		})
+		out = append(out, api.DomainInventory{Domain: domain.name, Flows: flows})
 	}
-	slices.SortFunc(out, func(a, b api.DomainInventory) int { return cmpString(a.Name, b.Name) })
+	slices.SortFunc(out, func(a, b api.DomainInventory) int { return cmpString(a.Domain.String(), b.Domain.String()) })
 	return out
+}
+
+// FlowRef addresses one flow by this agent's own coordinates: the resolved domain directory and
+// the flow id. It is what [Inventory.SetReplicated] is keyed on, because that is the pair a
+// [worker.Spec] carries.
+type FlowRef struct {
+	DomainPath string
+	FlowID     string
+}
+
+// SetReplicated records which flows this node's own target workers are writing (§6, §10.6).
+//
+// Called from the agent's reconcile, which is the only thing that starts and stops workers, so the
+// set is exactly the running ones. Replacing it wholesale rather than adding and removing is the
+// same level-triggered discipline as everything else here: there is no delta to get out of step.
+func (i *Inventory) SetReplicated(set map[FlowRef]struct{}) {
+	i.mu.Lock()
+	changed := len(set) != len(i.replicated)
+	if !changed {
+		for ref := range set {
+			if _, held := i.replicated[ref]; !held {
+				changed = true
+				break
+			}
+		}
+	}
+	i.replicated = set
+	i.mu.Unlock()
+
+	// Only on a genuine transition. Inventory is compared before it is sent (§6), so a spurious
+	// wake costs a comparison rather than a store write — but it also wakes the report loop, and
+	// this is called on every reconcile pass.
+	if changed {
+		i.onChange()
+	}
 }
 
 // Liveness is what one flow looks like to the agent's metrics (§12).
@@ -627,7 +644,7 @@ func (i *Inventory) sampleFlow(domain *domainState, flow *flowState, now time.Ti
 	if flow.flow == nil || !flow.flow.IsValid() {
 		if flow.flow != nil {
 			i.log.Info("flow was replaced under the same id; reopening",
-				"domain", domain.name, "flow", flow.id)
+				"domain", domain.name.String(), "flow", flow.id)
 		}
 		flow.close()
 		i.refresh(flow)

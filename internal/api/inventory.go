@@ -20,20 +20,21 @@ type InventorySnapshot struct {
 
 // DomainInventory is one domain and the flows currently in it.
 type DomainInventory struct {
-	// Name is the fleet-wide domain name. The local path is deliberately absent: it is
-	// agent-local config, it is reported once at registration for diagnostics, and it has no
-	// business in a per-heartbeat snapshot.
-	Name string `json:"name"`
-
-	// Configured mirrors [DomainMapping.Configured], and is descriptive for the same reason: it
-	// says where this domain came from — an explicit input mapping, or a search path — and
-	// nothing keys authority off it.
+	// Domain is the fleet-wide identity: `(area, elements)`, assigned by the innermost containing
+	// area (§10.6). The local path is deliberately absent — it is agent-local, it is reported once
+	// at registration for diagnostics, and it has no business in a per-heartbeat snapshot.
 	//
-	// A materialised output domain reports true. It is not a search-path find, it exists because
-	// a request asked for it, and it appears here at all because the agent adds it to its own
-	// watch set when it accepts the target assignment — which is what makes a chain A→B→C work,
-	// B's domain becoming visible as a source for the second hop (§10.6).
-	Configured bool `json:"configured"`
+	// **Structured rather than rendered**, so that nothing on the server has to parse a domain
+	// string back into its parts: the agent computes the identity once, from its own area table,
+	// and the structure travels. `Domain.String()` is what a metric label, a path identity and an
+	// error message carry (§10.6).
+	Domain Domain `json:"domain"`
+
+	// *There used to be a `Configured` flag here, mirroring the one on a registration's domain
+	// mapping.* It is **gone rather than merely descriptive** (§6): it was the security bit before
+	// an area carried its own grants, separating an explicitly mapped domain from one a scan
+	// found — and with mappings removed there is nothing left for it to distinguish. A domain is a
+	// place, and every one this node observes is reported the same way (§10.6).
 
 	Flows []FlowInventory `json:"flows"`
 }
@@ -59,6 +60,28 @@ type FlowInventory struct {
 	// or it is malformed. This is what a group-hint selector matches against (§9.1) — parsed
 	// agent-side, where mxl-utils already does it, so the server never has to know the tag URN.
 	GroupHint *GroupHint `json:"group_hint,omitempty"`
+
+	// Replicated reports that **this node's own target worker is writing this flow** — that this
+	// project put it here (§6, §10.6).
+	//
+	// It is the signal the self-amplification guard runs on, and it is what keeps a label selector
+	// from matching this project's own output (§10.7). *This supersedes a directory-granular
+	// proxy for the same thing — "under an output root" — which was blunt: a domain holding one
+	// replicated flow beside nine local ones was entirely invisible as a source.*
+	//
+	// The agent cannot be wrong about it: it is the process that started the worker. It is derived
+	// from **running workers rather than from assignments**, which is what makes §10.6's safety
+	// argument hold — provenance and production go absent together, so the window in which a
+	// replicated flow reports false is also a window in which it is not advancing, and §11.1's
+	// admission rule starts nothing over it.
+	//
+	// Low-churn by construction — it changes when a target starts or stops — so it costs §6's
+	// compare-before-send discipline nothing.
+	//
+	// Reported to operators as well as consumed by the matcher: it reaches `GET /v1/flows` and
+	// `describe domain`, because a selector that silently skips a flow is otherwise undiagnosable
+	// (§9.1).
+	Replicated bool `json:"replicated,omitempty"`
 
 	// Producing reports whether the flow is being written to, and it is deliberately a coarse,
 	// hysteretic boolean rather than a head index (§11.1).

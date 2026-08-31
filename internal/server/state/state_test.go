@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -42,14 +43,21 @@ func TestLoadRoutesEveryLayer(t *testing.T) {
 	lease, err := s.GrantLease(ctx, time.Minute)
 	require.NoError(t, err)
 
-	put(t, s, store.NodeKey("edge-01"), NodeRecord{Node: "edge-01", Domains: []api.DomainMapping{{Name: "ingest", Configured: true}}})
+	put(t, s, store.NodeKey("edge-01"), NodeRecord{Node: "edge-01"})
 	// A request always carries a valid selector — an invalid one refuses to marshal, which is
 	// the tagged union defending itself on the way *out* as well as in (§9.1).
-	put(t, s, store.RequestKey("cam1"), RequestRecord{ID: "cam1", Spec: api.RequestSpec{
-		Name:         "cam1",
-		Source:       api.Source{Node: "studio-a", Domain: "cameras", Select: api.Selector{Flow: "flow-1"}},
-		Destinations: []api.Destination{{Node: "edge-01", Domain: []string{"ingest"}}},
-	}})
+	put(t, s, store.NamespaceKey("nab"), NamespaceRecord{
+		Name: "nab", Spec: api.Namespace{Name: "nab", Paths: api.PathsExclusive},
+	})
+	put(t, s, store.RequestKey("nab", "cam1"), RequestRecord{
+		ID: api.RequestID{Namespace: "nab", Name: "cam1"},
+		Spec: api.RequestSpec{
+			Namespace:    "nab",
+			Name:         "cam1",
+			Source:       api.Source{Node: "studio-a", Domain: named("media/cameras"), Select: api.Selector{Flow: "flow-1"}},
+			Destinations: []api.Destination{{Node: "edge-01", Domain: api.Domain{Area: "fast", Elements: []string{"ingest"}}}},
+		},
+	})
 	put(t, s, store.LeaseKey("edge-01"), LeaseRecord{Node: "edge-01", Instance: "i-1"}, store.WithLease(lease))
 	put(t, s, store.InventoryKey("edge-01"), api.InventorySnapshot{Node: "edge-01"}, store.WithLease(lease))
 	put(t, s, store.StatusKey("edge-01"), api.StatusSnapshot{Node: "edge-01"}, store.WithLease(lease))
@@ -68,7 +76,8 @@ func TestLoadRoutesEveryLayer(t *testing.T) {
 	assert.Positive(t, fleet.Revision)
 
 	require.Contains(t, fleet.Nodes, "edge-01")
-	require.Contains(t, fleet.Requests, "cam1")
+	require.Contains(t, fleet.Namespaces, "nab")
+	require.Contains(t, fleet.Requests, api.RequestID{Namespace: "nab", Name: "cam1"})
 	require.Contains(t, fleet.Leases, "edge-01")
 	require.Contains(t, fleet.Inventory, "edge-01")
 	require.Contains(t, fleet.Status, "edge-01")
@@ -84,6 +93,15 @@ func TestLoadRoutesEveryLayer(t *testing.T) {
 
 	assert.True(t, fleet.Live("edge-01"))
 	assert.False(t, fleet.Live("edge-02"))
+
+	// A namespace with no record answers with defaults rather than refusing: auto-create is a
+	// real write, so the window between a request landing and its namespace record existing is a
+	// real one and a reader must not report the request as broken during it (§9.3).
+	assert.True(t, fleet.Namespace("nab").Paths.Exclusive())
+	assert.False(t, fleet.Namespace("never-declared").Paths.Exclusive())
+	assert.Equal(t, api.PathsShared, fleet.Namespace("never-declared").Paths)
+
+	assert.Equal(t, map[string]int{"nab": 1}, fleet.NamespacesInUse())
 }
 
 // One unreadable key must not wedge the reconciler for the whole fleet.
@@ -137,8 +155,8 @@ func TestFleetLookups(t *testing.T) {
 			"studio-a": {Found: true, Value: api.InventorySnapshot{
 				Node: "studio-a",
 				Domains: []api.DomainInventory{{
-					Name: "cameras", Configured: true,
-					Flows: []api.FlowInventory{{ID: "flow-1", Producing: true}},
+					Domain: api.Domain{Area: "media", Elements: []string{"cameras"}},
+					Flows:  []api.FlowInventory{{ID: "flow-1", Producing: true}},
 				}},
 			}},
 		},
@@ -153,18 +171,27 @@ func TestFleetLookups(t *testing.T) {
 		},
 	}
 
-	flow, ok := fleet.Flow("studio-a", "cameras", "flow-1")
+	flow, ok := fleet.Flow("studio-a", "media/cameras", "flow-1")
 	require.True(t, ok)
 	assert.True(t, flow.Producing)
 
-	_, ok = fleet.Flow("studio-a", "cameras", "flow-2")
+	_, ok = fleet.Flow("studio-a", "media/cameras", "flow-2")
+	assert.False(t, ok)
+
+	// The structured identity comes back from the agent's own report, never from splitting the
+	// rendered string: that is what keeps "a domain string is parsed at exactly one boundary"
+	// true (§10.6).
+	domain, ok := fleet.Domain("studio-a", "media/cameras")
+	require.True(t, ok)
+	assert.Equal(t, api.Domain{Area: "media", Elements: []string{"cameras"}}, domain)
+	_, ok = fleet.Domain("studio-a", "media/other")
 	assert.False(t, ok)
 
 	// A node reporting no inventory is "no observation", never "the flow is gone" — the caller
 	// must be able to tell those apart, so an absent node reports false rather than empty.
-	_, ok = fleet.Flow("edge-99", "cameras", "flow-1")
+	_, ok = fleet.Flow("edge-99", "media/cameras", "flow-1")
 	assert.False(t, ok)
-	assert.Empty(t, fleet.Flows("edge-99", "cameras"))
+	assert.Empty(t, fleet.Flows("edge-99", "media/cameras"))
 
 	// The same session has one status per role, and asking for the wrong role must not return
 	// the other end's epoch.
@@ -183,7 +210,7 @@ func TestFleetLookups(t *testing.T) {
 func identity() PathIdentity {
 	return PathIdentity{
 		Source:      api.FlowAddress{Node: "studio-a", Domain: "cameras", Flow: "flow-1"},
-		Destination: api.Destination{Node: "edge-01", Domain: []string{"ingest"}},
+		Destination: api.Destination{Node: "edge-01", Domain: api.Domain{Area: "fast", Elements: []string{"ingest"}}},
 	}
 }
 
@@ -218,7 +245,12 @@ func TestIdentityFieldsAllMatter(t *testing.T) {
 		{"source domain", func(p *PathIdentity) { p.Source.Domain = "other" }},
 		{"flow", func(p *PathIdentity) { p.Source.Flow = "flow-2" }},
 		{"destination node", func(p *PathIdentity) { p.Destination.Node = "edge-02" }},
-		{"destination domain", func(p *PathIdentity) { p.Destination.Domain = []string{"other"} }},
+		{"destination domain", func(p *PathIdentity) { p.Destination.Domain.Elements = []string{"other"} }},
+		// **The area is a term of the identity**, because it is the first segment of the domain's
+		// name (§5.4, §10.6). Moving a domain to another area is an operator choosing a different
+		// destination, which is a different path by any reading; repointing an area's *directory*
+		// while keeping its name changes nothing here, which is the property that buy pays for.
+		{"destination area", func(p *PathIdentity) { p.Destination.Domain.Area = "bulk" }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			changed := base
@@ -297,7 +329,7 @@ func TestPutJSONSkipsUnchangedWrites(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, fleet.Revision, after.Revision)
 
-	record.Domains = []api.DomainMapping{{Name: "ingest", Configured: true}}
+	record.Capabilities.SchedPrio = true
 	_, wrote, err = PutJSON(ctx, s, key, record, after.Nodes["edge-01"].Prior(), WriteOptions{})
 	require.NoError(t, err)
 	assert.True(t, wrote)
@@ -368,4 +400,11 @@ func TestPutJSONCASFailsAgainstAStaleRead(t *testing.T) {
 	require.NoError(t, err)
 	_, _, err = PutJSON(ctx, s, store.AssignmentsKey("edge-02"), api.AssignmentSet{Node: "edge-02", Revision: 7}, Prior{}, WriteOptions{CAS: true})
 	require.ErrorIs(t, err, store.ErrCompareFailed)
+}
+
+// named builds a `name` domain selector from the `<area>/<elements>` spelling, splitting it the
+// way a manifest does. Tests are allowed the convenience the rest of the tree is not (§10.6).
+func named(domain string) api.DomainSelector {
+	segments := strings.Split(domain, "/")
+	return api.SelectDomain(api.Domain{Area: segments[0], Elements: segments[1:]})
 }

@@ -43,13 +43,22 @@ func (s *Server) routes() http.Handler {
 	agent.HandleFunc("POST "+api.AgentPrefix+"/{node}/status", s.handleStatus)
 	agent.HandleFunc("GET "+api.AgentPrefix+"/{node}/assignments", s.handleAssignments)
 
+	// Requests live under their namespace, because `(namespace, name)` is a request's ID (§9.3).
+	// `GET /v1/requests` stays as the fleet-wide list, narrowable with `?namespace=`: a list has
+	// to be readable without already knowing which partitions exist.
 	user := http.NewServeMux()
-	user.HandleFunc("POST "+api.PathRequests, s.handleCreateRequest)
+	user.HandleFunc("POST "+api.PathNamespaces, s.handleCreateNamespace)
+	user.HandleFunc("GET "+api.PathNamespaces, s.handleListNamespaces)
+	user.HandleFunc("GET "+api.PathNamespaces+"/{ns}", s.handleGetNamespace)
+	user.HandleFunc("DELETE "+api.PathNamespaces+"/{ns}", s.handleDeleteNamespace)
+	user.HandleFunc("POST "+api.PathNamespaces+"/{ns}/requests", s.handleCreateRequest)
+	user.HandleFunc("GET "+api.PathNamespaces+"/{ns}/requests", s.handleListNamespaceRequests)
+	user.HandleFunc("GET "+api.PathNamespaces+"/{ns}/requests/{name}", s.handleGetRequest)
+	user.HandleFunc("DELETE "+api.PathNamespaces+"/{ns}/requests/{name}", s.handleDeleteRequest)
 	user.HandleFunc("GET "+api.PathRequests, s.handleListRequests)
-	user.HandleFunc("GET "+api.PathRequests+"/{id}", s.handleGetRequest)
-	user.HandleFunc("DELETE "+api.PathRequests+"/{id}", s.handleDeleteRequest)
 	user.HandleFunc("GET "+api.PathNodes, s.handleListNodes)
 	user.HandleFunc("GET "+api.PathNodes+"/{node}/domains", s.handleNodeDomains)
+	user.HandleFunc("POST "+api.PathNodes+"/{node}/domains", s.handleLabelDomain)
 	user.HandleFunc("GET "+api.PathFlows, s.handleFlows)
 	user.HandleFunc("GET "+api.PathPaths, s.handlePaths)
 

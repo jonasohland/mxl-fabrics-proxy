@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -47,8 +48,8 @@ func (p *pair) replicate(name string) api.Request {
 
 	return p.request(api.RequestSpec{
 		Name:         name,
-		Source:       api.Source{Node: "studio-a", Domain: "cameras", Select: api.Selector{Flow: p.flow.ID()}},
-		Destinations: []api.Destination{{Node: "edge-01", Domain: []string{"ingest"}}},
+		Source:       api.Source{Node: "studio-a", Domain: p.src.source("cameras"), Select: api.Selector{Flow: p.flow.ID()}},
+		Destinations: []api.Destination{{Node: "edge-01", Domain: api.Domain{Area: "fast", Elements: []string{"ingest"}}}},
 	})
 }
 
@@ -97,7 +98,7 @@ func TestFullPathFromDiscoveryToRunningSession(t *testing.T) {
 	// with the definition the producer wrote and the liveness the agent derived.
 	p.eventually("the source flow to reach the fleet inventory", func() bool {
 		for _, flow := range p.flows().Flows {
-			if flow.ID == p.flow.ID() && flow.Node == "studio-a" && flow.Domain == "cameras" {
+			if flow.ID == p.flow.ID() && flow.Node == "studio-a" && flow.Domain == p.src.sourceName("cameras") {
 				return flow.Producing
 			}
 		}
@@ -112,10 +113,10 @@ func TestFullPathFromDiscoveryToRunningSession(t *testing.T) {
 		return len(p.paths().Paths) == 1
 	})
 	path := p.onlyPath()
-	assert.Equal(t, api.FlowAddress{Node: "studio-a", Domain: "cameras", Flow: p.flow.ID()}, path.Source)
+	assert.Equal(t, api.FlowAddress{Node: "studio-a", Domain: p.src.sourceName("cameras"), Flow: p.flow.ID()}, path.Source)
 	// The *resolved* root, not the one the request spelled: it names none and edge-01 advertises
 	// exactly one (§10.6).
-	assert.Equal(t, api.Destination{Node: "edge-01", Domain: []string{"ingest"}, Root: "fast"}, path.Destination)
+	assert.Equal(t, api.Destination{Node: "edge-01", Domain: api.Domain{Area: "fast", Elements: []string{"ingest"}}}, path.Destination)
 	assert.Equal(t, []string{request.ID}, path.Requests)
 
 	sessionID := p.established()
@@ -164,7 +165,7 @@ func TestFullPathFromDiscoveryToRunningSession(t *testing.T) {
 
 	// Cancelling the intent tears the session down. A request is durable user intent and is
 	// never cancelled by the system (§11); this is the only thing that ends it.
-	p.cancel(request.ID)
+	p.cancel(request.RequestID())
 	p.eventually("both workers to be withdrawn", func() bool {
 		return p.dst.worker(sessionID, api.RoleTarget) == nil &&
 			p.src.worker(sessionID, api.RoleInitiator) == nil
@@ -508,15 +509,15 @@ func TestAGroupHintRequestFollowsTheFlowsThatMatchIt(t *testing.T) {
 
 	request := f.request(api.RequestSpec{
 		Name: "camera-1",
-		Source: api.Source{Node: "studio-a", Domain: "cameras", Select: api.Selector{
+		Source: api.Source{Node: "studio-a", Domain: src.source("cameras"), Select: api.Selector{
 			GroupHint: &api.GroupHintSelector{Name: "Studio A:Camera 1"},
 		}},
-		Destinations: []api.Destination{{Node: "edge-01", Domain: []string{"ingest"}}},
+		Destinations: []api.Destination{{Node: "edge-01", Domain: api.Domain{Area: "fast", Elements: []string{"ingest"}}}},
 	})
 
 	// Matching nothing is WAITING, and costs nothing.
 	f.eventually("the request to be waiting on its selector", func() bool {
-		resp := f.do(http.MethodGet, api.RequestPath(request.ID), nil)
+		resp := f.do(http.MethodGet, api.RequestPath(request.RequestID()), nil)
 		if resp.status != http.StatusOK {
 			return false
 		}
@@ -557,7 +558,7 @@ func TestAGroupHintRequestFollowsTheFlowsThatMatchIt(t *testing.T) {
 
 	// The request is still there. Failure is made observable; intent is not cancelled by it
 	// (§11).
-	resp := f.do(http.MethodGet, api.RequestPath(request.ID), nil)
+	resp := f.do(http.MethodGet, api.RequestPath(request.RequestID()), nil)
 	require.Equal(t, http.StatusOK, resp.status)
 }
 
@@ -591,8 +592,8 @@ func TestThePathStateFollowsTheFlows(t *testing.T) {
 	def := videoFlowDef("Studio A:Camera 1", "video")
 	f.request(api.RequestSpec{
 		Name:         "cam1",
-		Source:       api.Source{Node: "studio-a", Domain: "cameras", Select: api.Selector{Flow: def.ID}},
-		Destinations: []api.Destination{{Node: "edge-01", Domain: []string{"ingest"}}},
+		Source:       api.Source{Node: "studio-a", Domain: src.source("cameras"), Select: api.Selector{Flow: def.ID}},
+		Destinations: []api.Destination{{Node: "edge-01", Domain: api.Domain{Area: "fast", Elements: []string{"ingest"}}}},
 	})
 
 	// WAITING: the flow does not exist yet.
@@ -694,8 +695,8 @@ func TestAnOutputDomainIsRefcountedAcrossRequests(t *testing.T) {
 	replicate := func(name, flowID string) api.Request {
 		return f.request(api.RequestSpec{
 			Name:         name,
-			Source:       api.Source{Node: "studio-a", Domain: "cameras", Select: api.Selector{Flow: flowID}},
-			Destinations: []api.Destination{{Node: "edge-01", Domain: []string{"ingest"}}},
+			Source:       api.Source{Node: "studio-a", Domain: src.source("cameras"), Select: api.Selector{Flow: flowID}},
+			Destinations: []api.Destination{{Node: "edge-01", Domain: api.Domain{Area: "fast", Elements: []string{"ingest"}}}},
 		})
 	}
 	one := replicate("cam1", first.ID())
@@ -720,7 +721,7 @@ func TestAnOutputDomainIsRefcountedAcrossRequests(t *testing.T) {
 
 	observed := func() bool {
 		for _, flow := range f.flows().Flows {
-			if flow.ID == delivered.ID() && flow.Node == "edge-01" && flow.Domain == "ingest" {
+			if flow.ID == delivered.ID() && flow.Node == "edge-01" && flow.Domain == "fast/ingest" {
 				return true
 			}
 		}
@@ -729,14 +730,14 @@ func TestAnOutputDomainIsRefcountedAcrossRequests(t *testing.T) {
 	f.eventually("the destination domain to be observed", observed)
 
 	// The first cancellation changes nothing: the other request still names the domain.
-	f.cancel(one.ID)
+	f.cancel(one.RequestID())
 	f.eventually("one path to remain", func() bool { return len(f.paths().Paths) == 1 })
 	assert.True(t, observed(), "a domain another path still targets must stay observed")
 
 	// The last one releases it. The directory stays — the SDK removes a flow directory when its
 	// writer is released, so what is left is empty and invisible to discovery — but this node
 	// stops observing it, so it leaves the fleet view.
-	f.cancel(two.ID)
+	f.cancel(two.RequestID())
 	f.eventually("the domain to be released once nothing targets it", func() bool { return !observed() })
 	assert.DirExists(t, dst.path("ingest"), "releasing stops observation; it does not delete media directories")
 }
@@ -756,8 +757,8 @@ func TestAChainUsesAMaterialisedDomainAsItsSource(t *testing.T) {
 
 	f.request(api.RequestSpec{
 		Name:         "a-to-b",
-		Source:       api.Source{Node: "studio-a", Domain: "cameras", Select: api.Selector{Flow: flow.ID()}},
-		Destinations: []api.Destination{{Node: "edge-01", Domain: []string{"mid"}}},
+		Source:       api.Source{Node: "studio-a", Domain: a.source("cameras"), Select: api.Selector{Flow: flow.ID()}},
+		Destinations: []api.Destination{{Node: "edge-01", Domain: api.Domain{Area: "fast", Elements: []string{"mid"}}}},
 	})
 	f.eventually("the first hop to establish", func() bool {
 		paths := f.paths().Paths
@@ -775,7 +776,7 @@ func TestAChainUsesAMaterialisedDomainAsItsSource(t *testing.T) {
 
 	f.eventually("the materialised domain to be a visible source", func() bool {
 		for _, entry := range f.flows().Flows {
-			if entry.ID == middle.ID() && entry.Node == "edge-01" && entry.Domain == "mid" {
+			if entry.ID == middle.ID() && entry.Node == "edge-01" && entry.Domain == "fast/mid" {
 				return entry.Producing
 			}
 		}
@@ -784,8 +785,8 @@ func TestAChainUsesAMaterialisedDomainAsItsSource(t *testing.T) {
 
 	f.request(api.RequestSpec{
 		Name:         "b-to-c",
-		Source:       api.Source{Node: "edge-01", Domain: "mid", Select: api.Selector{Flow: middle.ID()}},
-		Destinations: []api.Destination{{Node: "edge-02", Domain: []string{"ingest"}}},
+		Source:       api.Source{Node: "edge-01", Domain: named("fast/mid"), Select: api.Selector{Flow: middle.ID()}},
+		Destinations: []api.Destination{{Node: "edge-02", Domain: api.Domain{Area: "fast", Elements: []string{"ingest"}}}},
 	})
 
 	f.eventually("the second hop to establish from the materialised domain", func() bool {
@@ -794,7 +795,7 @@ func TestAChainUsesAMaterialisedDomainAsItsSource(t *testing.T) {
 			return false
 		}
 		for _, path := range paths {
-			if path.Source.Node == "edge-01" && path.Source.Domain == "mid" {
+			if path.Source.Node == "edge-01" && path.Source.Domain == "fast/mid" {
 				return path.Session != nil && path.Session.Epoch != ""
 			}
 		}
@@ -889,54 +890,71 @@ func TestMatchedSettingsReachBothWorkersIdentically(t *testing.T) {
 // can have a worker create a flow directory anywhere a search path reaches, on every node in the
 // fleet.
 //
-// The other half is that a discovered domain is still a perfectly good *source*, so the check is
-// not "discovered domains are ignored".
-func TestADiscoveredDomainIsASourceAndNeverADestination(t *testing.T) {
+// The other half is that a domain some *other* actor created inside a readable area is a perfectly
+// good source, so the check is not "discovered domains are ignored".
+func TestADomainInAReadOnlyAreaIsASourceAndNeverADestination(t *testing.T) {
 	f := newFleet(t, fleetOptions{})
 
-	root := searchRoot(t)
-	src := f.addNode("studio-a", nodeOptions{domains: []string{"cameras"}, searchPaths: []string{root}})
-	f.addNode("edge-01", nodeOptions{searchPaths: []string{root}})
+	area := searchRoot(t)
+	src := f.addNode("studio-a", nodeOptions{
+		domains:    []string{"cameras"},
+		extraAreas: []api.Area{{Name: "ro", Path: area, Read: true}},
+	})
+	f.addNode("edge-01", nodeOptions{})
 
-	// A producer creates a domain nobody configured. It is named by its path, which is the one
-	// string certain to be unique on the node — and not a path the API can use, because
-	// resolution is a lookup in the agent's own mapping table.
-	found := filepath.Join(root, "adhoc")
+	// A producer creates a domain nobody asked for, inside an area that grants only reading. It
+	// has a name like any other — `ro/adhoc`, from the innermost containing area (§10.6).
+	found := filepath.Join(area, "adhoc")
 	flow := createFlowAt(t, found, videoFlowDef("Ad Hoc:Camera", "video"))
 	flow.produce()
 
-	f.eventually("the discovered domain to be reported as unconfigured", func() bool {
+	f.eventually("the domain to be reported under its area's name", func() bool {
 		for _, entry := range f.flows().Flows {
-			if entry.ID == flow.ID() && entry.Node == "studio-a" && entry.Domain == found {
+			if entry.ID == flow.ID() && entry.Node == "studio-a" && entry.Domain == "ro/adhoc" {
 				return entry.Producing
 			}
 		}
 		return false
 	})
 
-	// As a destination it is refused. A discovered domain is *named by its path*, and a path is
-	// not a domain name at all, so it never reaches the question of whether that domain exists on
-	// the destination node — it is refused structurally (§10.6). Stricter than the check this
-	// replaced, and refused at the API boundary rather than stored as INVALID, which is the
-	// better place for it: nothing is persisted and no reconcile ever sees it.
-	refused := f.do(http.MethodPost, api.PathRequests, api.RequestSpec{
-		Name:         "write-anywhere",
-		Source:       api.Source{Node: "studio-a", Domain: found, Select: api.Selector{Flow: flow.ID()}},
-		Destinations: []api.Destination{{Node: "edge-01", Domain: []string{found}}},
+	// As a destination it is refused: `ro` grants reading and nothing else, and the **grant is a
+	// field on the entry** now rather than something the shape of the configuration carried
+	// (§10.6). Refused at the API boundary rather than stored as INVALID, which is the better
+	// place for it: nothing is persisted and no reconcile ever sees it.
+	refused := f.do(http.MethodPost, api.NamespaceRequestsPath(api.DefaultNamespace), api.RequestSpec{
+		Name:   "write-anywhere",
+		Source: api.Source{Node: "studio-a", Domain: src.source("cameras"), Select: api.Selector{Flow: flow.ID()}},
+		Destinations: []api.Destination{{
+			Node: "edge-01", Domain: api.Domain{Area: "ro", Elements: []string{"adhoc"}},
+		}},
 	})
 	require.Equal(t, http.StatusBadRequest, refused.status, "body: %s", refused.body)
 
 	var refusal api.Error
 	refused.decode(t, &refusal)
 	assert.Equal(t, api.CodeInvalidRequest, refusal.Code)
-	assert.Contains(t, refusal.Message, "destinations[0].domain")
+	assert.Equal(t, string(api.ReasonUnknownArea), refusal.Details["reason_code"],
+		"edge-01 has no area called `ro` at all")
 	assert.Zero(t, src.starts(), "and nothing may be started for it")
 
-	// The same domain as a *source* is fine, and replicates into a mapped destination.
+	// And a raw path where a domain's elements belong is refused structurally, before the fleet
+	// is consulted at all: a separator is simply not something an element may contain (§10.6).
+	raw := f.do(http.MethodPost, api.NamespaceRequestsPath(api.DefaultNamespace), api.RequestSpec{
+		Name:   "raw-path",
+		Source: api.Source{Node: "studio-a", Domain: src.source("cameras"), Select: api.Selector{Flow: flow.ID()}},
+		Destinations: []api.Destination{{
+			Node: "edge-01", Domain: api.Domain{Area: "fast", Elements: []string{found}},
+		}},
+	})
+	require.Equal(t, http.StatusBadRequest, raw.status, "body: %s", raw.body)
+	raw.decode(t, &refusal)
+	assert.Contains(t, refusal.Message, "destinations[0].domain")
+
+	// The same domain as a *source* is fine, and replicates into a writable area.
 	f.request(api.RequestSpec{
 		Name:         "adhoc-in",
-		Source:       api.Source{Node: "studio-a", Domain: found, Select: api.Selector{Flow: flow.ID()}},
-		Destinations: []api.Destination{{Node: "edge-01", Domain: []string{"ingest"}}},
+		Source:       api.Source{Node: "studio-a", Domain: named("ro/adhoc"), Select: api.Selector{Flow: flow.ID()}},
+		Destinations: []api.Destination{{Node: "edge-01", Domain: api.Domain{Area: "fast", Elements: []string{"ingest"}}}},
 	})
 	f.eventually("a session from the discovered domain", func() bool {
 		paths := f.paths().Paths
@@ -978,10 +996,10 @@ func TestNoSharedFabricIsRefusedAtTheRequest(t *testing.T) {
 		return false
 	})
 
-	refused := f.do(http.MethodPost, api.PathRequests, api.RequestSpec{
+	refused := f.do(http.MethodPost, api.NamespaceRequestsPath(api.DefaultNamespace), api.RequestSpec{
 		Name:         "across-fabrics",
-		Source:       api.Source{Node: "studio-a", Domain: "cameras", Select: api.Selector{Flow: flow.ID()}},
-		Destinations: []api.Destination{{Node: "edge-01", Domain: []string{"ingest"}}},
+		Source:       api.Source{Node: "studio-a", Domain: src.source("cameras"), Select: api.Selector{Flow: flow.ID()}},
+		Destinations: []api.Destination{{Node: "edge-01", Domain: api.Domain{Area: "fast", Elements: []string{"ingest"}}}},
 	})
 	require.Equal(t, http.StatusBadRequest, refused.status, "body: %s", refused.body)
 
@@ -1008,4 +1026,237 @@ func TestTheAgentAuthenticatesOnEveryCall(t *testing.T) {
 	sessionID := p.established()
 	assert.NotNil(t, p.dst.worker(sessionID, api.RoleTarget))
 	assert.NotNil(t, p.src.worker(sessionID, api.RoleInitiator))
+}
+
+// --- 10.7. domain labels and the label selector -------------------------------------------------
+
+// label attaches labels to one (node, domain) through the real API.
+func (f *fleet) label(node, domain string, labels map[string]string) api.DomainLabelResult {
+	f.t.Helper()
+
+	segments := strings.Split(domain, "/")
+	resp := f.do(http.MethodPost, api.NodeDomainsPath(node), api.DomainLabelWrite{
+		Domain: api.Domain{Area: segments[0], Elements: segments[1:]},
+		Apply:  labels,
+	})
+	require.Less(f.t, resp.status, 300, "body: %s", resp.body)
+
+	var out api.DomainLabelResult
+	resp.decode(f.t, &out)
+	return out
+}
+
+// **A label applied before its domain is discovered resolves by itself when a producer appears**
+// (§10.7, §17). That is what "before or after" means: the operator labels a camera's domain before
+// the camera is switched on, and the record is accepted, inert and visible in the meantime.
+func TestALabelAppliedBeforeItsDomainResolvesWhenAProducerAppears(t *testing.T) {
+	f := newFleet(t, fleetOptions{})
+	src := f.addNode("studio-a", nodeOptions{domains: []string{"cameras"}})
+	f.addNode("edge-01", nodeOptions{})
+
+	// Nothing is in `media/pending` yet — the directory does not even exist.
+	f.label("studio-a", "media/pending", map[string]string{"role": "late"})
+
+	// The record is listed, so the intent is visible rather than lost.
+	var list api.DomainList
+	f.do(http.MethodGet, api.NodeDomainsPath("studio-a"), nil).decode(t, &list)
+	var pending *api.DomainInfo
+	for i := range list.Domains {
+		if list.Domains[i].Domain.String() == "media/pending" {
+			pending = &list.Domains[i]
+		}
+	}
+	require.NotNil(t, pending, "a label on an unobserved domain is a pending record, not an error")
+	assert.False(t, pending.Observed)
+
+	// A request selecting it is accepted and WAITING, which §7.2 already files as legitimately not
+	// an error.
+	request := f.request(api.RequestSpec{
+		Name:         "late",
+		Source:       api.Source{Node: "studio-a", Domain: api.SelectLabels(map[string]string{"role": "late"}), Select: api.Selector{Flow: "does-not-exist"}},
+		Destinations: []api.Destination{{Node: "edge-01", Domain: api.Domain{Area: "fast", Elements: []string{"ingest"}}}},
+	})
+	assert.Equal(t, api.StateWaiting, request.Status.State)
+	assert.Empty(t, f.paths().Paths)
+
+	// The producer appears. Nothing was written to make this work: the label record was already
+	// there, and the reconcile that notices the domain is the ordinary one (§10.7).
+	created := createFlowAt(t, filepath.Join(src.in, "pending"), videoFlowDef("Late:Camera", "video"))
+	created.produce()
+
+	f.eventually("the pending label to resolve into a path", func() bool {
+		paths := f.paths().Paths
+		return len(paths) == 1 && paths[0].Source.Domain == "media/pending"
+	})
+}
+
+// **A relabel changes a request's expansion without restarting a worker on a path it still
+// matches** (§17). That is the property the annotate-don't-rename decision exists for: a label is
+// not in path identity, so relabelling is free.
+func TestARelabelMovesTheExpansionWithoutRestartingAWorker(t *testing.T) {
+	f := newFleet(t, fleetOptions{})
+	src := f.addNode("studio-a", nodeOptions{domains: []string{"cameras", "audio"}})
+	dst := f.addNode("edge-01", nodeOptions{})
+
+	video := src.createFlow("cameras", videoFlowDef("Studio A:Camera 1", "video"))
+	video.produce()
+	audio := src.createFlow("audio", videoFlowDef("Studio A:Camera 1", "video"))
+	audio.produce()
+
+	f.label("studio-a", "media/cameras", map[string]string{"role": "live"})
+
+	f.request(api.RequestSpec{
+		Name: "live",
+		Source: api.Source{
+			Node:   "studio-a",
+			Domain: api.SelectLabels(map[string]string{"role": "live"}),
+			Select: api.Selector{GroupHint: &api.GroupHintSelector{Name: "Studio A:Camera 1"}},
+		},
+		Destinations: []api.Destination{{Node: "edge-01", Domain: api.Domain{Area: "fast", Elements: []string{"ingest"}}}},
+	})
+
+	f.eventually("the first path to establish", func() bool {
+		paths := f.paths().Paths
+		return len(paths) == 1 && paths[0].Session != nil && paths[0].Session.Epoch != ""
+	})
+	first := f.paths().Paths[0]
+	starts := dst.starts()
+
+	// Labelling a *second* domain joins it to the expansion.
+	f.label("studio-a", "media/audio", map[string]string{"role": "live"})
+
+	f.eventually("the relabel to widen the expansion", func() bool {
+		paths := f.paths().Paths
+		if len(paths) != 2 {
+			return false
+		}
+		// Both **established**, not merely planned: "no worker restarted" is otherwise measured
+		// against a set that has not finished arriving. An epoch means the target is up and has
+		// reported (§5.3 step 4).
+		return paths[0].Session != nil && paths[0].Session.Epoch != "" &&
+			paths[1].Session != nil && paths[1].Session.Epoch != ""
+	})
+
+	// **The path that already matched keeps its identity**, so nothing restarted on it. A worker
+	// restart here would be a metadata edit glitching live media, which is exactly what §10.7
+	// refuses.
+	var still bool
+	for _, path := range f.paths().Paths {
+		if path.ID == first.ID {
+			still = true
+			assert.Equal(t, first.Session.ID, path.Session.ID, "same session, same worker")
+		}
+	}
+	assert.True(t, still, "the existing path must not be re-identified")
+
+	// One new target, and no restart of the old one.
+	assert.Equal(t, starts+1, dst.starts(), "exactly one worker started, for the new path")
+}
+
+// **A label selector declines to match a flow this node is writing, while a sibling flow in the
+// same domain — written locally — still matches; and a request naming that domain directly still
+// chains** (§17).
+//
+// One node is both a source and a destination, which is the only shape in which the filter's
+// omission is visible at all.
+func TestASelectorSkipsThisProjectsOutputWhileNamingItStillChains(t *testing.T) {
+	f := newFleet(t, fleetOptions{})
+	src := f.addNode("studio-a", nodeOptions{domains: []string{"cameras"}})
+	mid := f.addNode("edge-01", nodeOptions{domains: []string{"local"}})
+	f.addNode("edge-02", nodeOptions{})
+
+	original := src.createFlow("cameras", videoFlowDef("Studio A:Camera 1", "video"))
+	original.produce()
+
+	// Hop one puts a flow into edge-01's writable area, and edge-01's own target worker is the
+	// thing writing it — which is what `replicated` reports (§6).
+	f.request(api.RequestSpec{
+		Name:         "a-to-b",
+		Source:       api.Source{Node: "studio-a", Domain: src.source("cameras"), Select: api.Selector{Flow: original.ID()}},
+		Destinations: []api.Destination{{Node: "edge-01", Domain: api.Domain{Area: "fast", Elements: []string{"ingest"}}}},
+	})
+	f.eventually("the first hop to establish", func() bool {
+		paths := f.paths().Paths
+		return len(paths) == 1 && paths[0].Session != nil
+	})
+
+	// The fake worker does not actually create the flow, so the test does — this is the flow the
+	// target would have made from the definition it was assigned. **Same ID as the original**,
+	// which is what replication means: the flow ID is unique to the media, not to a location
+	// (§3), and it is what the agent's provenance keys on.
+	replicatedDef := videoFlowDef("Studio A:Camera 1", "video")
+	replicatedDef.ID = original.ID()
+	replicated := createFlowAt(t, mid.path("ingest"), replicatedDef)
+	replicated.produce()
+
+	// And a flow a *local* media function produced beside it, in the same domain.
+	sibling := createFlowAt(t, mid.path("ingest"), videoFlowDef("Studio A:Camera 1", "video"))
+	sibling.produce()
+
+	f.eventually("edge-01 to report both flows, one of them as replicated", func() bool {
+		var seen, provenance int
+		for _, flow := range f.flows().Flows {
+			if flow.Node != "edge-01" || flow.Domain != "fast/ingest" {
+				continue
+			}
+			seen++
+			if flow.Replicated {
+				provenance++
+			}
+		}
+		return seen == 2 && provenance == 1
+	})
+
+	f.label("edge-01", "fast/ingest", map[string]string{"role": "onward"})
+
+	// A **label selector** takes the sibling and not the replicated one.
+	f.request(api.RequestSpec{
+		Name: "matched",
+		Source: api.Source{
+			Node:   "edge-01",
+			Domain: api.SelectLabels(map[string]string{"role": "onward"}),
+			Select: api.Selector{GroupHint: &api.GroupHintSelector{Name: "Studio A:Camera 1"}},
+		},
+		Destinations: []api.Destination{{Node: "edge-02", Domain: api.Domain{Area: "fast", Elements: []string{"ingest"}}}},
+	})
+
+	f.eventually("the selector to take exactly the flow this node did not write", func() bool {
+		var matched []string
+		for _, path := range f.paths().Paths {
+			if path.Source.Node == "edge-01" {
+				matched = append(matched, path.Source.Flow)
+			}
+		}
+		return len(matched) == 1 && matched[0] == sibling.ID()
+	})
+
+	// And it says so: the skipped flow is named in the request's status, where a flow that simply
+	// did not match the labels is not listed at all (§9.1).
+	var requests api.RequestList
+	f.do(http.MethodGet, api.PathRequests, nil).decode(t, &requests)
+	var excluded []api.Exclusion
+	for _, request := range requests.Requests {
+		if request.Name == "matched" {
+			excluded = request.Status.Excluded
+		}
+	}
+	require.Len(t, excluded, 1)
+	assert.Equal(t, replicated.ID(), excluded[0].Flow)
+	assert.Equal(t, api.ExclusionSelfOutput, excluded[0].Reason)
+
+	// **Naming the domain directly still reaches it**, which is what keeps chaining possible:
+	// explicit chaining is intent, matched chaining is emergence (§10.7).
+	f.request(api.RequestSpec{
+		Name:         "named",
+		Source:       api.Source{Node: "edge-01", Domain: named("fast/ingest"), Select: api.Selector{Flow: replicated.ID()}},
+		Destinations: []api.Destination{{Node: "edge-02", Domain: api.Domain{Area: "fast", Elements: []string{"onward"}}}},
+	})
+	f.eventually("the named source to reach the replicated flow", func() bool {
+		for _, path := range f.paths().Paths {
+			if path.Source.Flow == replicated.ID() && path.Destination.Node == "edge-02" {
+				return true
+			}
+		}
+		return false
+	})
 }

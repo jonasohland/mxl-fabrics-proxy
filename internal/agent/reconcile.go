@@ -7,6 +7,7 @@ import (
 	"maps"
 	"sync"
 
+	"github.com/jonasohland/mxl-replicator/internal/agent/inventory"
 	"github.com/jonasohland/mxl-replicator/internal/api"
 	"github.com/jonasohland/mxl-replicator/internal/epoch"
 	"github.com/jonasohland/mxl-replicator/internal/worker"
@@ -53,8 +54,35 @@ func (a *Agent) reconcile(ctx context.Context, set *api.AssignmentSet) {
 	a.stopUndesired(running, desired)
 	a.materialise(desired)
 	a.startMissing(ctx, desired)
+	a.publishProvenance()
 
 	a.Notify()
+}
+
+// publishProvenance tells the inventory which flows this node's own target workers are writing
+// (§6, §10.6).
+//
+// **Read off the running units, not off the assignment set**, and that is the whole of §10.6's
+// safety argument: provenance and production have to go absent together. A flag derived from
+// assignments would stay true through an agent restart, a long-idle teardown or a crash — windows
+// in which the flow is *not* advancing — and the two would then be able to disagree in the
+// dangerous direction. Derived from the worker, they cannot.
+//
+// After startMissing, so a unit that has just been created is already in the set.
+func (a *Agent) publishProvenance() {
+	a.mu.Lock()
+	units := maps.Clone(a.units)
+	a.mu.Unlock()
+
+	replicated := make(map[inventory.FlowRef]struct{}, len(units))
+	for key, unit := range units {
+		if key.Role != api.RoleTarget {
+			continue
+		}
+		spec := unit.desired()
+		replicated[inventory.FlowRef{DomainPath: spec.DomainPath, FlowID: spec.FlowID}] = struct{}{}
+	}
+	a.cfg.Inventory.SetReplicated(replicated)
 }
 
 // materialise makes the set of observed output domains match the target assignments (§10.6).
@@ -67,10 +95,13 @@ func (a *Agent) reconcile(ctx context.Context, set *api.AssignmentSet) {
 // Between stopping and starting, deliberately. A domain must be watched before its worker
 // creates a flow in it, and released only once the last worker in it has gone.
 func (a *Agent) materialise(desired map[unitKey]worker.Spec) {
+	// Keyed on the **resolved path**, because that is the thing the inventory holds. A domain's
+	// name is derived from the path by the area table (§10.6), so the two cannot disagree and
+	// there is nothing for a second key to add.
 	wanted := map[string]string{}
 	for _, spec := range desired {
 		if spec.IsTarget() {
-			wanted[spec.Domain] = spec.DomainPath
+			wanted[spec.DomainPath] = spec.Domain
 		}
 	}
 
@@ -79,26 +110,26 @@ func (a *Agent) materialise(desired map[unitKey]worker.Spec) {
 	a.outputs = wanted
 	a.mu.Unlock()
 
-	for name, path := range held {
-		if wanted[name] == path {
+	for path, name := range held {
+		if _, still := wanted[path]; still {
 			continue
 		}
-		a.log.Info("releasing output domain", "domain", name, "path", path)
-		a.cfg.Inventory.Release(name, path)
+		a.log.Info("releasing domain", "domain", name, "path", path)
+		a.cfg.Inventory.Release(path)
 	}
 
-	for name, path := range wanted {
-		if held[name] == path {
+	for path, name := range wanted {
+		if _, already := held[path]; already {
 			continue
 		}
-		if err := a.cfg.Inventory.Materialise(name, path); err != nil {
+		if err := a.cfg.Inventory.Materialise(path); err != nil {
 			// Logged rather than turned into a rejection: the worker's own MkdirAll fails on the
 			// same directory a moment later and reports it as a failed session with a reason,
 			// which is where an operator will look for it (§11).
-			a.log.Error("could not materialise an output domain", "domain", name, "path", path, "error", err)
+			a.log.Error("could not materialise a domain", "domain", name, "path", path, "error", err)
 			continue
 		}
-		a.log.Info("materialised output domain", "domain", name, "path", path)
+		a.log.Info("materialised domain", "domain", name, "path", path)
 	}
 }
 
@@ -179,33 +210,34 @@ func (a *Agent) stopAll() {
 // knows: where the named domain lives, which local address the negotiated fabric means, and
 // which service to bind.
 func (a *Agent) specFor(key unitKey, assignment api.Assignment) (worker.Spec, error) {
-	// A domain **name**, never a path. Which side of the split it is resolved through depends on
-	// the role, and the asymmetry is the sharpest property of the design (§10.6):
+	// One domain value, resolved two ways, and the asymmetry is the sharpest property of the
+	// design (§10.6):
 	//
-	//   - An initiator's domain is an *input* one, looked up among the domains this agent
-	//     observes, because a source is by definition something the node already has.
-	//   - A target's is an *output* one, resolved from this agent's configured roots and the two
-	//     names in the assignment, with **no reference to observed state at all**. The
-	//     security-critical path is therefore a pure function of one config file and two names.
+	//   - An initiator's is looked up among the domains this agent **observes**, because a source
+	//     is by definition something the node already has.
+	//   - A target's is resolved from this agent's own area table, with **no reference to observed
+	//     state at all**. The security-critical path is therefore a pure function of one config
+	//     file and one name, and the `write` grant is checked as part of it.
 	//
 	// The server validates both and is the authority. Checking again here is the one place in the
 	// tree where duplication earns its keep (§7.2, §13, invariant 6): an agent that trusted the
 	// control plane on it would be one compromised or buggy server away from creating flows
-	// wherever a root can reach.
+	// wherever an area can reach.
+	//
+	// Resolution takes the **structure** — the area name and the elements — and never splits a
+	// rendered string. Nothing outside the CLI's manifest parser turns a domain string back into
+	// path elements (§10.6).
 	var domainPath string
 	if assignment.Role == api.RoleTarget {
-		// Resolved from the *elements*, never by splitting [api.Assignment.Domain]. Nothing
-		// outside the CLI's manifest parser turns a domain string back into path elements, so
-		// the security-critical resolver only ever takes structure (§10.6).
-		resolved, err := a.cfg.Inventory.Output(assignment.Root, assignment.OutputDomain)
+		resolved, err := a.cfg.Inventory.Resolve(assignment.Domain)
 		if err != nil {
 			return worker.Spec{}, err
 		}
 		domainPath = resolved
 	} else {
-		resolved, ok := a.cfg.Inventory.Input(assignment.Domain)
+		resolved, ok := a.cfg.Inventory.Lookup(assignment.Domain)
 		if !ok {
-			return worker.Spec{}, fmt.Errorf("domain %q is not mapped on this node", assignment.Domain)
+			return worker.Spec{}, fmt.Errorf("domain %q is not observed on this node", assignment.Domain)
 		}
 		domainPath = resolved
 	}
@@ -234,7 +266,7 @@ func (a *Agent) specFor(key unitKey, assignment api.Assignment) (worker.Spec, er
 		SessionID:                   assignment.SessionID,
 		Role:                        assignment.Role,
 		Epoch:                       assignment.Epoch,
-		Domain:                      assignment.Domain,
+		Domain:                      assignment.Domain.String(),
 		DomainPath:                  domainPath,
 		FlowID:                      assignment.FlowID,
 		FlowDef:                     assignment.FlowDef,
@@ -246,6 +278,7 @@ func (a *Agent) specFor(key unitKey, assignment api.Assignment) (worker.Spec, er
 		SchedPrio:                   assignment.SchedPrio,
 		IdleTimeout:                 assignment.IdleTimeout.Duration(),
 		ConnectTimeout:              assignment.ConnectTimeout.Duration(),
+		Namespace:                   assignment.Namespace,
 		Labels:                      assignment.Labels,
 	}
 	if assignment.Role == api.RoleTarget {

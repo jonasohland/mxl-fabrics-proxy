@@ -5,10 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"maps"
 	"net"
 	"net/http"
-	"path/filepath"
 	"slices"
 	"time"
 
@@ -42,23 +40,28 @@ type AgentOptions struct {
 	Server []string  `help:"URL of the mxl-replicator server. Repeatable for an HA deployment." env:"MXL_REPLICATOR_SERVER"`
 	Auth   AuthFlags `embed:""`
 
-	// **Input** domains only (§10.6). Kept byte-compatible with the legacy proxy's flag syntax
-	// and `domains:` YAML block, so the mapping config carries over unchanged (§16) — but a
-	// legacy mapping that a subscription used as a *destination* is no longer usable as one, and
-	// becomes a domain name under an output root instead.
-	Domains map[string]string `help:"Map an input domain name to a local path, e.g. -m cameras=/dev/shm/mxl0. Repeatable. Input only: replication destinations are named under an --output-root." short:"m" name:"map-domain"`
-
-	// Optional auto-discovery of unconfigured input domains. Nothing discovered is ever written
-	// to: this project only writes inside an output root.
-	SearchPath []string `help:"Recursively search these paths for MXL domains. Discovered domains are replication sources; nothing discovered is ever written to." name:"search-path"`
-
-	// The write side, and the whole of the authority the API has over this node's filesystem
-	// (§10.6, §13). No default: a node with none configured is not a replication destination,
-	// which is the right posture for an opt-in that grants the control plane write access.
+	// **Areas**, and between them the whole of this project's authority over this node's
+	// filesystem (§10.6, §13). `read` is where domains are discovered from; `write` is where
+	// replication may create them. Neither implies the other, both default false, so a node with
+	// no area at all offers no sources and accepts no destinations.
 	//
-	// A map rather than a repeatable `name=path` list so that a name declared twice is a
-	// configuration error the flag parser catches rather than one this has to detect.
-	OutputRoots map[string]string `help:"Permit replication to create domains under this directory, e.g. --output-root fast=/dev/shm/mxl. Repeatable. Without one this node cannot be a replication destination." name:"output-root"`
+	// *This supersedes `--search-path` and `--output-root`.* One noun with two independent grants
+	// is what "read these as a pair" was asking for, and it is what makes a domain's fleet-wide
+	// name `<area>/<elements>` — one identity grammar for every domain, whichever direction this
+	// project uses it in.
+	//
+	// *There was also a `-m`/`--map-domain` flag, kept byte-compatible with the legacy proxy's.*
+	// It did two jobs at once — granting authority to read a directory, and giving that directory
+	// a fleet-wide name — and those separate: the grant is an area's `read` bit, the naming is the
+	// area's own name plus what the filesystem already decided (§10.6, §16).
+	//
+	// sep:"none" because a directory may contain a comma, and kong would otherwise split one
+	// area into two halves of nothing.
+	Area []string `help:"Declare an area: a directory MXL domains live in, with its grants. e.g. --agent-area media=/dev/shm/mxl:r or fast=/dev/shm/mxl/replicated:rw. Repeatable." sep:"none"`
+
+	// areas is the merged list — the configuration files' `areas:` blocks plus --agent-area —
+	// resolved at parse time.
+	areas []api.Area
 
 	// What this node can be reached on (§10.1). Repeatable, and *added* to any `fabrics:` block
 	// in a configuration file rather than replacing it, so a file describing the hardware can be
@@ -100,9 +103,8 @@ type AgentOptions struct {
 // resolve loads the configuration files and folds them into the flags.
 //
 // The rule is that **a flag wins over a file for a scalar, and adds to it for a collection**.
-// Domain mappings merge with the flag winning per name; fabric attachments and search paths
-// accumulate. It is the shape that makes a file describing a host's hardware extensible on the
-// command line without a second way to spell "replace everything".
+// Fabric attachments and areas accumulate. It is the shape that makes a file describing a host's
+// hardware extensible on the command line without a second way to spell "replace everything".
 func (c *AgentOptions) resolve() error {
 	loaded, err := config.LoadAgent(c.Config...)
 	if err != nil {
@@ -118,21 +120,14 @@ func (c *AgentOptions) resolve() error {
 	if len(c.Server) == 0 {
 		c.Server = loaded.Server
 	}
-	c.SearchPath = append(slices.Clone(loaded.SearchPaths), c.SearchPath...)
-
-	domains := maps.Clone(loaded.Domains)
-	if domains == nil {
-		domains = map[string]string{}
+	c.areas = slices.Clone(loaded.Areas)
+	for _, raw := range c.Area {
+		area, err := config.ParseArea(raw)
+		if err != nil {
+			return err
+		}
+		c.areas = append(c.areas, area)
 	}
-	maps.Copy(domains, c.Domains)
-	c.Domains = domains
-
-	roots := map[string]string{}
-	for _, root := range loaded.OutputRoots {
-		roots[root.Name] = root.Path
-	}
-	maps.Copy(roots, c.OutputRoots)
-	c.OutputRoots = roots
 
 	c.fabrics = slices.Clone(loaded.Fabrics)
 	for _, raw := range c.Fabric {
@@ -180,24 +175,13 @@ func (c *AgentOptions) Validate() error {
 		return fmt.Errorf("--flow-idle-after must be positive")
 	}
 
-	for name, path := range c.Domains {
-		// An input domain name shares a namespace with every output domain on this node, so it
-		// takes the same rule (§10.6). Refused here so the message names the flag.
-		if err := api.ValidDomainName(name); err != nil {
-			return fmt.Errorf("--map-domain: name %q: %w", name, err)
-		}
-		if !filepath.IsAbs(path) {
-			return fmt.Errorf("--map-domain %s: path %q must be absolute", name, path)
-		}
-	}
-
-	// The merged picture, and the only place that has one: roots against each other, against the
-	// input mappings and against the search paths (§10.6). One directory must have exactly one
-	// name on this node, and the message names both sides of any collision.
+	// The merged picture, and the only place that has one. **The one rule left is that no two
+	// areas share a path** (§10.6): areas may nest, and the innermost containing one names a
+	// directory, so the only arrangement that rule cannot decide is two areas on one directory.
 	//
 	// The same function the inventory builds its resolver with, so the rule an operator is held
 	// to at parse time and the rule that decides where a target worker writes cannot drift apart.
-	if err := inventory.ValidateRoots(rootList(c.OutputRoots), domainList(c.Domains), c.SearchPath); err != nil {
+	if err := inventory.ValidateAreas(c.areas); err != nil {
 		return err
 	}
 
@@ -215,9 +199,7 @@ func (c *AgentOptions) Run(ctx context.Context, logger *slog.Logger) error {
 	logger.Info("agent configuration resolved",
 		"node", c.Node,
 		"server", c.Server,
-		"domains", len(c.Domains),
-		"search_paths", len(c.SearchPath),
-		"output_roots", len(c.OutputRoots),
+		"areas", len(c.areas),
 		"fabrics", len(c.fabrics),
 		"port_range", c.PortRange.String(),
 		"worker_binary", c.WorkerBinary,
@@ -304,12 +286,10 @@ func (c *AgentOptions) build(ctx context.Context, logger *slog.Logger) (*agent.A
 	// calls it until Agent.Run starts the inventory's own goroutines.
 	var built *agent.Agent
 	inv, err := inventory.New(inventory.Options{
-		Domains:     domainList(c.Domains),
-		SearchPaths: c.SearchPath,
-		OutputRoots: rootList(c.OutputRoots),
-		IdleAfter:   c.FlowIdleAfter,
-		Logger:      logger.With("module", "inventory"),
-		OnChange:    func() { built.Notify() },
+		Areas:     c.areas,
+		IdleAfter: c.FlowIdleAfter,
+		Logger:    logger.With("module", "inventory"),
+		OnChange:  func() { built.Notify() },
 	})
 	if err != nil {
 		return nil, err
@@ -338,9 +318,9 @@ func (c *AgentOptions) build(ctx context.Context, logger *slog.Logger) (*agent.A
 // anything is assigned to this node — and its versions are not decoration: `target_info` is
 // produced by one node's mxl-fabrics and consumed by another's, so a node pair straddling an mxl
 // version boundary is a compatibility concern neither agent can detect alone.
-// Output roots are deliberately *not* assembled here. They are static agent configuration rather
-// than something libfabric reports, the agent already holds them through its inventory, and it is
-// the agent that adds them to the registration this returns (§10.2, §10.6).
+// Areas are deliberately *not* assembled here. They are static agent configuration rather than
+// something libfabric reports, the agent already holds them through its inventory, and it is the
+// agent that adds them to the registration this returns (§10.2, §10.6).
 func (c *AgentOptions) prober(logger *slog.Logger) func(context.Context) (api.Capabilities, error) {
 	return func(ctx context.Context) (api.Capabilities, error) {
 		versions, err := exec.ProbeVersions(ctx, c.WorkerBinary)
@@ -436,36 +416,4 @@ func (c *AgentOptions) serve(ctx context.Context, logger *slog.Logger, built *ag
 		return err
 	}
 	return nil
-}
-
-func domainList(domains map[string]string) []inventory.Domain {
-	out := make([]inventory.Domain, 0, len(domains))
-	for name, path := range domains {
-		out = append(out, inventory.Domain{Name: name, Path: path})
-	}
-	slices.SortFunc(out, func(a, b inventory.Domain) int { return byName(a.Name, b.Name) })
-	return out
-}
-
-func rootList(roots map[string]string) []inventory.Root {
-	out := make([]inventory.Root, 0, len(roots))
-	for name, path := range roots {
-		out = append(out, inventory.Root{Name: name, Path: path})
-	}
-	slices.SortFunc(out, func(a, b inventory.Root) int { return byName(a.Name, b.Name) })
-	return out
-}
-
-// byName keeps both lists deterministic. Not cosmetic: a map iteration order decides which of two
-// overlapping roots is reported as the collision, and an error message that changes between runs
-// is one an operator cannot search for.
-func byName(a, b string) int {
-	switch {
-	case a < b:
-		return -1
-	case a > b:
-		return 1
-	default:
-		return 0
-	}
 }

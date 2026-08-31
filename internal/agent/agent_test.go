@@ -12,7 +12,6 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/jonasohland/mxl-replicator/internal/agent/inventory"
 	"github.com/jonasohland/mxl-replicator/internal/api"
 	"github.com/jonasohland/mxl-replicator/internal/epoch"
 	"github.com/jonasohland/mxl-replicator/internal/worker"
@@ -50,29 +49,34 @@ func TestRegistrationAdvertisesVerifiedCapabilities(t *testing.T) {
 	require.Len(t, registration.Capabilities.Fabrics, 1)
 	assert.Equal(t, api.ProviderTCP, registration.Capabilities.Fabrics[0].Provider)
 
-	// Configured mappings only. A discovered domain reaches the server through inventory, where
-	// high-churn observations belong.
-	require.Len(t, registration.Domains, 1)
-	assert.Equal(t, "cameras", registration.Domains[0].Name)
-	assert.True(t, registration.Domains[0].Configured)
+	// **Registration carries no domains** (§6): there are none to carry, since a node's domains
+	// are discovered and reach the server through inventory, which is where high-churn
+	// observations belong.
 
-	// The harness configures one output root, which is what makes this node a destination at
-	// all (§10.6).
-	require.Len(t, registration.Capabilities.OutputRoots, 1)
-	assert.Equal(t, "fast", registration.Capabilities.OutputRoots[0].Name)
+	// The harness configures one readable area and one writable one, and **both are advertised**
+	// (§10.2): a domain's name is `<area>/<elements>`, so a server that does not hold this table
+	// cannot render a domain's identity or resolve a name in a request.
+	require.Len(t, registration.Capabilities.Areas, 2)
+	assert.Equal(t, "fast", registration.Capabilities.Areas[0].Name)
+	assert.True(t, registration.Capabilities.Areas[0].Write)
+	assert.Equal(t, "media", registration.Capabilities.Areas[1].Name)
+	assert.False(t, registration.Capabilities.Areas[1].Write)
 }
 
-// Roots are static agent configuration rather than something the worker probe reports, and they
+// Areas are static agent configuration rather than something the worker probe reports, and they
 // are advertised at registration for the same reason fabric attachments are: without them the
-// server would accept a request whose destination cannot be materialised (§10.2, §10.6).
-func TestOutputRootsAreAdvertisedAndPreCreated(t *testing.T) {
+// server cannot render a domain's identity, resolve a name in a request, or tell an operator
+// which area a name landed outside of (§10.2, §10.6).
+func TestAreasAreAdvertisedAndWritableOnesPreCreated(t *testing.T) {
 	base := t.TempDir()
 	fast := filepath.Join(base, "fast")
 	bulk := filepath.Join(base, "bulk", "not-yet")
+	readOnly := filepath.Join(base, "read-only", "not-yet")
 
-	h := newHarness(t, harnessOptions{outputRoots: []inventory.Root{
-		{Name: "bulk", Path: bulk},
-		{Name: "fast", Path: fast},
+	h := newHarness(t, harnessOptions{areas: []api.Area{
+		{Name: "bulk", Path: bulk, Read: true, Write: true},
+		{Name: "fast", Path: fast, Read: true, Write: true},
+		{Name: "media", Path: readOnly, Read: true},
 	}})
 	h.run()
 
@@ -85,20 +89,24 @@ func TestOutputRootsAreAdvertisedAndPreCreated(t *testing.T) {
 	registration := h.server.registrations[0]
 	h.server.mu.Unlock()
 
-	// Ordered by name, and carrying the path for diagnostics only — the server sends a root
-	// *name* back to the agent and the agent resolves it.
-	assert.Equal(t, []api.OutputRoot{
-		{Name: "bulk", Path: bulk},
-		{Name: "fast", Path: fast},
-	}, registration.Capabilities.OutputRoots)
+	// Ordered by name, grants travelling with the entry, and carrying the path for diagnostics
+	// only — the server sends an area *name* back to the agent and the agent resolves it.
+	assert.Equal(t, []api.Area{
+		{Name: "bulk", Path: bulk, Read: true, Write: true},
+		{Name: "fast", Path: fast, Read: true, Write: true},
+		{Name: "media", Path: readOnly, Read: true},
+	}, registration.Capabilities.Areas)
 
-	// Created at startup, so only the leaf MkdirAll for a domain is ever on the establishment
-	// path (§6.1).
+	// **Writable areas** are created at startup, so only the leaf MkdirAll for a domain is ever on
+	// the establishment path (§6.1). A read-only area is somewhere this project looks, not
+	// somewhere it may create anything.
 	for _, path := range []string{fast, bulk} {
 		info, err := os.Stat(path)
 		require.NoError(t, err, path)
 		assert.True(t, info.IsDir())
 	}
+	_, err := os.Stat(readOnly)
+	assert.True(t, os.IsNotExist(err), "a read-only area is not created")
 }
 
 // A node name another instance holds is loud and never fatal — the holder may go away — and the
@@ -177,7 +185,7 @@ func TestInitiatorVerifiesTheEpochBeforeStarting(t *testing.T) {
 	require.NoError(t, err)
 	good := epoch.Compute(epoch.NewNonce(), info)
 
-	h.server.assign("edge-01", initiatorAssignment("s1", good, blob))
+	h.server.assign("edge-01", initiatorAssignment(h.name, "s1", good, blob))
 	h.eventually("the initiator", func() bool {
 		return h.launcher.Find("s1", api.RoleInitiator) != nil
 	})
@@ -186,7 +194,7 @@ func TestInitiatorVerifiesTheEpochBeforeStarting(t *testing.T) {
 	// check the worker comes up, connects to nothing, and reports healthy — no error, no data
 	// (§5.2).
 	other := fake.TargetInfo(spec, 2)
-	h.server.assign("edge-01", initiatorAssignment("s2", good, other))
+	h.server.assign("edge-01", initiatorAssignment(h.name, "s2", good, other))
 
 	h.eventually("the mismatch to be reported", func() bool {
 		status, ok := h.server.lastStatus("s2", api.RoleInitiator)
@@ -211,7 +219,7 @@ func TestInitiatorReconnectsOnANewEpochEvenForAnIdenticalBlob(t *testing.T) {
 	require.NoError(t, err)
 
 	first := epoch.Compute(epoch.NewNonce(), info)
-	h.server.assign("edge-01", initiatorAssignment("s1", first, blob))
+	h.server.assign("edge-01", initiatorAssignment(h.name, "s1", first, blob))
 
 	h.eventually("the initiator", func() bool {
 		return h.launcher.Find("s1", api.RoleInitiator) != nil
@@ -221,7 +229,7 @@ func TestInitiatorReconnectsOnANewEpochEvenForAnIdenticalBlob(t *testing.T) {
 
 	// The same assignment again changes nothing: the already-correct test is on material config,
 	// and nothing material moved.
-	h.server.assign("edge-01", initiatorAssignment("s1", first, blob))
+	h.server.assign("edge-01", initiatorAssignment(h.name, "s1", first, blob))
 	h.consistently("the initiator to be left alone", 150*time.Millisecond, func() bool {
 		return h.launcher.StartCount() == 1
 	})
@@ -229,7 +237,7 @@ func TestInitiatorReconnectsOnANewEpochEvenForAnIdenticalBlob(t *testing.T) {
 	// The target restarted and reported a byte-identical blob under a new incarnation.
 	second := epoch.Compute(epoch.NewNonce(), info)
 	require.NotEqual(t, first, second)
-	h.server.assign("edge-01", initiatorAssignment("s1", second, blob))
+	h.server.assign("edge-01", initiatorAssignment(h.name, "s1", second, blob))
 
 	h.eventually("the initiator to be replaced", func() bool {
 		current := h.launcher.Find("s1", api.RoleInitiator)
@@ -382,7 +390,8 @@ func TestUnchangedSnapshotsAreNotResent(t *testing.T) {
 		return len(h.server.inventoryReports()) == settled
 	})
 
-	// A flow appearing is a change, and is reported once.
+	// A *second* flow appearing is a change, and is reported once. The harness's source domain
+	// already holds one, because a directory with no flow in it is not discovered at all (§10.7).
 	flow, err := testutil.RandomVideoFlow(h.domain)
 	require.NoError(t, err)
 	require.NoError(t, flow.Create())
@@ -393,7 +402,7 @@ func TestUnchangedSnapshotsAreNotResent(t *testing.T) {
 			return false
 		}
 		last := reports[len(reports)-1]
-		return len(last.Domains) == 1 && len(last.Domains[0].Flows) == 1
+		return len(last.Domains) == 1 && len(last.Domains[0].Flows) == 2
 	})
 
 	reported := len(h.server.inventoryReports())
@@ -440,63 +449,57 @@ func TestUnexpectedDeathIsRestartedAndCounted(t *testing.T) {
 	}
 }
 
-// The destination domain must be a name the agent explicitly mapped. The server validates it and
-// is the authority; the agent checks again because it is the invariant that stops the API being a
-// remote arbitrary-filesystem-write primitive (§7.2, §13, invariant 6).
+// A destination is a name inside an area the operator granted `write` on. The server validates it
+// and is the authority; the agent checks again because it is the invariant that stops the API
+// being a remote arbitrary-filesystem-write primitive (§7.2, §13, invariant 6).
 func TestAssignmentsAreRefusedRatherThanGuessedAt(t *testing.T) {
-	root := t.TempDir()
-	found := filepath.Join(root, "discovered")
+	readOnly := t.TempDir()
+	found := filepath.Join(readOnly, "discovered")
 	require.NoError(t, os.MkdirAll(found, 0o755))
 	flow, err := testutil.RandomVideoFlow(found)
 	require.NoError(t, err)
 	require.NoError(t, flow.Create())
 
-	h := newHarness(t, harnessOptions{searchPaths: []string{root}})
+	h := newHarness(t, harnessOptions{extraAreas: []api.Area{{Name: "ro", Path: readOnly, Read: true}}})
 	h.run()
 
 	h.eventually("the discovered domain", func() bool {
-		_, ok := h.cfg.Inventory.Input(found)
+		_, ok := h.cfg.Inventory.Lookup(api.Domain{Area: "ro", Elements: []string{"discovered"}})
 		return ok
 	})
 
 	// A raw path where a domain element belongs. It is not interpreted as a path at any point: a
-	// separator is simply not something an element may contain (§10.6). Note that the resolver
-	// reads OutputDomain and never Domain, so a server that put a path in the *name* could not
-	// smuggle it through either — the name is for logs and labels.
+	// separator is simply not something an element may contain (§10.6).
 	rawPath := targetAssignment("s1")
-	rawPath.OutputDomain = []string{"/etc"}
+	rawPath.Domain.Elements = []string{"/etc"}
 
-	// A domain this agent *discovered*. Its name is its path, so it fails the same rule — which
-	// is why "a discovered domain is never a destination" needs no separate check: after §10.6 a
-	// destination is elements under a root, and a discovered domain's name has no such shape.
-	discovered := targetAssignment("s2")
-	discovered.OutputDomain = []string{found}
+	// An area this node advertises but does not grant `write` on. **This is the one line the
+	// unification adds**: "this is an output root" used to carry the grant by construction, and
+	// now that one table answers both directions the grant is a field that has to be read (§10.6).
+	readOnlyArea := targetAssignment("s2")
+	readOnlyArea.Domain = api.Domain{Area: "ro", Elements: []string{"discovered"}}
 
-	// A root this node does not advertise. The server validates this and is the authority;
-	// checking it again is the deliberate duplication that keeps one buggy control plane from
-	// writing wherever a root can reach (§13).
-	unknownRoot := targetAssignment("s3")
-	unknownRoot.Root = "bulk"
+	// An area this node does not advertise at all. The server validates this and is the
+	// authority; checking it again is the deliberate duplication that keeps one buggy control
+	// plane from writing wherever an area can reach (§13).
+	unknownArea := targetAssignment("s3")
+	unknownArea.Domain.Area = "bulk"
 
-	// And an input mapping named as a destination, which resolves to nothing now: input and
-	// output are different namespaces reached by different functions.
-	inputAsOutput := targetAssignment("s4")
-	inputAsOutput.OutputDomain = []string{"cameras"}
-	inputAsOutput.Root = ""
+	// A destination that names no area. There is no "the node's only one" to fall back on any
+	// more: the area is the first segment of the domain's name (§10.6).
+	noArea := targetAssignment("s4")
+	noArea.Domain.Area = ""
 
 	wrongFabric := targetAssignment("s5")
 	wrongFabric.Fabric = "ib-somewhere-else"
 
-	h.server.assign("edge-01", rawPath, discovered, unknownRoot, inputAsOutput, wrongFabric)
+	h.server.assign("edge-01", rawPath, readOnlyArea, unknownArea, noArea, wrongFabric)
 
 	for _, tc := range []struct{ session, wants string }{
 		{"s1", "contains byte 0x2f"},
-		// The discovered domain's path is over the per-element length cap before it is over
-		// anything else. Either rejection is the point; the assertion names the shape, not the
-		// clause that caught it first.
-		{"s2", "output domain"},
-		{"s3", `no output root "bulk" on this node`},
-		{"s4", "no output root named"},
+		{"s2", `area "ro" on this node does not grant writing`},
+		{"s3", `no area "bulk" on this node`},
+		{"s4", "no area named"},
 		{"s5", "advertises no tcp attachment"},
 	} {
 		h.eventually("session "+tc.session+" to be reported failed", func() bool {
@@ -540,7 +543,7 @@ func TestPortsAreStablePerSessionAndReleasedOnWithdrawal(t *testing.T) {
 // memory registrations and flows.
 func TestShutdownStopsEveryWorker(t *testing.T) {
 	h := newHarness(t, harnessOptions{})
-	h.server.assign("edge-01", targetAssignment("s1"), initiatorAssignmentFor(t, "s2"))
+	h.server.assign("edge-01", targetAssignment("s1"), initiatorAssignmentFor(t, h.name, "s2"))
 	h.run()
 
 	h.eventually("both workers", func() bool {
@@ -570,7 +573,7 @@ func TestAFailedProbeRetriesRatherThanRegisteringEmpty(t *testing.T) {
 }
 
 // initiatorAssignmentFor builds a self-consistent initiator assignment for a session.
-func initiatorAssignmentFor(t *testing.T, sessionID string) api.Assignment {
+func initiatorAssignmentFor(t *testing.T, domain api.Domain, sessionID string) api.Assignment {
 	t.Helper()
 
 	blob := fake.TargetInfo(worker.Spec{
@@ -582,5 +585,5 @@ func initiatorAssignmentFor(t *testing.T, sessionID string) api.Assignment {
 	info, _, err := epoch.Decode(blob)
 	require.NoError(t, err)
 
-	return initiatorAssignment(sessionID, epoch.Compute(epoch.NewNonce(), info), blob)
+	return initiatorAssignment(domain, sessionID, epoch.Compute(epoch.NewNonce(), info), blob)
 }

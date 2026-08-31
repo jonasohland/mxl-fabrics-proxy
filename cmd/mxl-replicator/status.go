@@ -48,9 +48,9 @@ type NodeSummary struct {
 	// the agent being down; only the lease goes away (§7.1).
 	Leased int `json:"leased"`
 
-	// NoOutputRoot counts nodes that cannot be a replication destination at all — worth
+	// NoWritableArea names the nodes that cannot be a replication destination at all — worth
 	// surfacing because it is the first thing to check behind an INVALID request (§10.6).
-	NoOutputRoot []string `json:"no_output_root,omitempty"`
+	NoWritableArea []string `json:"no_writable_area,omitempty"`
 }
 
 type Unhealthy struct {
@@ -70,7 +70,7 @@ func (c *StatusCmd) Run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	requests, err := user.Requests(ctx)
+	requests, err := user.Requests(ctx, "")
 	if err != nil {
 		return err
 	}
@@ -90,8 +90,8 @@ func (c *StatusCmd) Run(ctx context.Context) error {
 		if node.Live {
 			summary.Nodes.Leased++
 		}
-		if len(node.Capabilities.OutputRoots) == 0 {
-			summary.Nodes.NoOutputRoot = append(summary.Nodes.NoOutputRoot, node.Name)
+		if !writable(node.Capabilities.Areas) {
+			summary.Nodes.NoWritableArea = append(summary.Nodes.NoWritableArea, node.Name)
 		}
 		if !node.Live {
 			summary.Unhealthy = append(summary.Unhealthy, Unhealthy{
@@ -134,10 +134,10 @@ func printSummary(summary Summary) {
 	fmt.Fprintf(out, "paths\t%d  %s\n", total(summary.Paths), states(summary.Paths))
 	fmt.Fprintf(out, "sessions\t%d running\n", summary.Sessions)
 
-	if len(summary.Nodes.NoOutputRoot) > 0 {
+	if len(summary.Nodes.NoWritableArea) > 0 {
 		fmt.Fprintln(out)
-		fmt.Fprintf(out, "%s: no output root, cannot be a destination\n",
-			strings.Join(summary.Nodes.NoOutputRoot, ", "))
+		fmt.Fprintf(out, "%s: no writable area, cannot be a destination\n",
+			strings.Join(summary.Nodes.NoWritableArea, ", "))
 	}
 
 	switch {
@@ -216,19 +216,34 @@ func renderAs(format string, value any, text func()) error {
 	}
 }
 
+// writable reports whether any of a node's areas grants writing, which is what makes it a
+// replication destination at all (§10.6).
+func writable(areas []api.Area) bool {
+	for _, area := range areas {
+		if area.Write {
+			return true
+		}
+	}
+	return false
+}
+
 func printRequestTable(requests []api.Request) {
 	if len(requests) == 0 {
 		fmt.Println("no replication requests")
 		return
 	}
 
-	out := table("NAME", "STATE", "PATHS", "SOURCE", "DESTINATIONS", "LABELS")
+	// NAMESPACE is a column of its own rather than being folded into the name, because a request's
+	// ID is the pair (§9.3) and two requests called `cam1` in two partitions are two rows that
+	// would otherwise be indistinguishable.
+	out := table("NAMESPACE", "NAME", "STATE", "PATHS", "SOURCE", "DESTINATIONS", "LABELS")
 	for _, request := range requests {
-		fmt.Fprintf(out, "%s\t%s\t%s\t%s\t%s\t%s\n",
+		fmt.Fprintf(out, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+			request.NamespaceOrDefault(),
 			request.Name,
 			request.Status.State,
 			pathSummary(request.Status),
-			request.Source.Node+"/"+request.Source.Domain,
+			request.Source.Node+"/"+request.Source.Domain.String(),
 			destinations(request.Destinations),
 			sortedLabels(request.Labels),
 		)
@@ -239,7 +254,7 @@ func printRequestTable(requests []api.Request) {
 	// width. Printed under the table rather than in it.
 	for _, request := range requests {
 		if request.Status.Reason != "" && request.Status.State != api.StateActive {
-			fmt.Printf("\n%s: %s\n", request.Name, request.Status.Reason)
+			fmt.Printf("\n%s: %s\n", request.ID, request.Status.Reason)
 		}
 	}
 }

@@ -133,8 +133,24 @@ type Result struct {
 	// requests that share it.
 	Paths map[string]api.Path
 
-	// Requests is each request's aggregate status, keyed by request ID.
-	Requests map[string]api.RequestStatus
+	// Requests is each request's aggregate status, keyed by request ID (§9.3).
+	Requests map[api.RequestID]api.RequestStatus
+
+	// Structural is the subset of invalidity that refuses a `POST` (§7.2).
+	//
+	// **Validation is per path, not per request.** A request whose selector expands onto twenty
+	// paths, one of which conflicts, is not refused: it reports nineteen paths and one invalid one
+	// with its reason. What the `POST` refuses is what is structurally wrong — a destination naming
+	// an area no node advertises, a spec that cannot expand at all — and that is exactly a
+	// *destination-level* validation failure, which is decidable from the request plus node
+	// registrations and says nothing about which flows happen to exist.
+	//
+	// The conflicts deliberately absent from this map are the ones that depend on the rest of the
+	// fleet: [api.ReasonFlowConflict], [api.ReasonLoop] and [api.ReasonNamespaceOverlap]. A
+	// selector's expansion is not something its author can enumerate before submitting it, so
+	// refusing the whole request for one bad pairing would put the author at the mercy of fleet
+	// state they did not write.
+	Structural map[api.RequestID]validate.Result
 
 	// Frozen is the set of session IDs whose assignments were carried forward untouched because
 	// an endpoint's agent is not currently leased. Reported so the loop can log it: it is the
@@ -157,11 +173,16 @@ type pathPlan struct {
 
 	// requests are the IDs sharing this path — the refcount. The path is torn down when the
 	// last of them goes away (§3).
-	requests []string
+	requests []api.RequestID
 
 	// since is the creation time of the earliest request on this path, and decides who loses a
 	// conflict: the older path is the one probably already carrying media.
 	since time.Time
+
+	// namespace is the partition this path's workers are labelled with (§12). A path shared
+	// across namespaces takes the last merged one — arbitrary, but deterministic, which is what
+	// matters: a value that differed between replicas would restart workers.
+	namespace string
 
 	// The settings the sharing requests agreed on. Where they disagree, the resolution is
 	// always the conservative one — see [pathPlan.merge].
@@ -239,6 +260,8 @@ func (p *pathPlan) merge(record state.RequestRecord, pin api.ProviderPin, defaul
 		p.teardown = teardown
 	}
 
+	p.namespace = spec.NamespaceOrDefault()
+
 	if len(spec.Labels) > 0 {
 		if p.labels == nil {
 			p.labels = map[string]string{}
@@ -261,7 +284,7 @@ func (p *pathPlan) tornDown(idle time.Duration) bool {
 // A request fans out to many destinations (§9.1) and they are validated, negotiated and expanded
 // independently — so this, not the request, is the unit the reconciler works on.
 type leg struct {
-	request string
+	request api.RequestID
 	record  state.RequestRecord
 	dst     api.Destination
 	pin     api.ProviderPin
@@ -282,11 +305,17 @@ func identicalFailures(failures []legFailure) bool {
 
 // legFailure is one destination a request cannot use, kept per request so that the failure is
 // reported even when the leg expands to no paths at all — a request whose source flow does not
-// exist yet and whose destination has no output root is INVALID, not WAITING, and saying WAITING
-// would let a POST through that §7.2 requires be rejected.
+// exist yet and whose destination names an area the node does not advertise is INVALID, not
+// WAITING, and saying WAITING would let a POST through that §7.2 requires be rejected.
 type legFailure struct {
 	Destination api.Destination
 	Result      validate.Result
+
+	// Structural marks a failure that follows from the request and the node registrations alone,
+	// which is the only kind a `POST` refuses (§7.2). Destination validation is structural;
+	// losing a namespace overlap is not, because it depends on what *another* request expanded
+	// onto and on inventory neither author controls. See [Result.Structural].
+	Structural bool
 }
 
 // Compute derives everything from one fleet snapshot.
@@ -298,7 +327,8 @@ func Compute(fleet *state.Fleet, cfg Config) *Result {
 		Sessions:    map[string]state.SessionRecord{},
 		Assignments: map[string]api.AssignmentSet{},
 		Paths:       map[string]api.Path{},
-		Requests:    map[string]api.RequestStatus{},
+		Requests:    map[api.RequestID]api.RequestStatus{},
+		Structural:  map[api.RequestID]validate.Result{},
 	}
 
 	// Every registered node gets an assignment set, including an empty one. A node with nothing
@@ -312,8 +342,22 @@ func Compute(fleet *state.Fleet, cfg Config) *Result {
 	sessionsByPath := indexSessionsByPath(fleet)
 
 	plans := map[string]*pathPlan{}
-	requestPaths := map[string][]string{}
-	invalidLegs := map[string][]legFailure{}
+	requestPaths := map[api.RequestID][]string{}
+	invalidLegs := map[api.RequestID][]legFailure{}
+
+	// The expansion depends on the source and its two selectors only, so it is the same for every
+	// leg of one request and is worth resolving once — a request with eight destinations would
+	// otherwise walk the whole inventory eight times. It is also where the exclusion list comes
+	// from, and that has to be per request rather than per leg.
+	expansions := map[api.RequestID]expansion{}
+	expansionOf := func(record state.RequestRecord) expansion {
+		if cached, ok := expansions[record.ID]; ok {
+			return cached
+		}
+		out := expand(fleet, record.Spec)
+		expansions[record.ID] = out
+		return out
+	}
 
 	// The negotiated interface config for a path, kept only for the single-request case — see
 	// [negotiatedFor]. Keyed by path rather than by request because a request now contributes one
@@ -323,28 +367,20 @@ func Compute(fleet *state.Fleet, cfg Config) *Result {
 	// A leg is one (request, destination) pair: the unit validation and expansion work on, since
 	// a request fans out and its destinations succeed or fail independently (§9.1).
 	var valid, invalid []leg
-	for _, id := range sortedKeys(fleet.Requests) {
+	for _, id := range fleet.SortedRequestIDs() {
 		record := fleet.Requests[id].Value
 		for _, dst := range record.Spec.Destinations {
-			agreed, root, bad := validate.Destination(record.Spec, dst, fleet, cfg.Negotiate)
-
-			// The *resolved* root goes into the identity, not the one the request spelled
-			// (§10.6). A request that named the node's only root and one that omitted it are the
-			// same destination and must produce one path; two naming different roots are two
-			// paths, which is what lets the conflict between them be reported rather than
-			// silently merged.
-			//
-			// It is carried even for a rejected leg, when validation got far enough to resolve
-			// one: a shadow path must have the same identity as the real path would, or a session
-			// already running on it is invisible to this reconcile and its assignments are
-			// withdrawn.
-			dst.Root = root
+			// *The resolved output root used to be written back onto the destination here*, so
+			// that a shadow path carried the same identity a real one would. A destination's
+			// identity is complete the moment the request is read now — the area is the first
+			// segment of the domain's name (§10.6) — so there is nothing left to resolve into it.
+			agreed, bad := validate.Destination(record.Spec, dst, fleet, cfg.Negotiate)
 
 			this := leg{request: id, record: record, dst: dst, pin: record.Spec.ProviderFor(dst), agreed: agreed}
 			if bad != nil {
 				this.bad = bad
 				invalid = append(invalid, this)
-				invalidLegs[id] = append(invalidLegs[id], legFailure{Destination: dst, Result: *bad})
+				invalidLegs[id] = append(invalidLegs[id], legFailure{Destination: dst, Result: *bad, Structural: true})
 				continue
 			}
 			valid = append(valid, this)
@@ -372,7 +408,16 @@ func Compute(fleet *state.Fleet, cfg Config) *Result {
 	// Valid legs first, so that a path a valid one wants is never turned into a shadow path by an
 	// invalid leg that happens to name the same edge.
 	for _, leg := range valid {
-		for _, address := range expand(fleet, leg.record.Spec) {
+		for _, address := range expansionOf(leg.record).addresses {
+			// **A self-pair a label selector produced is elided, not rejected** (§7.2, §10.7). A
+			// named source resolving to the destination is a typo and is refused by
+			// [validate.Destination]; a *matched* one is the selector doing what it was asked to,
+			// and refusing the whole request would put its author at the mercy of which domains
+			// happen to carry a label. The rest of the expansion stands.
+			if address.Node == leg.dst.Node && address.Domain == leg.dst.DomainName() {
+				continue
+			}
+
 			identity := state.PathIdentity{Source: address, Destination: leg.dst}
 			pid := identity.ID()
 
@@ -391,8 +436,8 @@ func Compute(fleet *state.Fleet, cfg Config) *Result {
 	//
 	// The naive reading of INVALID is "this cannot work, remove it", and applied to a leg whose
 	// session is already carrying media that is a teardown triggered by a *registration* changing
-	// — an attachment that disappeared while an agent re-probed, a domain mapping edited on the
-	// destination node. A request is durable intent and the system never cancels one on its
+	// — an attachment that disappeared while an agent re-probed, an area edited on the destination
+	// node. A request is durable intent and the system never cancels one on its
 	// behalf (§11); validity governs admission, and cancelling is the user's job.
 	//
 	// So an invalid leg still expands, onto shadow paths that retain whatever session exists and
@@ -400,7 +445,11 @@ func Compute(fleet *state.Fleet, cfg Config) *Result {
 	// planned above and establish normally, which is the point of validating per destination.
 	for _, leg := range invalid {
 		verdict := *leg.bad
-		for _, address := range expand(fleet, leg.record.Spec) {
+		for _, address := range expansionOf(leg.record).addresses {
+			if address.Node == leg.dst.Node && address.Domain == leg.dst.DomainName() {
+				continue
+			}
+
 			identity := state.PathIdentity{Source: address, Destination: leg.dst}
 			pid := identity.ID()
 			requestPaths[leg.request] = append(requestPaths[leg.request], pid)
@@ -409,7 +458,7 @@ func Compute(fleet *state.Fleet, cfg Config) *Result {
 				// Some other leg wants this path and is valid; it decides.
 				continue
 			}
-			plans[pid] = &pathPlan{id: pid, identity: identity, invalid: &verdict, requests: []string{leg.request}}
+			plans[pid] = &pathPlan{id: pid, identity: identity, invalid: &verdict, requests: []api.RequestID{leg.request}}
 		}
 	}
 
@@ -442,7 +491,13 @@ func Compute(fleet *state.Fleet, cfg Config) *Result {
 		result.Assignments[node] = sorted
 	}
 
-	summarise(result, fleet, requestPaths, invalidLegs)
+	// Every request's expansion, whether or not it produced a leg: a request whose only
+	// destination is invalid still has an exclusion list, and an operator looking at why it has no
+	// paths needs it.
+	for _, id := range fleet.SortedRequestIDs() {
+		expansionOf(fleet.Requests[id].Value)
+	}
+	summarise(result, fleet, requestPaths, invalidLegs, expansions)
 	return result
 }
 
@@ -485,33 +540,144 @@ func negotiatedFor(plan *pathPlan, perPath map[string]negotiate.Result, fleet *s
 	return result, nil
 }
 
-// expand turns a selector into source flow addresses (§9.1).
-//
-// A pinned flow ID always expands to exactly one address, whether or not the flow is currently
-// observed: a request naming a specific flow deserves to be told that *that* flow is missing,
-// rather than silently having no paths at all. A group hint expands to whatever matches, and
-// matching nothing is simply a request with zero paths.
-func expand(fleet *state.Fleet, spec api.RequestSpec) []api.FlowAddress {
-	src := spec.Source
-	switch spec.Source.Select.Kind() {
-	case api.SelectorKindFlow:
-		return []api.FlowAddress{{Node: src.Node, Domain: src.Domain, Flow: spec.Source.Select.Flow}}
+// expansion is what a request's source selectors resolve to: the flow addresses to replicate, and
+// what was deliberately left out.
+type expansion struct {
+	addresses []api.FlowAddress
 
-	case api.SelectorKindGroupHint:
-		var out []api.FlowAddress
-		for _, flow := range fleet.Flows(src.Node, src.Domain) {
-			if flow.GroupHint == nil || !spec.Source.Select.GroupHint.Matches(*flow.GroupHint) {
-				continue
-			}
-			out = append(out, api.FlowAddress{Node: src.Node, Domain: src.Domain, Flow: flow.ID})
+	// excluded is populated **here and nowhere downstream**, because by the time a PathStatus
+	// exists the excluded flow is gone: the expander is the only place that ever holds both the
+	// match and the reason it was dropped (§9.1).
+	excluded []api.Exclusion
+	dropped  int
+}
+
+func (e *expansion) exclude(node, domain, flow string, reason api.ExclusionReason) {
+	if len(e.excluded) >= api.MaxExclusions {
+		e.dropped++
+		return
+	}
+	e.excluded = append(e.excluded, api.Exclusion{Node: node, Domain: domain, Flow: flow, Reason: reason})
+}
+
+// expand resolves a request's source — first to a set of domains, then to flow addresses within
+// them (§9.1, §10.7).
+//
+// # The domain half
+//
+// A **named** domain is taken as written: it addresses any domain, including one another request
+// replicates into, which is how `A→B→C` is written (§10.6). A **label selector** matches domains
+// on the source node by equality, ANDed — and then three things happen that the named form does
+// not do, each of which is load-bearing:
+//
+//  1. The match is intersected with the domains inventory actually reports for that node. A label
+//     on an unobserved domain is inert and must expand to nothing rather than to a path that
+//     cannot resolve (§10.7).
+//  2. Every flow the source node's own target worker is writing is dropped. **That is the whole of
+//     the self-amplification guard, and it is one line** — the point of having moved it to the
+//     flow, where the directory-granular version was a pruning pass in the agent.
+//  3. A pairing whose resolved `(node, domain)` equals a destination's is *elided* rather than
+//     refusing the request (§7.2, §10.7): a selector matching the destination's own domain is not
+//     a typo, it is the selector doing what it was asked to, and refusing would put its author at
+//     the mercy of which domains happen to carry a label. That elision lives in the caller, which
+//     is where the destination is known.
+//
+// Step 1 and step 2 look redundant and are not: step 1 is about a domain that is not *there*,
+// step 2 about a flow that must not be *matched*. Collapsing them loses the pending-label case,
+// which is the case §10.7's "before or after" is entirely about.
+//
+// # The flow half
+//
+// A pinned flow ID always expands to exactly one address per domain, whether or not the flow is
+// currently observed: a request naming a specific flow deserves to be told that *that* flow is
+// missing, rather than silently having no paths at all. A group hint expands to whatever matches,
+// and matching nothing is simply a request with zero paths.
+func expand(fleet *state.Fleet, spec api.RequestSpec) expansion {
+	src := spec.Source
+	var out expansion
+
+	switch src.Domain.Kind() {
+	case api.DomainSelectorKindName:
+		// Taken as written, and **not** filtered by provenance: naming a domain explicitly reaches
+		// everything, which is what keeps chaining possible (§10.7).
+		out.addresses = flowsIn(fleet, src, src.Domain.Name.String(), false, &out)
+
+	case api.DomainSelectorKindLabels:
+		for _, domain := range matchingDomains(fleet, src) {
+			out.addresses = append(out.addresses, flowsIn(fleet, src, domain, true, &out)...)
 		}
-		sort.Slice(out, func(i, j int) bool { return out[i].Flow < out[j].Flow })
-		return out
 
 	default:
 		// Not reachable through the API — a selector with no kind cannot be decoded or encoded
-		// (§9.1) — but a stored record is not a decode away from anything, so it is handled
+		// (§10.7) — but a stored record is not a decode away from anything, so it is handled
 		// rather than assumed.
+		return expansion{}
+	}
+
+	sort.Slice(out.addresses, func(i, j int) bool {
+		if out.addresses[i].Domain != out.addresses[j].Domain {
+			return out.addresses[i].Domain < out.addresses[j].Domain
+		}
+		return out.addresses[i].Flow < out.addresses[j].Flow
+	})
+	return out
+}
+
+// matchingDomains is steps 1 and 2 of the domain half: the label match, intersected with what the
+// node actually reports.
+//
+// Ordered, because everything downstream of a reconcile has to be deterministic across replicas.
+func matchingDomains(fleet *state.Fleet, src api.Source) []string {
+	entry, observing := fleet.Inventory[src.Node]
+	if !observing {
+		return nil
+	}
+
+	var out []string
+	for _, observed := range entry.Value.Domains {
+		name := observed.Domain.String()
+		if src.Domain.Matches(fleet.LabelsFor(src.Node, name)) {
+			out = append(out, name)
+		}
+	}
+	slices.Sort(out)
+	return out
+}
+
+// flowsIn resolves the flow selector within one domain.
+//
+// skipReplicated is step 2 of the domain half — the self-amplification guard — and it is set for a
+// label match and clear for a named domain. Its omission is invisible in every test that does not
+// involve a node being both a source and a destination (§17), which is why that is the test to
+// write first rather than last.
+func flowsIn(fleet *state.Fleet, src api.Source, domain string, skipReplicated bool, out *expansion) []api.FlowAddress {
+	switch src.Select.Kind() {
+	case api.SelectorKindFlow:
+		if skipReplicated {
+			// A pinned flow expands whether or not it is observed, so the guard can only apply to
+			// one this node *is* reporting — which is exactly the case it exists for.
+			if flow, observed := fleet.Flow(src.Node, domain, src.Select.Flow); observed && flow.Replicated {
+				out.exclude(src.Node, domain, src.Select.Flow, api.ExclusionSelfOutput)
+				return nil
+			}
+		}
+		return []api.FlowAddress{{Node: src.Node, Domain: domain, Flow: src.Select.Flow}}
+
+	case api.SelectorKindGroupHint:
+		var addresses []api.FlowAddress
+		for _, flow := range fleet.Flows(src.Node, domain) {
+			if flow.GroupHint == nil || !src.Select.GroupHint.Matches(*flow.GroupHint) {
+				continue
+			}
+			if skipReplicated && flow.Replicated {
+				out.exclude(src.Node, domain, flow.ID, api.ExclusionSelfOutput)
+				continue
+			}
+			addresses = append(addresses, api.FlowAddress{Node: src.Node, Domain: domain, Flow: flow.ID})
+		}
+		return addresses
+
+	default:
 		return nil
 	}
 }
@@ -524,7 +690,7 @@ func expand(fleet *state.Fleet, spec api.RequestSpec) []api.FlowAddress {
 // agent — and "no flows matched" is indistinguishable from "I cannot see this node". Without
 // this, a control-plane-visible agent restart would withdraw every assignment on that node's
 // peers, which is media stopping because a lease expired.
-func retain(fleet *state.Fleet, plans map[string]*pathPlan, requestPaths map[string][]string, sessionsByPath map[string][]state.SessionRecord, defaultTeardown time.Duration) {
+func retain(fleet *state.Fleet, plans map[string]*pathPlan, requestPaths map[api.RequestID][]string, sessionsByPath map[string][]state.SessionRecord, defaultTeardown time.Duration) {
 	for _, pid := range sortedKeys(sessionsByPath) {
 		if _, planned := plans[pid]; planned {
 			continue
@@ -546,9 +712,15 @@ func retain(fleet *state.Fleet, plans map[string]*pathPlan, requestPaths map[str
 		// their status rather than as an orphan. A group hint cannot be re-evaluated without the
 		// inventory that went away with the agent, so a matching source and destination is as
 		// close as this can get — and it is only ever used for display.
-		for _, rid := range sortedKeys(fleet.Requests) {
+		for _, rid := range fleet.SortedRequestIDs() {
 			spec := fleet.Requests[rid].Value.Spec
-			if spec.Source.Node != identity.Source.Node || spec.Source.Domain != identity.Source.Domain {
+			// A named source has to match; a label selector cannot be re-evaluated without the
+			// inventory that went away with the agent, so it is taken as plausible. This is only
+			// ever used for display (see the comment above).
+			if spec.Source.Node != identity.Source.Node {
+				continue
+			}
+			if name := spec.Source.Domain.Name; name != nil && name.String() != identity.Source.Domain {
 				continue
 			}
 			if spec.Source.Select.Kind() == api.SelectorKindFlow && spec.Source.Select.Flow != identity.Source.Flow {
@@ -582,28 +754,33 @@ func matchingDestination(spec api.RequestSpec, path api.Destination) (api.Destin
 
 // sameDestination compares a *request's* destination with a *path's*.
 //
-// They are the same type but not the same thing: a request names a root or leaves it to be
-// resolved, while a path identity always carries the resolved one (§10.6). So a request that
-// spells no root matches any root, and one that spells a root matches only that root. A plain
-// struct comparison would fail for the common single-root request, which is how a retained path
-// would end up attributed to nothing and reported as an orphan.
+// *This used to have to allow for a request that spelled no output root matching a path carrying
+// the resolved one.* A destination always names its area now (§10.6), so the two are the same
+// value and the comparison is an equality.
 func sameDestination(spec, path api.Destination) bool {
-	if spec.Node != path.Node || !slices.Equal(spec.Domain, path.Domain) {
-		return false
-	}
-	return spec.Root == "" || spec.Root == path.Root
+	return spec.Node == path.Node && spec.Domain.Equal(path.Domain)
 }
 
 // namespaceOverlaps finds legs that would put a second request from one namespace onto a path
 // another request in that namespace already holds. It returns a verdict per index into `legs`;
 // an index absent from the map is fine.
 //
-// **Why this is a rule and not a rendering problem.** A path is refcounted and works perfectly
-// well held by two requests — that is what makes fan-in expressible (§9.1, §10.6). What it
-// breaks is the claim a *namespace* makes: that its requests are a partition, so a set of them
-// can be drawn as a matrix where a cell means one edge and clearing it stops exactly the paths
-// in it. Sharing inside a namespace makes two cells one edge, silently, and the interface has no
-// honest way to draw it. Across namespaces sharing stays legal and untouched.
+// **Opt-in, per namespace** (§9.3). A namespace whose `paths` policy is `shared` — the default,
+// and the zero value — is skipped entirely: two of its requests holding one path share one path,
+// one session and one worker pair, which is §9.1's refcounting working exactly as designed.
+//
+// **Why this is a rule at all, and why it is the one that is optional.** A path is refcounted and
+// works perfectly well held by two requests — that is what makes fan-in expressible (§9.1,
+// §10.6). What overlap breaks is the claim a *namespace* makes: that its requests are a
+// partition, so a set of them can be drawn as a matrix where a cell means one edge and clearing
+// it stops exactly the paths in it. Sharing inside a namespace makes two cells one edge,
+// silently, and the interface has no honest way to draw it.
+//
+// That is legibility, not integrity, and it gives the governing line: conflict rules that protect
+// data integrity are mandatory ([api.ReasonFlowConflict] — two initiators into one ring buffer,
+// never optional for anybody); conflict rules that protect legibility belong to whoever is doing
+// the reading. Hence a policy on the namespace and a default that does not surprise a client
+// which never heard of the rule.
 //
 // **Precedence is by UpdatedAt, then request ID**, which is not the same choice
 // [validate.Conflicts] makes and the difference is deliberate. There it is creation time,
@@ -626,8 +803,24 @@ func sameDestination(spec, path api.Destination) bool {
 // why this lives in the reconcile rather than only in validation.
 func namespaceOverlaps(fleet *state.Fleet, legs []leg) map[int]validate.Result {
 	type claim struct {
-		request string
+		request api.RequestID
 		ns      string
+	}
+
+	// Nothing to police in a permissive namespace, and skipping it here rather than filtering the
+	// result keeps the expansion work off the common path entirely.
+	exclusive := map[string]bool{}
+	interesting := false
+	for _, leg := range legs {
+		ns := leg.record.Spec.NamespaceOrDefault()
+		if _, known := exclusive[ns]; known {
+			continue
+		}
+		exclusive[ns] = fleet.Namespace(ns).Paths.Exclusive()
+		interesting = interesting || exclusive[ns]
+	}
+	if !interesting {
+		return nil
 	}
 
 	order := make([]int, len(legs))
@@ -639,18 +832,18 @@ func namespaceOverlaps(fleet *state.Fleet, legs []leg) map[int]validate.Result {
 		if !x.UpdatedAt.Equal(y.UpdatedAt) {
 			return x.UpdatedAt.Before(y.UpdatedAt)
 		}
-		return x.ID < y.ID
+		return x.ID.String() < y.ID.String()
 	})
 
 	// The expansion depends on the source and selector only, so it is the same for every leg of
 	// one request and is worth resolving once — a request with eight destinations otherwise
 	// walks the whole inventory eight times.
-	expansions := map[string][]api.FlowAddress{}
+	expansions := map[api.RequestID][]api.FlowAddress{}
 	expansionOf := func(record state.RequestRecord) []api.FlowAddress {
 		if cached, ok := expansions[record.ID]; ok {
 			return cached
 		}
-		addresses := expand(fleet, record.Spec)
+		addresses := expand(fleet, record.Spec).addresses
 		expansions[record.ID] = addresses
 		return addresses
 	}
@@ -660,7 +853,10 @@ func namespaceOverlaps(fleet *state.Fleet, legs []leg) map[int]validate.Result {
 
 	for _, i := range order {
 		leg := legs[i]
-		ns := leg.record.Spec.Namespace()
+		ns := leg.record.Spec.NamespaceOrDefault()
+		if !exclusive[ns] {
+			continue
+		}
 
 		for _, address := range expansionOf(leg.record) {
 			pid := state.PathIdentity{Source: address, Destination: leg.dst}.ID()
@@ -678,7 +874,7 @@ func namespaceOverlaps(fleet *state.Fleet, legs []leg) map[int]validate.Result {
 					Code: api.ReasonNamespaceOverlap,
 					Message: fmt.Sprintf(
 						"request %q already replicates %s/%s %s to %s in namespace %q",
-						prior.request, address.Node, address.Domain, address.Flow,
+						prior.request.Name, address.Node, address.Domain, address.Flow,
 						leg.dst.Endpoint(), ns),
 				}
 			}
@@ -726,9 +922,15 @@ func (b *builder) status(plan *pathPlan) api.PathStatus {
 }
 
 func (b *builder) emit(plan *pathPlan, status api.PathStatus, session *api.Session) {
+	// Rendered `<namespace>/<name>`, which is the joinable spelling: a path's refcount list is
+	// read against `GET /v1/requests`, and a bare name would be ambiguous across namespaces (§9.3).
+	refs := make([]string, 0, len(plan.requests))
+	for _, id := range plan.requests {
+		refs = append(refs, id.String())
+	}
 	b.result.Paths[plan.id] = api.Path{
 		PathStatus: status,
-		Requests:   slices.Compact(slices.Sorted(slices.Values(plan.requests))),
+		Requests:   slices.Compact(slices.Sorted(slices.Values(refs))),
 		Session:    session,
 	}
 }
@@ -992,7 +1194,6 @@ func (b *builder) assign(plan *pathPlan, record state.SessionRecord, flow api.Fl
 
 	common := api.Assignment{
 		SessionID:                   record.ID,
-		Domain:                      dst.DomainName(),
 		FlowID:                      src.Flow,
 		Interface:                   record.Interface,
 		Fabric:                      record.Fabric,
@@ -1000,16 +1201,17 @@ func (b *builder) assign(plan *pathPlan, record state.SessionRecord, flow api.Fl
 		SchedPrio:                   plan.schedPrio,
 		IdleTimeout:                 api.Millis(b.cfg.IdleTimeout),
 		ConnectTimeout:              api.Millis(b.cfg.ConnectTimeout),
+		Namespace:                   plan.namespace,
 		Labels:                      plan.labels,
 	}
 
 	target := common
 	target.Role = api.RoleTarget
-	// The root and the element list are meaningful for a target only: together they are what the
-	// destination agent resolves the output directory from. An initiator's domain is an *input*
-	// one, resolved through what its node observes, and does not decompose (§10.6).
-	target.Root = dst.Root
-	target.OutputDomain = slices.Clone(dst.Domain)
+	// **One domain field, the same structured value for both roles** (§10.6). The destination's
+	// is the request's own; the source's is looked up from the agent's report below, so that the
+	// structure always comes from whoever computed the identity rather than from splitting a
+	// rendered string.
+	target.Domain = dst.Domain
 	target.FlowDef = append(json.RawMessage(nil), flow.Definition...)
 	b.append(dst.Node, target)
 
@@ -1026,9 +1228,18 @@ func (b *builder) assign(plan *pathPlan, record state.SessionRecord, flow api.Fl
 		return
 	}
 
+	// The source domain's structure comes from the source agent's own inventory report. It is
+	// there by construction — the path exists because that node reported this flow in this domain
+	// — and the fallback is a degenerate one-element domain rather than a parse, because parsing a
+	// domain string anywhere outside the manifest is the thing §10.6 forbids.
+	sourceDomain, ok := b.fleet.Domain(src.Node, src.Domain)
+	if !ok {
+		return
+	}
+
 	initiator := common
 	initiator.Role = api.RoleInitiator
-	initiator.Domain = src.Domain
+	initiator.Domain = sourceDomain
 	initiator.Epoch = status.Epoch
 	initiator.TargetInfo = status.TargetInfo
 	initiator.Peer = &api.PeerEndpoint{Node: dst.Node, Address: status.Address, Service: status.Service}
@@ -1090,7 +1301,7 @@ var aggregateOrder = []api.State{
 	api.StateActive,
 }
 
-func summarise(result *Result, fleet *state.Fleet, requestPaths map[string][]string, invalid map[string][]legFailure) {
+func summarise(result *Result, fleet *state.Fleet, requestPaths map[api.RequestID][]string, invalid map[api.RequestID][]legFailure, expansions map[api.RequestID]expansion) {
 	for id := range fleet.Requests {
 		spec := fleet.Requests[id].Value.Spec
 
@@ -1107,7 +1318,22 @@ func summarise(result *Result, fleet *state.Fleet, requestPaths map[string][]str
 			counts[path.State]++
 		}
 
-		status := api.RequestStatus{Paths: statuses, Counts: counts}
+		status := api.RequestStatus{
+			Paths:           statuses,
+			Counts:          counts,
+			Excluded:        expansions[id].excluded,
+			ExcludedDropped: expansions[id].dropped,
+		}
+
+		// What a POST refuses, and only that. A namespace overlap sits in `invalid[id]` beside the
+		// structural failures and is deliberately absent here: it makes the request INVALID and
+		// does not make it unacceptable, because it depends on another request's expansion (§7.2).
+		for _, failure := range invalid[id] {
+			if failure.Structural {
+				result.Structural[id] = failure.Result
+				break
+			}
+		}
 
 		switch {
 		case len(invalid[id]) > 0:
@@ -1152,7 +1378,7 @@ func summarise(result *Result, fleet *state.Fleet, requestPaths map[string][]str
 				status.Reason = "source agent " + spec.Source.Node + " is not currently leased"
 			} else {
 				status.ReasonCode = api.ReasonFlowNotFound
-				status.Reason = "the selector matches no flow in " + spec.Source.Node + "/" + spec.Source.Domain
+				status.Reason = "the selector matches no flow in " + spec.Source.Node + "/" + spec.Source.Domain.String()
 			}
 		default:
 			for _, candidate := range aggregateOrder {

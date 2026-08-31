@@ -100,48 +100,79 @@ func TestKnownProvider(t *testing.T) {
 	assert.False(t, KnownProvider(Provider("")))
 }
 
-// Configured is descriptive now: it says where a domain came from, and nothing keys authority
-// off it (§10.6). An agent that omits it still reports false — "discovered" — which is what
-// GET /v1/nodes/{node}/domains renders.
-func TestDomainMappingConfiguredDefaultsToDiscovered(t *testing.T) {
-	t.Parallel()
-
-	var mapping DomainMapping
-	require.NoError(t, json.Unmarshal([]byte(`{"name":"ingest"}`), &mapping))
-	assert.False(t, mapping.Configured)
-}
-
-// Where the fail-closed direction moved to. Destination authority is now the node's advertised
-// output roots, and a registration that names none is not a replication destination at all —
-// which is both the default and what an older agent, or one whose operator has not opted in,
-// reports (§10.6, §13).
-func TestCapabilitiesWithoutOutputRootsAreNotADestination(t *testing.T) {
+// Where the fail-closed direction lives. Both grants default false, so a registration that names
+// no area at all offers no sources and accepts no destinations — which is both the default and
+// what an agent whose operator has not opted in reports (§10.6, §13).
+func TestCapabilitiesWithoutAreasAreNeitherSourceNorDestination(t *testing.T) {
 	t.Parallel()
 
 	var caps Capabilities
 	require.NoError(t, json.Unmarshal([]byte(`{"fabrics":[],"sched_prio":true}`), &caps))
-	assert.Empty(t, caps.OutputRoots)
-	assert.Nil(t, caps.FindRoot(""), "the empty root name is not a root")
-	assert.Nil(t, caps.FindRoot("fast"))
+	assert.Empty(t, caps.Areas)
+	assert.Nil(t, caps.FindArea(""), "the empty area name is not an area")
+	assert.Nil(t, caps.FindArea("fast"))
+
+	// And an area decoded with no grants spelled out grants nothing, rather than defaulting to
+	// something an operator did not ask for.
+	var area Area
+	require.NoError(t, json.Unmarshal([]byte(`{"name":"fast","path":"/dev/shm/mxl"}`), &area))
+	assert.False(t, area.Read)
+	assert.False(t, area.Write)
 }
 
-func TestCapabilitiesFindRoot(t *testing.T) {
+func TestCapabilitiesFindArea(t *testing.T) {
 	t.Parallel()
 
-	caps := Capabilities{OutputRoots: []OutputRoot{
-		{Name: "fast", Path: "/dev/shm/mxl"},
-		{Name: "bulk", Path: "/mnt/nvme/mxl"},
+	caps := Capabilities{Areas: []Area{
+		{Name: "fast", Path: "/dev/shm/mxl", Read: true, Write: true},
+		{Name: "bulk", Path: "/mnt/nvme/mxl", Read: true},
 	}}
 
-	require.NotNil(t, caps.FindRoot("bulk"))
-	assert.Equal(t, "/mnt/nvme/mxl", caps.FindRoot("bulk").Path)
-	assert.Nil(t, caps.FindRoot("slow"))
+	require.NotNil(t, caps.FindArea("bulk"))
+	assert.Equal(t, "/mnt/nvme/mxl", caps.FindArea("bulk").Path)
+	assert.False(t, caps.FindArea("bulk").Write, "the grants travel with the entry")
+	assert.Nil(t, caps.FindArea("slow"))
 
-	// A path is advertised for diagnostics but is never required: the server sends a root *name*
-	// to an agent and the agent resolves it, exactly as with a domain name (§10.2).
-	encoded, err := json.Marshal(OutputRoot{Name: "fast"})
+	// A path is advertised for diagnostics but is never required: the server sends an area *name*
+	// to an agent and the agent resolves it, exactly as with a domain's elements (§10.2).
+	encoded, err := json.Marshal(Area{Name: "fast", Read: true})
 	require.NoError(t, err)
-	assert.Equal(t, `{"name":"fast"}`, string(encoded))
+	assert.Equal(t, `{"name":"fast","read":true,"write":false}`, string(encoded))
+}
+
+// The identity grammar itself: `<area>/<elements>`, injective because neither half can contain the
+// separator, and nesting compared within one area (§10.6).
+func TestDomainIdentity(t *testing.T) {
+	t.Parallel()
+
+	d := Domain{Area: "fast", Elements: []string{"studio-a", "cam1"}}
+	assert.Equal(t, "fast/studio-a/cam1", d.String())
+	require.NoError(t, d.Valid())
+
+	assert.True(t, d.Equal(Domain{Area: "fast", Elements: []string{"studio-a", "cam1"}}))
+	assert.False(t, d.Equal(Domain{Area: "bulk", Elements: []string{"studio-a", "cam1"}}),
+		"two areas holding one element list are two domains, which is the whole point")
+
+	// Nesting is an exact slice prefix, so `studio-ab` is not a child of `studio-a` — the trap the
+	// string spelling of this question has to work around.
+	assert.True(t, d.NestedIn(Domain{Area: "fast", Elements: []string{"studio-a"}}))
+	assert.False(t, d.NestedIn(Domain{Area: "fast", Elements: []string{"studio-ab"}}))
+	assert.False(t, d.NestedIn(Domain{Area: "bulk", Elements: []string{"studio-a"}}),
+		"two areas are two directory trees and cannot nest")
+	assert.False(t, d.NestedIn(d), "a domain does not nest in itself")
+
+	// An area's own directory is not a domain, and a domain names an area.
+	assert.Error(t, Domain{Area: "fast"}.Valid())
+	assert.Error(t, Domain{Elements: []string{"ingest"}}.Valid())
+	assert.Error(t, Domain{Area: "fast/inner", Elements: []string{"ingest"}}.Valid())
+
+	// The rendered cap counts the area segment. Measuring only the elements would let it loosen
+	// silently the day the area moved into the name (§10.6).
+	long := Domain{Area: strings.Repeat("a", MaxDomainNameLen), Elements: []string{}}
+	for range MaxDomainElements {
+		long.Elements = append(long.Elements, strings.Repeat("b", MaxDomainNameLen))
+	}
+	assert.Error(t, long.Valid())
 }
 
 // The rule every layer defers to, pinned once here because it is shared: the server rejects a

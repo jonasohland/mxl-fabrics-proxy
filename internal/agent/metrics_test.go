@@ -72,7 +72,9 @@ func TestWorkerMetricsCarryTheirLabels(t *testing.T) {
 	// The labels this project applies itself, in one line, because the exposition is what a
 	// dashboard is actually written against. `format` is the definition's
 	// "urn:x-nmos:format:video" with the urn prefix taken off, which is what anyone would type.
-	const own = `direction="target",domain="ingest",flow_id="5592a23b-0974-45bb-9388-89ea81c42537",format="video",media_type="",session="s1"`
+	// `namespace` is a dimension of its own now that a namespace is a real property (§9.3, §12),
+	// and it sits between media_type and session because the encoder sorts label names.
+	const own = `direction="target",domain="fast/ingest",flow_id="5592a23b-0974-45bb-9388-89ea81c42537",format="video",media_type="",namespace="default",session="s1"`
 	assert.Contains(t, body, `mxl_grains_total{`+own+`} 300`)
 	assert.Contains(t, body, `mxl_octets_total{`+own+`} 1.234567e+06`)
 
@@ -244,8 +246,8 @@ func TestTwoSessionsOnOneFlowDoNotCollide(t *testing.T) {
 	// Same domain and same flow id on both, which is what initiatorAssignmentFor produces —
 	// only the session differs.
 	h.server.assign("edge-01",
-		initiatorAssignmentFor(t, "s1"),
-		initiatorAssignmentFor(t, "s2"))
+		initiatorAssignmentFor(t, h.name, "s1"),
+		initiatorAssignmentFor(t, h.name, "s2"))
 
 	h.eventually("both initiators to be running", func() bool {
 		return h.launcher.Find("s1", api.RoleInitiator) != nil &&

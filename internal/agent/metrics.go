@@ -299,6 +299,8 @@ func labelValues(names []string, t target) []string {
 			values = append(values, t.spec.FlowID)
 		case metrics.LabelSession:
 			values = append(values, t.spec.SessionID)
+		case metrics.LabelNamespace:
+			values = append(values, t.spec.Namespace)
 		case metrics.LabelFormat:
 			values = append(values, t.flow.format)
 		case metrics.LabelMediaType:

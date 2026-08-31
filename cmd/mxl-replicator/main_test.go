@@ -139,43 +139,44 @@ func TestServerIdleDefaults(t *testing.T) {
 	assert.NotZero(t, idle.IdleTeardown)
 }
 
-// §16: the legacy `-m name=/path` syntax carries over byte-compatible.
-func TestAgentDomainMappingSyntaxIsLegacyCompatible(t *testing.T) {
-	cli, _ := mustParse(t, agentOnly(
-		"-m", "cameras=/dev/shm/mxl0",
-		"--agent-map-domain", "ingest=/dev/shm/mxl1",
-	)...)
-
-	assert.Equal(t, map[string]string{
-		"cameras": "/dev/shm/mxl0",
-		"ingest":  "/dev/shm/mxl1",
-	}, cli.Run.AgentOpts.Domains)
+// §6, §16: **there is no `-m` flag any more.** A domain is discovered under a search path and
+// named through the API, so a flag that still tried to map one is refused as unknown rather than
+// silently doing nothing.
+func TestTheMapDomainFlagIsGone(t *testing.T) {
+	for _, flag := range []string{"-m", "--agent-map-domain"} {
+		_, _, err := parse(t, agentOnly(flag, "cameras=/dev/shm/mxl0")...)
+		assert.Error(t, err, "flag %q should be unknown", flag)
+	}
 }
 
-// The write side is opt-in and separate from -m: an input mapping is a directory the node has, an
-// output root is a place replication may create directories (§10.6).
-func TestAgentOutputRoots(t *testing.T) {
+// **One noun with two independent grants** (§10.6). *This supersedes `--search-path` and
+// `--output-root` as separate flags*: they were already counterparts and already had to be read as
+// a pair.
+func TestAgentAreas(t *testing.T) {
 	cli, _ := mustParse(t, agentOnly(
-		"--agent-output-root", "fast=/dev/shm/mxl",
-		"--agent-output-root", "bulk=/mnt/nvme/mxl",
+		"--agent-area", "media=/dev/shm/mxl:r",
+		"--agent-area", "fast=/dev/shm/mxl/replicated:rw",
+		"--agent-area", "bulk=/mnt/nvme/mxl:w",
 	)...)
 
-	assert.Equal(t, map[string]string{
-		"fast": "/dev/shm/mxl",
-		"bulk": "/mnt/nvme/mxl",
-	}, cli.Run.AgentOpts.OutputRoots)
+	assert.Equal(t, []api.Area{
+		{Name: "media", Path: "/dev/shm/mxl", Read: true},
+		{Name: "fast", Path: "/dev/shm/mxl/replicated", Read: true, Write: true},
+		{Name: "bulk", Path: "/mnt/nvme/mxl", Write: true},
+	}, cli.Run.AgentOpts.areas)
 
-	// No default. A node that has not opted in is not a replication destination, which is the
-	// correct posture for the one flag that grants the control plane write authority.
+	// No default. A node that has declared no area offers no sources and accepts no destinations,
+	// which is the correct posture for the one flag that grants this project any authority over a
+	// host's filesystem.
 	cli, _ = mustParse(t, agentOnly()...)
-	assert.Empty(t, cli.Run.AgentOpts.OutputRoots)
+	assert.Empty(t, cli.Run.AgentOpts.areas)
 }
 
-// One directory must have exactly one name on this node (§10.6). Checked on the merged
-// configuration, which is the only place that sees roots, input mappings and search paths at
-// once — and checked with the same function the destination resolver is built from, so the rule
-// an operator is held to and the rule that decides where a worker writes cannot drift apart.
-func TestAgentOutputRootValidation(t *testing.T) {
+// **The one merged rule left is that no two areas share a path** (§10.6). *This supersedes a table
+// of overlap rules — a search path inside a root, a search path equal to a root, a root above an
+// input mapping.* Checked with the same function the destination resolver is built from, so the
+// rule an operator is held to and the rule that decides where a worker writes cannot drift apart.
+func TestAgentAreaValidation(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		args []string
@@ -183,53 +184,34 @@ func TestAgentOutputRootValidation(t *testing.T) {
 	}{
 		{
 			name: "relative path",
-			args: []string{"--agent-output-root", "fast=dev/shm/mxl"},
+			args: []string{"--agent-area", "fast=dev/shm/mxl:rw"},
 			want: "absolute",
 		},
 		{
 			name: "the filesystem root",
-			args: []string{"--agent-output-root", "fast=/"},
-			want: "the filesystem root is not an output root",
+			args: []string{"--agent-area", "fast=/:rw"},
+			want: "the filesystem root is not an area",
 		},
 		{
 			name: "name that is not a plain element",
-			args: []string{"--agent-output-root", "../fast=/dev/shm/mxl"},
-			want: "output root name",
+			args: []string{"--agent-area", "../fast=/dev/shm/mxl:rw"},
+			want: "area name",
 		},
 		{
-			name: "two roots on one directory",
-			args: []string{"--agent-output-root", "fast=/dev/shm/mxl", "--agent-output-root", "bulk=/dev/shm/mxl"},
-			want: "an output root twice",
+			name: "no grants",
+			args: []string{"--agent-area", "fast=/dev/shm/mxl"},
+			want: "names no grants",
 		},
 		{
-			name: "nested roots",
-			args: []string{"--agent-output-root", "fast=/dev/shm/mxl", "--agent-output-root", "bulk=/dev/shm/mxl/inner"},
-			want: "overlap",
+			name: "same name twice",
+			args: []string{"--agent-area", "fast=/dev/shm/mxl:rw", "--agent-area", "fast=/mnt/nvme/mxl:rw"},
+			want: "declared twice",
 		},
 		{
-			// A root that *is* an input domain's directory. Distinct from a root *above* one,
-			// which is permitted — the collision that allows is one exact path, and it is refused
-			// where it is precise, at resolution time (§10.6).
-			name: "root that is an input mapping",
-			args: []string{"--agent-output-root", "fast=/dev/shm/mxl0", "-m", "cameras=/dev/shm/mxl0"},
-			want: `overlaps domain "cameras"`,
-		},
-		{
-			name: "root under an input mapping",
-			args: []string{"--agent-output-root", "fast=/dev/shm/mxl0/inner", "-m", "cameras=/dev/shm/mxl0"},
-			want: `overlaps domain "cameras"`,
-		},
-		{
-			// Discovery is pruned at every root, so a search path that *is* one could never find
-			// anything. Distinct from a search path *above* a root, which is permitted below.
-			name: "root that is a search path",
-			args: []string{"--agent-output-root", "fast=/dev/shm/mxl", "--agent-search-path", "/dev/shm/mxl"},
-			want: "is also search path",
-		},
-		{
-			name: "root over a search path",
-			args: []string{"--agent-output-root", "fast=/dev/shm/mxl", "--agent-search-path", "/dev/shm/mxl/inner"},
-			want: "contains search path",
+			// The one arrangement the innermost-area rule cannot decide.
+			name: "two areas on one directory",
+			args: []string{"--agent-area", "fast=/dev/shm/mxl:rw", "--agent-area", "bulk=/dev/shm/mxl:r"},
+			want: "an area twice",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -238,20 +220,19 @@ func TestAgentOutputRootValidation(t *testing.T) {
 		})
 	}
 
-	// **A search path may be an ancestor of a root**: one MXL area per host, part of it discovered
-	// and part of it written, which is the layout the pruning exists to make safe (§10.6).
+	// **Nesting is legal**, in either direction, and is the one-MXL-area-per-host layout an
+	// operator actually writes: the innermost containing area names a directory (§10.6).
 	_, _, err := parse(t, agentOnly(
-		"--agent-search-path", "/dev/shm/mxl",
-		"--agent-output-root", "fast=/dev/shm/mxl/replicated",
-		"-m", "cameras=/dev/shm/mxl/cameras",
+		"--agent-area", "media=/dev/shm/mxl:r",
+		"--agent-area", "fast=/dev/shm/mxl/replicated:rw",
 	)...)
 	assert.NoError(t, err)
 
-	// A sibling whose path is a string prefix of a root's is not an overlap. Same boundary the
+	// A sibling whose path is a string prefix of another's is not a collision. Same boundary the
 	// destination resolver is careful about, on the configuration side.
 	_, _, err = parse(t, agentOnly(
-		"--agent-output-root", "fast=/dev/shm/mxl",
-		"-m", "cameras=/dev/shm/mxl-other",
+		"--agent-area", "fast=/dev/shm/mxl:rw",
+		"--agent-area", "other=/dev/shm/mxl-other:r",
 	)...)
 	assert.NoError(t, err)
 }
@@ -261,8 +242,9 @@ func TestAgentValidation(t *testing.T) {
 	_, _, err := parse(t, "run", "--agent", "--agent-node", "edge-01")
 	assert.ErrorContains(t, err, "--server is required")
 
-	// A relative domain path is ambiguous against the agent's working directory.
-	_, _, err = parse(t, agentOnly("-m", "cameras=dev/shm/mxl0")...)
+	// A relative area path is ambiguous against the agent's working directory, which is not
+	// something the operator controls under a DaemonSet.
+	_, _, err = parse(t, agentOnly("--agent-area", "media=dev/shm/mxl0:r")...)
 	assert.ErrorContains(t, err, "absolute")
 
 	_, _, err = parse(t, agentOnly("--agent-port-range", "24999-24000")...)
@@ -421,13 +403,9 @@ func TestAgentConfigFileIsMergedWithFlags(t *testing.T) {
 node: from-file
 server:
   - http://from-file:2283
-domains:
-  cameras: /dev/shm/mxl0
-  ingest:
-    url: mxl:///dev/shm/mxl1
-output_roots:
-  - name: fast
-    path: /dev/shm/mxl
+areas:
+  - {name: media, path: /dev/shm/mxl-in, read: true}
+  - {name: fast,  path: /dev/shm/mxl, read: true, write: true}
 fabrics:
   - provider: tcp
     fabric: dc1
@@ -438,35 +416,28 @@ fabrics:
 	cli, _ := mustParse(t, "run", "--agent", "--agent-config", path)
 	assert.Equal(t, "from-file", cli.Run.AgentOpts.Node)
 	assert.Equal(t, []string{"http://from-file:2283"}, cli.Run.AgentOpts.Server)
-	assert.Equal(t, map[string]string{
-		"cameras": "/dev/shm/mxl0",
-		"ingest":  "/dev/shm/mxl1",
-	}, cli.Run.AgentOpts.Domains)
-	assert.Equal(t, map[string]string{"fast": "/dev/shm/mxl"}, cli.Run.AgentOpts.OutputRoots)
+	assert.Equal(t, []api.Area{
+		{Name: "media", Path: "/dev/shm/mxl-in", Read: true},
+		{Name: "fast", Path: "/dev/shm/mxl", Read: true, Write: true},
+	}, cli.Run.AgentOpts.areas)
 	require.Len(t, cli.Run.AgentOpts.fabrics, 1)
 
 	// Flags override the scalars and merge into the collections.
 	cli, _ = mustParse(t, "run", "--agent", "--agent-config", path,
 		"--agent-node", "edge-01",
 		"--agent-server", "http://ctrl:2283",
-		"-m", "cameras=/dev/shm/other",
-		"-m", "archive=/dev/shm/mxl2",
-		"--agent-output-root", "fast=/dev/shm/faster",
-		"--agent-output-root", "bulk=/mnt/nvme/mxl",
+		"--agent-area", "bulk=/mnt/nvme/mxl:rw",
 		"--agent-fabric", "provider=shm")
 
 	assert.Equal(t, "edge-01", cli.Run.AgentOpts.Node)
 	assert.Equal(t, []string{"http://ctrl:2283"}, cli.Run.AgentOpts.Server)
-	assert.Equal(t, map[string]string{
-		"cameras": "/dev/shm/other",
-		"ingest":  "/dev/shm/mxl1",
-		"archive": "/dev/shm/mxl2",
-	}, cli.Run.AgentOpts.Domains)
-	// Roots merge by name like domains do: the flag redirects "fast" and adds "bulk".
-	assert.Equal(t, map[string]string{
-		"fast": "/dev/shm/faster",
-		"bulk": "/mnt/nvme/mxl",
-	}, cli.Run.AgentOpts.OutputRoots)
+	// Areas accumulate, file first — the same rule fabric attachments follow, so a file describing
+	// a host's layout stays extensible on the command line.
+	assert.Equal(t, []api.Area{
+		{Name: "media", Path: "/dev/shm/mxl-in", Read: true},
+		{Name: "fast", Path: "/dev/shm/mxl", Read: true, Write: true},
+		{Name: "bulk", Path: "/mnt/nvme/mxl", Read: true, Write: true},
+	}, cli.Run.AgentOpts.areas)
 	require.Len(t, cli.Run.AgentOpts.fabrics, 2)
 }
 
@@ -479,38 +450,4 @@ func TestAgentConfigFileErrorsAtParseTime(t *testing.T) {
 
 	_, _, err := parse(t, agentOnly("--agent-config", path)...)
 	assert.ErrorContains(t, err, "fabircs")
-}
-
-// A root above an input domain is a legal layout: one directory holding this node's domains, some
-// read and some written. The exact path is refused as an output domain at resolution time, which
-// is where the collision is precise (§10.6).
-func TestARootMayBeTheParentOfAnInputDomain(t *testing.T) {
-	t.Parallel()
-
-	_, _, err := parse(t, agentOnly(
-		"--agent-output-root", "fast=/dev/shm/mxl",
-		"-m", "cameras=/dev/shm/mxl/cameras",
-	)...)
-	assert.NoError(t, err)
-}
-
-// An input domain name shares a namespace with every output domain on this node, so it takes the
-// same rule (§10.6). Without it, `-m a/b=…` and `domain: a/b` would be two things with one
-// address — and the server's collision check compares exactly those two strings.
-func TestAgentDomainNameValidation(t *testing.T) {
-	t.Parallel()
-
-	for _, name := range []string{"a/b", "with space", ".hidden", "-flag", ".."} {
-		_, _, err := parse(t, agentOnly("-m", name+"=/dev/shm/mxl0")...)
-		assert.Error(t, err, "domain name %q should be refused", name)
-	}
-
-	// §16 promised `-m name=/path` carries over byte-compatible from the legacy proxy. The syntax
-	// does, and so does every name shape a deployment actually uses; what changed is that a name
-	// legacy would have accepted but this cannot address is now a startup error rather than one
-	// that works until something collides with it.
-	for _, name := range []string{"mxl0", "cameras", "loopback-in", "studio_a", "a.b"} {
-		_, _, err := parse(t, agentOnly("-m", name+"=/dev/shm/mxl0")...)
-		assert.NoError(t, err, "domain name %q should be accepted", name)
-	}
 }

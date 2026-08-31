@@ -17,11 +17,13 @@ import (
 // The five kinds are the five nouns of §3, and they are deliberately not collapsed:
 //
 //	node      a host, one agent — what it advertises and what it is currently running
+//	domain    a place on a node that holds flows: its labels, and what is in it
 //	flow      a UUID. Unique to the media, *not* to a location: after replication the same
 //	          flow exists on both nodes, so this lists every place it is
 //	request   durable user intent, and what its selector currently expands to
 //	path      the deduplicated edge a request expands onto, and its refcount
 //	session   the concrete worker pair realising a path: epoch, negotiated fabric, both ends
+//	namespace a request partition: its path policy, and what is in it
 //
 // Path and session stay separate even though they are 1:1 in practice, because they are separate
 // layers (§4): a path is derived state that outlives any particular session, and a session is
@@ -30,8 +32,12 @@ import (
 //
 // `status` is the overview; this is the detail. There is deliberately no third way to see either.
 type DescribeCmd struct {
-	Kind string `arg:"" enum:"node,flow,request,path,session" help:"One of: node, flow, request, path, session."`
-	Name string `arg:"" help:"The node name, flow id, request name, path id or session id."`
+	Kind string `arg:"" enum:"node,domain,flow,request,path,session,namespace" help:"One of: node, domain, flow, request, path, session, namespace."`
+	Name string `arg:"" help:"The node name, <node>:<area>/<elements>, flow id, request name, path id, session id or namespace."`
+
+	// Namespace scopes a request name, because a request's ID is the (namespace, name) pair
+	// (§9.3). Ignored for every other kind, whose names are fleet-wide.
+	Namespace string `short:"n" help:"Namespace the request is in. Applies to requests; defaults to 'default'."`
 
 	ClientFlags `embed:""`
 	OutputFlags `embed:""`
@@ -46,6 +52,8 @@ func (c *DescribeCmd) Run(ctx context.Context) error {
 	switch c.Kind {
 	case "node":
 		return c.node(ctx, api)
+	case "domain":
+		return c.domain(ctx, api)
 	case "flow":
 		return c.flow(ctx, api)
 	case "request":
@@ -54,6 +62,8 @@ func (c *DescribeCmd) Run(ctx context.Context) error {
 		return c.path(ctx, api)
 	case "session":
 		return c.session(ctx, api)
+	case "namespace":
+		return c.namespace(ctx, api)
 	default:
 		return fmt.Errorf("unknown kind %q", c.Kind)
 	}
@@ -85,10 +95,17 @@ func (c *DescribeCmd) node(ctx context.Context, user *client.Client) error {
 		return err
 	}
 
-	return c.render(node, func() { printNode(*node, paths.Paths) })
+	// Domains are **observed**, not registered (§6), so they are a second request rather than a
+	// field on the node.
+	domains, err := user.NodeDomains(ctx, c.Name)
+	if err != nil {
+		return err
+	}
+
+	return c.render(node, func() { printNode(*node, domains, paths.Paths) })
 }
 
-func printNode(node api.Node, paths []api.Path) {
+func printNode(node api.Node, domains *api.DomainList, paths []api.Path) {
 	out := table()
 	defer flush(out)
 
@@ -123,27 +140,32 @@ func printNode(node api.Node, paths []api.Path) {
 		fmt.Fprintf(out, "  port range\t%s (inbound)\n", node.Capabilities.PortRange)
 	}
 
-	heading(out, "  Input domains")
-	if len(node.Domains) == 0 {
-		fmt.Fprintln(out, "    none")
+	// **Observed domains**, since there is no configured mapping to report (§6). A domain this
+	// project replicates *into* is listed like any other: a domain is a place rather than a
+	// direction (§10.6).
+	heading(out, "  Domains")
+	switch {
+	case domains == nil:
+	case domains.Settling:
+		fmt.Fprintln(out, "    still settling: this node has not reported yet")
+	case len(domains.Domains) == 0:
+		fmt.Fprintln(out, "    none observed")
 	}
-	for _, domain := range node.Domains {
-		origin := "configured"
-		if !domain.Configured {
-			origin = "discovered"
+	if domains != nil {
+		for _, domain := range domains.Domains {
+			fmt.Fprintf(out, "    %s\t%d flow(s)\n", domain.Domain, len(domain.Flows))
 		}
-		fmt.Fprintf(out, "    %s\t%s\t%s\n", domain.Name, origin, domain.Path)
 	}
 
-	// The whole of the authority the API has over this node's filesystem (§10.6, §13). A node
-	// with none is not a replication destination at all, and saying so plainly here saves an
-	// operator working it out from an INVALID request later.
-	heading(out, "  Output roots")
-	if len(node.Capabilities.OutputRoots) == 0 {
-		fmt.Fprintln(out, "    not a replication destination")
+	// Between them the whole of this project's authority over this node's filesystem (§10.6,
+	// §13). A node with no writable area is not a replication destination at all, and saying so
+	// plainly here saves an operator working it out from an INVALID request later.
+	heading(out, "  Areas")
+	if len(node.Capabilities.Areas) == 0 {
+		fmt.Fprintln(out, "    none: no sources, no destinations")
 	}
-	for _, root := range node.Capabilities.OutputRoots {
-		fmt.Fprintf(out, "    %s\t%s\n", root.Name, root.Path)
+	for _, area := range node.Capabilities.Areas {
+		fmt.Fprintf(out, "    %s\t%s\t%s\n", area.Name, grantText(area), area.Path)
 	}
 
 	heading(out, "  Fabric attachments")
@@ -196,6 +218,91 @@ func printNodePaths(out *tabwriter.Writer, name string, paths []api.Path) {
 	fmt.Fprintln(out, "  ROLE\tPATH\tFLOW\tPEER\tSTATE")
 	for _, row := range rows {
 		fmt.Fprintf(out, "  %s\t%s\t%s\t%s\t%s\n", row[0], row[1], row[2], row[3], row[4])
+	}
+}
+
+// --- domain ---------------------------------------------------------------------------------
+
+// domain describes one `(node, domain)`: what it is called, what is in it, and — for each flow —
+// whether **this node is the one writing it** (§10.7).
+//
+// That last column is not decoration. A label selector never matches a flow this project is
+// itself writing, so a broad selector silently skips those flows; under the superseded
+// directory-granular rule the whole domain was missing from the source's options, which an
+// operator could at least see as a category. Per-flow provenance is finer and therefore *less*
+// obvious, and this is where that cost is paid back (§10.7).
+func (c *DescribeCmd) domain(ctx context.Context, user *client.Client) error {
+	node, domain, err := parseLabelTarget(c.Name)
+	if err != nil {
+		return err
+	}
+
+	list, err := user.NodeDomains(ctx, node)
+	if err != nil {
+		return err
+	}
+
+	var found *api.DomainInfo
+	for i := range list.Domains {
+		if list.Domains[i].Domain.Equal(domain) {
+			found = &list.Domains[i]
+		}
+	}
+	if found == nil {
+		return fmt.Errorf("node %q has no domain %q, observed or labelled", node, domain)
+	}
+
+	return c.render(found, func() { printDomain(node, *found, list.Settling) })
+}
+
+func printDomain(node string, domain api.DomainInfo, settling bool) {
+	out := table()
+	defer flush(out)
+
+	fmt.Fprintf(out, "Domain    %s:%s\n", node, domain.Domain)
+	fmt.Fprintf(out, "  area\t%s\n", domain.Domain.Area)
+
+	switch {
+	case settling:
+		fmt.Fprintf(out, "  observed\tstill settling: this node has not reported yet\n")
+	case domain.Observed:
+		fmt.Fprintf(out, "  observed\tyes\n")
+	default:
+		// A label on a domain the node does not report is accepted and inert — a pending record,
+		// not an error, and it resolves by itself when a producer appears (§10.7).
+		fmt.Fprintf(out, "  observed\tno: labelled but not reported, a request selecting it waits\n")
+	}
+
+	if name := domain.Name(); name != "" {
+		fmt.Fprintf(out, "  name\t%s (the `name` label, rendered as domain_name in metrics)\n", name)
+	}
+
+	if len(domain.Labels) > 0 {
+		heading(out, "  Labels")
+		for _, key := range sortedKeys(domain.Labels) {
+			fmt.Fprintf(out, "    %s\t%s\n", key, domain.Labels[key])
+		}
+	}
+
+	heading(out, "  Flows")
+	if len(domain.Flows) == 0 {
+		fmt.Fprintln(out, "    none")
+		return
+	}
+	fmt.Fprintln(out, "    FLOW\tPRODUCING\tREPLICATED\tGROUP HINT")
+	for _, flow := range domain.Flows {
+		producing := "idle"
+		if flow.Producing {
+			producing = "yes"
+		}
+		// A flow this node's own target worker is writing is never matched by a label selector,
+		// which is the self-amplification guard (§10.7). Saying so here is what keeps a silently
+		// skipped flow diagnosable.
+		replicated := "no"
+		if flow.Replicated {
+			replicated = "yes: written by this node, so no label selector matches it"
+		}
+		fmt.Fprintf(out, "    %s\t%s\t%s\t%s\n", flow.ID, producing, replicated, groupHintText(flow.GroupHint))
 	}
 }
 
@@ -327,18 +434,76 @@ func describeDefinition(raw json.RawMessage) string {
 // --- request --------------------------------------------------------------------------------
 
 func (c *DescribeCmd) request(ctx context.Context, user *client.Client) error {
-	request, err := user.Request(ctx, c.Name)
+	ns := c.Namespace
+	if ns == "" {
+		ns = api.DefaultNamespace
+	}
+	request, err := user.Request(ctx, api.RequestID{Namespace: ns, Name: c.Name})
 	if err != nil {
 		return err
 	}
 	return c.render(request, func() { printRequest(*request) })
 }
 
+// --- namespace ------------------------------------------------------------------------------
+
+// namespace describes one request partition (§9.3).
+//
+// It lists the requests in it as well as its rules, because the two questions an operator has
+// about a namespace are "what does `paths` say" and "what will stop me deleting this".
+func (c *DescribeCmd) namespace(ctx context.Context, user *client.Client) error {
+	info, err := user.Namespace(ctx, c.Name)
+	if err != nil {
+		return err
+	}
+	requests, err := user.Requests(ctx, c.Name)
+	if err != nil {
+		return err
+	}
+	return c.render(info, func() { printNamespace(*info, requests) })
+}
+
+func printNamespace(info api.NamespaceInfo, requests []api.Request) {
+	out := table()
+	defer flush(out)
+
+	fmt.Fprintf(out, "Namespace %s\n", info.Name)
+	fmt.Fprintf(out, "  paths\t%s\n", pathPolicyText(info.Paths))
+	if info.Description != "" {
+		fmt.Fprintf(out, "  description\t%s\n", info.Description)
+	}
+	if info.Name == api.DefaultNamespace {
+		fmt.Fprintf(out, "  note\tthe default namespace; it cannot be deleted\n")
+	}
+
+	fmt.Fprintln(out)
+	if len(requests) == 0 {
+		fmt.Fprintln(out, "  no requests")
+		return
+	}
+	fmt.Fprintln(out, "  REQUEST\tSOURCE\tSTATE\tPATHS")
+	for _, request := range requests {
+		fmt.Fprintf(out, "  %s\t%s/%s\t%s\t%d\n",
+			request.Name, request.Source.Node, request.Source.Domain,
+			request.Status.State, len(request.Status.Paths))
+	}
+}
+
+// pathPolicyText spells out what the policy means, because the word alone does not say which way
+// round it is.
+func pathPolicyText(policy api.PathPolicy) string {
+	if policy.Exclusive() {
+		return "exclusive — two requests here may not hold one path"
+	}
+	return "shared — requests here may share a path (the default)"
+}
+
 func printRequest(request api.Request) {
 	out := table()
 	defer flush(out)
 
-	fmt.Fprintf(out, "Request   %s\n", request.Name)
+	fmt.Fprintf(out, "Request   %s\n", request.ID)
+	fmt.Fprintf(out, "  namespace\t%s\n", request.NamespaceOrDefault())
 	fmt.Fprintf(out, "  source\t%s/%s %s\n", request.Source.Node, request.Source.Domain, selectorText(request.Source.Select))
 	fmt.Fprintf(out, "  created\t%s (%s ago)\n", request.CreatedAt.Format(time.RFC3339), since(request.CreatedAt))
 	if !request.Provider.IsEmpty() {
@@ -365,17 +530,13 @@ func printRequest(request api.Request) {
 	}
 
 	heading(out, "  Destinations")
-	fmt.Fprintln(out, "  NODE/DOMAIN\tROOT\tPROVIDER")
+	fmt.Fprintln(out, "  NODE/DOMAIN\tPROVIDER")
 	for _, dst := range request.Destinations {
-		root := dst.Root
-		if root == "" {
-			root = "(the node's only one)"
-		}
 		pin := "inherited"
 		if !dst.Provider.IsEmpty() {
 			pin = providerText(dst.Provider)
 		}
-		fmt.Fprintf(out, "  %s\t%s\t%s\n", dst.Endpoint(), root, pin)
+		fmt.Fprintf(out, "  %s\t%s\n", dst.Endpoint(), pin)
 	}
 
 	fmt.Fprintln(out)
@@ -395,6 +556,40 @@ func printRequest(request api.Request) {
 	for _, path := range request.Status.Paths {
 		fmt.Fprintf(out, "  %s\t%s\t%s\t%s\t%s\n",
 			path.ID, path.Source.Flow, path.Destination.Endpoint(), path.State, path.Reason)
+	}
+
+	printExclusions(out, request.Status)
+}
+
+// printExclusions renders what the expansion deliberately left out (§9.1).
+//
+// **Not decoration.** A path that does not exist has no status to carry a reason, so a flow a
+// selector skipped is invisible in a paths-only rendering — and §10.7's self-output rule skips
+// flows deliberately, on a node that is also a replication destination, which is precisely where
+// an operator's broad selector will meet it.
+func printExclusions(out *tabwriter.Writer, status api.RequestStatus) {
+	if len(status.Excluded) == 0 && status.ExcludedDropped == 0 {
+		return
+	}
+
+	heading(out, "  Excluded")
+	for _, excluded := range status.Excluded {
+		fmt.Fprintf(out, "  %s/%s\t%s\t%s\n",
+			excluded.Node, excluded.Domain, excluded.Flow, exclusionText(excluded.Reason))
+	}
+	if status.ExcludedDropped > 0 {
+		// A silent cap reads as "nothing else was excluded", which is the one thing this list must
+		// not say when it is untrue.
+		fmt.Fprintf(out, "  \t\t(and %d more)\n", status.ExcludedDropped)
+	}
+}
+
+func exclusionText(reason api.ExclusionReason) string {
+	switch reason {
+	case api.ExclusionSelfOutput:
+		return "this node writes it: a label selector never matches its own output"
+	default:
+		return string(reason)
 	}
 }
 
@@ -418,9 +613,6 @@ func printPath(path api.Path) {
 	defer flush(out)
 
 	destination := path.Destination.Endpoint()
-	if path.Destination.Root != "" {
-		destination += fmt.Sprintf(" (root %s)", path.Destination.Root)
-	}
 
 	fmt.Fprintf(out, "Path      %s\n", path.ID)
 	fmt.Fprintf(out, "  source\t%s/%s %s\n", path.Source.Node, path.Source.Domain, path.Source.Flow)
@@ -593,6 +785,19 @@ func providerText(pin api.ProviderPin) string {
 		names = append(names, string(provider))
 	}
 	return strings.Join(names, " > ")
+}
+
+// grantText renders an area's two bits the way the flag spells them, so the output and the input
+// read alike.
+func grantText(area api.Area) string {
+	switch {
+	case area.Read && area.Write:
+		return "read+write"
+	case area.Write:
+		return "write"
+	default:
+		return "read"
+	}
 }
 
 func nodeNames(nodes []api.Node) string {

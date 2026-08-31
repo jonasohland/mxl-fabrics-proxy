@@ -136,6 +136,14 @@ const (
 	LabelFormat    = "format"
 	LabelMediaType = "media_type"
 
+	// LabelNamespace is the partition the request behind this session belongs to (§9.3).
+	//
+	// **Deliberately rather than incidentally.** It rode into metrics for free while a namespace
+	// was a user label; now that it is a real property the decision has to be made rather than
+	// inherited. Keep it: knowing which partition a transfer belongs to is a question dashboards
+	// actually ask, it is low cardinality, and it is fixed for a session's life.
+	LabelNamespace = "namespace"
+
 	// LabelQuantile carries a summary's quantile. Reserved for that, so a user label may not
 	// use it.
 	LabelQuantile = "quantile"
@@ -144,7 +152,7 @@ const (
 // WorkerLabelNames are the labels this project puts on worker metrics itself, in exposition
 // order. A user label may not use one of these, nor [LabelQuantile].
 func WorkerLabelNames() []string {
-	return []string{LabelDirection, LabelDomain, LabelFlowID, LabelSession, LabelFormat, LabelMediaType}
+	return []string{LabelDirection, LabelDomain, LabelFlowID, LabelSession, LabelNamespace, LabelFormat, LabelMediaType}
 }
 
 // labelNameRE is Prometheus' label grammar, which is looser than [nameRE] — this validates

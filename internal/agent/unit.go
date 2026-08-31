@@ -159,9 +159,9 @@ func (u *unit) run(ctx context.Context) {
 func (u *unit) attempt(ctx context.Context) (worker.Exit, bool) {
 	u.setState(api.WorkerStarting, "", "")
 
-	// The worker does not create its domain directory (WRS §5.1). Configured domains are
-	// pre-created at startup (§6.1); this covers one that has been removed since, and costs a
-	// stat when it has not.
+	// The worker does not create its domain directory (WRS §5.1). Writable areas are pre-created
+	// at startup and the reconciler materialises the domain itself (§6.1, §10.6); this covers one
+	// that has been removed since, and costs a stat when it has not.
 	if err := os.MkdirAll(u.spec.DomainPath, 0o755); err != nil {
 		return u.startFailed("create domain directory " + u.spec.DomainPath + ": " + err.Error()), true
 	}

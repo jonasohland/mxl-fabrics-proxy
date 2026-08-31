@@ -360,13 +360,14 @@ func (r *replica) running() bool {
 // --- nodes -------------------------------------------------------------------------------
 
 type nodeOptions struct {
-	// domains are configured domain names. Each gets a directory of its own under this node's
-	// temp directory; the agent creates them.
+	// domains are source domains this node should hold. Each gets a directory of its own under a
+	// search path, seeded with one flow — because a domain is **discovered** now (§6) and the
+	// discoverer only ever reports a directory that already contains one. Its fleet-wide name is
+	// [node.source], never the string passed here.
 	domains []string
 
-	// searchPaths add discovered-domain roots. A discovered domain may be a replication source
-	// and never a destination (§7.2).
-	searchPaths []string
+	// extraAreas are declared alongside this node's own two.
+	extraAreas []api.Area
 
 	// domainRoot places this node's domain directories somewhere other than a temp directory.
 	// The loopback suite puts them on /dev/shm, where a real MXL domain lives.
@@ -407,12 +408,12 @@ type node struct {
 	launcher *fake.Launcher
 	rewriter *assignmentRewriter
 
-	// domains maps the fleet-wide name of an *input* domain to this node's local path, which is
-	// the mapping the rest of the system deliberately never sees (§7.2).
+	// domains maps the short name a test used to the domain's fleet-wide identity, `media/<name>`.
 	domains map[string]string
 
-	// outputRoot is where output domains are materialised on this node, or empty for a node that
-	// is not a replication destination (§10.6).
+	// in is this node's readable area, and outputRoot its writable one — empty for a node that is
+	// not a replication destination (§10.6).
+	in         string
 	outputRoot string
 
 	cancel  context.CancelFunc
@@ -432,35 +433,41 @@ func (f *fleet) addNode(name string, opts nodeOptions) *node {
 	if root == "" {
 		root = f.t.TempDir()
 	}
-	domains := map[string]string{}
-	mappings := make([]inventory.Domain, 0, len(opts.domains))
-	for _, domain := range opts.domains {
-		path := filepath.Join(root, domain)
-		domains[domain] = path
-		mappings = append(mappings, inventory.Domain{Name: domain, Path: path})
-	}
-
-	// A sibling of the input mappings rather than a parent of them: an output root may not
-	// overlap an input mapping, which is the configuration half of one directory having one name
-	// (§10.6). Under `root` so that the loopback suite, which puts its domains on /dev/shm where
-	// a real MXL domain has to live, gets its output root there too.
-	var outputRoots []inventory.Root
+	// Two areas: `<root>/in` is read and `<root>/out` is written. Under `root` so that the
+	// loopback suite, which puts its domains on /dev/shm where a real MXL domain has to live, gets
+	// both there too.
+	in := filepath.Join(root, "in")
 	outputRoot := filepath.Join(root, "out")
+
+	areas := []api.Area{{Name: "media", Path: in, Read: true}}
 	if opts.noOutputRoots {
 		outputRoot = ""
 	} else {
-		outputRoots = []inventory.Root{{Name: "fast", Path: outputRoot}}
+		areas = append(areas, api.Area{Name: "fast", Path: outputRoot, Read: true, Write: true})
+	}
+	areas = append(areas, opts.extraAreas...)
+
+	// Source domains live in the readable area, and each is seeded with a flow so the discoverer's
+	// first scan reports it — it rescans on a fixed 7 s period and has no inotify on a search
+	// path, so a directory created later would not appear until long after a test has finished
+	// with it.
+	domains := map[string]string{}
+	for _, domain := range opts.domains {
+		path := filepath.Join(in, domain)
+		require.NoError(f.t, os.MkdirAll(path, 0o755))
+		seed, err := testutil.RandomVideoFlow(path)
+		require.NoError(f.t, err)
+		require.NoError(f.t, seed.Create())
+		domains[domain] = "media/" + domain
 	}
 
 	var built *agent.Agent
 	inv, err := inventory.New(inventory.Options{
-		Domains:     mappings,
-		SearchPaths: opts.searchPaths,
-		OutputRoots: outputRoots,
-		Interval:    inventoryInterval,
-		IdleAfter:   inventoryIdleAfter,
-		Logger:      discard(),
-		OnChange:    func() { built.Notify() },
+		Areas:     areas,
+		Interval:  inventoryInterval,
+		IdleAfter: inventoryIdleAfter,
+		Logger:    discard(),
+		OnChange:  func() { built.Notify() },
 	})
 	require.NoError(f.t, err)
 
@@ -497,9 +504,7 @@ func (f *fleet) addNode(name string, opts nodeOptions) *node {
 	// Applied after the override, so a test replacing the fabric list does not accidentally turn
 	// its node into something that cannot receive at all — a different rejection from the one it
 	// is testing.
-	for _, r := range outputRoots {
-		capabilities.OutputRoots = append(capabilities.OutputRoots, api.OutputRoot{Name: r.Name, Path: r.Path})
-	}
+	capabilities.Areas = append(capabilities.Areas, areas...)
 
 	// The fake launcher is built either way: a node driving a real worker keeps it unused, and
 	// its accessors then report nothing, which is what a test asserting on real processes wants
@@ -548,6 +553,7 @@ func (f *fleet) addNode(name string, opts nodeOptions) *node {
 		launcher:   fakeLauncher,
 		rewriter:   rewriter,
 		domains:    domains,
+		in:         in,
 		outputRoot: outputRoot,
 		stopped:    make(chan struct{}),
 	}
@@ -615,18 +621,42 @@ func (n *node) stop() {
 	})
 }
 
-// path returns this node's local path for a configured domain.
-// path is where a domain name lives on this node: a configured *input* mapping if there is one,
-// otherwise where an output domain of that name is materialised under this node's root (§10.6).
+// source is the **fleet-wide name** of one of this node's source domains — what a request's
+// `source.domain` has to say to select it (§10.6).
 //
-// The two are different namespaces reached by different code in the agent, and this helper spans
-// them only because a test wants a directory to look in. Nothing in the system resolves a name
-// this way.
+// It is deliberately not the string passed to [nodeOptions.domains]: a domain's identity is
+// `<area>/<elements>`, assigned by the innermost containing area, so a domain a test called
+// `cameras` is `media/cameras` to the fleet.
+func (n *node) source(domain string) api.DomainSelector {
+	name, ok := n.domains[domain]
+	require.True(n.t, ok, "node %s has no source domain %q", n.name, domain)
+	return named(name)
+}
+
+// sourceName is [node.source] rendered, for the assertions that compare against a flow address.
+func (n *node) sourceName(domain string) string {
+	name, ok := n.domains[domain]
+	require.True(n.t, ok, "node %s has no source domain %q", n.name, domain)
+	return name
+}
+
+// named builds a `name` domain selector from the `<area>/<elements>` spelling, splitting it the
+// way a manifest does. Tests are allowed the convenience the rest of the tree is not (§10.6).
+func named(domain string) api.DomainSelector {
+	segments := strings.Split(domain, "/")
+	return api.SelectDomain(api.Domain{Area: segments[0], Elements: segments[1:]})
+}
+
+// path is where a domain lives on this node: one of its source domains if there is one, otherwise
+// where a materialised one of that name goes inside this node's writable area (§10.6).
+//
+// The two are reached by different code in the agent, and this helper spans them only because a
+// test wants a directory to look in. Nothing in the system resolves a name this way.
 func (n *node) path(domain string) string {
-	if path, ok := n.domains[domain]; ok {
-		return path
+	if _, ok := n.domains[domain]; ok {
+		return filepath.Join(n.in, domain)
 	}
-	require.NotEmpty(n.t, n.outputRoot, "node %s has no domain %q and no output root", n.name, domain)
+	require.NotEmpty(n.t, n.outputRoot, "node %s has no domain %q and no writable area", n.name, domain)
 	return filepath.Join(n.outputRoot, domain)
 }
 
@@ -747,7 +777,7 @@ func (f *fleet) do(method, path string, body any) response {
 func (f *fleet) request(spec api.RequestSpec) api.Request {
 	f.t.Helper()
 
-	resp := f.do(http.MethodPost, api.PathRequests, spec)
+	resp := f.do(http.MethodPost, api.NamespaceRequestsPath(spec.NamespaceOrDefault()), spec)
 	require.Equal(f.t, http.StatusCreated, resp.status, "body: %s", resp.body)
 
 	var out api.Request
@@ -756,7 +786,7 @@ func (f *fleet) request(spec api.RequestSpec) api.Request {
 }
 
 // cancel deletes a request.
-func (f *fleet) cancel(id string) {
+func (f *fleet) cancel(id api.RequestID) {
 	f.t.Helper()
 
 	resp := f.do(http.MethodDelete, api.RequestPath(id), nil)

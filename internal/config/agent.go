@@ -1,23 +1,28 @@
 // Package config loads the agent's configuration file.
 //
 // Flags and YAML only, as the legacy proxy had (§6.2). What the agent owns is provisioning-level
-// — node name, domain mappings, fabric attachments, server URLs, port range — and it changes when
-// the host is built rather than when a flow is routed. What it no longer owns is subscriptions:
-// that state lives in the API now, which is what collapses the agent's restart rate down to
-// upgrades and removed the need for the companion reloader binary (§6.1).
+// — node name, filesystem authority, fabric attachments, server URLs, port range — and it changes
+// when the host is built rather than when a flow is routed. What it no longer owns is
+// subscriptions: that state lives in the API now, which is what collapses the agent's restart rate
+// down to upgrades and removed the need for the companion reloader binary (§6.1).
+//
+// **It also no longer owns domain *names*.** *This supersedes a `domains:` block kept
+// byte-compatible with the legacy proxy's, on the reasoning that it costs nothing to keep because
+// it changes when a host is built.* Both halves of that turned out to be wrong (§16): it bought
+// §10.6 an exception and a rule to police it, a rejection code checked at both ends and a
+// `Configured` flag that outlived its purpose — and naming a domain is the one thing on this list
+// an operator does while *routing* rather than while building, where doing it here cost an agent
+// restart and an agent restart re-establishes every flow on the node (§6.1). Domains are
+// discovered and named through the API instead (§6, §10.7).
 //
 // # Why a file at all, when everything else is a flag
 //
-// Two things do not fit on a command line. Fabric attachments are a list of records (§10.1), and
-// the domain block has to stay byte-compatible with the legacy proxy's so that an existing
-// deployment's mapping config carries over unchanged (§16) — which means accepting the shape that
-// config was written in, not only the shape that is convenient now.
+// Fabric attachments are a list of records (§10.1), which does not fit on a command line.
 package config
 
 import (
 	"errors"
 	"fmt"
-	"net/url"
 	"os"
 	"path/filepath"
 	"slices"
@@ -40,165 +45,38 @@ type Agent struct {
 	// Server is one or more control-plane URLs.
 	Server []string `yaml:"server"`
 
-	// Domains is the name→path mapping block, kept legacy-compatible (§16). See [Domains].
-	Domains Domains `yaml:"domains"`
-
-	// SearchPaths are recursively scanned for unconfigured domains. A domain found this way is a
-	// replication source; nothing discovered is ever written to (§7.2, §10.6).
-	SearchPaths []string `yaml:"search_paths"`
-
-	// OutputRoots are the directories replication may create domains under (§10.6):
+	// Areas are the directories this node has designated as somewhere MXL domains live (§10.6):
 	//
-	//	output_roots:
-	//	  - name: fast
-	//	    path: /dev/shm/mxl
-	//	  - name: bulk
-	//	    path: /mnt/nvme/mxl
+	//	areas:
+	//	  - {name: media, path: /dev/shm/mxl,            read: true}
+	//	  - {name: fast,  path: /dev/shm/mxl/replicated, read: true, write: true}
+	//	  - {name: bulk,  path: /mnt/nvme/mxl,           read: true, write: true}
 	//
-	// A list rather than a map, matching §10.6's own spelling and the `fabrics:` block next to
-	// it. No default and no legacy equivalent: this is the opt-in that makes a node a replication
-	// destination, and a node with none configured accepts none.
+	// *This supersedes `search_paths:` and `output_roots:` as separate blocks.* They were already
+	// counterparts and already had to be read as a pair; one noun with two independent grants is
+	// what that was asking for. The arrangement an operator actually reaches for — one MXL area
+	// per host, with a subtree replication may write into — stops being an exception to an overlap
+	// rule and becomes two ordinary areas.
+	//
+	// A list rather than a map, matching §10.6's own spelling and the `fabrics:` block next to it.
+	// No default: a node with no area at all offers no sources and accepts no destinations, which
+	// is the right posture for the one piece of configuration that grants this project any
+	// authority over a host's filesystem.
 	//
 	// Several are supported because "this domain on tmpfs, that one on NVMe" is a real
-	// requirement, and because a root is the natural place to hang a future capacity budget —
+	// requirement, and because an area is the natural place to hang a future capacity budget —
 	// capacity being a property of a mount rather than of a domain.
-	OutputRoots []OutputRoot `yaml:"output_roots"`
+	Areas []api.Area `yaml:"areas"`
 
 	// Fabrics is what this node can be reached on (§10.1). Each entry is a (provider, fabric)
 	// pair plus at most one selector; the join against the worker's probe is [probe.Join].
 	Fabrics []probe.Attachment `yaml:"fabrics"`
 }
 
-// OutputRoot is one entry of the `output_roots:` block.
-//
-// Deliberately not reusing [Domains]' shape: a root is not a domain, and giving them one spelling
-// would invite exactly the confusion §10.6 exists to remove — an input mapping is a directory the
-// node *has*, a root is a place the control plane is permitted to create directories.
-type OutputRoot struct {
-	Name string `yaml:"name"`
-	Path string `yaml:"path"`
-}
-
-// Domains is the domain mapping block.
-//
-// It decodes both the shape this project writes and the shape the legacy proxy's `config.yaml`
-// used, because §16 promises the mapping config carries over:
-//
-//	domains:
-//	  cameras: /dev/shm/mxl0                  # this project
-//	  ingest:
-//	    url: mxl:///dev/shm/mxl1              # legacy
-//	  archive:
-//	    path: /dev/shm/mxl2                   # explicit, equivalent to the scalar form
-//
-// The legacy block carried `node`, `provider` and `labels` alongside `url`. None of them survive
-// the rewrite as domain-level settings — a provider is negotiated per session against declared
-// attachments (§10), and labels belong to a request — and they are ignored rather than rejected
-// so that a legacy file can be pointed at this agent unchanged while its subscriptions are
-// imported separately (M8).
-type Domains map[string]string
-
-// UnmarshalYAML decodes either spelling of a domain mapping.
-func (d *Domains) UnmarshalYAML(node *yaml.Node) error {
-	if node.Kind != yaml.MappingNode {
-		return fmt.Errorf("domains: expected a mapping of name to path, got %s", kindName(node.Kind))
-	}
-
-	out := Domains{}
-	for i := 0; i+1 < len(node.Content); i += 2 {
-		key, value := node.Content[i], node.Content[i+1]
-
-		var name string
-		if err := key.Decode(&name); err != nil {
-			return fmt.Errorf("domains: %w", err)
-		}
-
-		path, err := domainPath(name, value)
-		if err != nil {
-			return err
-		}
-		out[name] = path
-	}
-
-	*d = out
-	return nil
-}
-
-func domainPath(name string, value *yaml.Node) (string, error) {
-	switch value.Kind {
-	case yaml.ScalarNode:
-		var scalar string
-		if err := value.Decode(&scalar); err != nil {
-			return "", fmt.Errorf("domain %q: %w", name, err)
-		}
-		return resolveDomainValue(name, scalar)
-
-	case yaml.MappingNode:
-		// The legacy shape. Unknown keys are ignored on purpose — see the type comment.
-		var mapping struct {
-			URL  string `yaml:"url"`
-			Path string `yaml:"path"`
-		}
-		if err := value.Decode(&mapping); err != nil {
-			return "", fmt.Errorf("domain %q: %w", name, err)
-		}
-		switch {
-		case mapping.Path != "" && mapping.URL != "":
-			return "", fmt.Errorf("domain %q: set either url or path, not both", name)
-		case mapping.Path != "":
-			return resolveDomainValue(name, mapping.Path)
-		case mapping.URL != "":
-			return resolveDomainValue(name, mapping.URL)
-		default:
-			return "", fmt.Errorf("domain %q: neither url nor path is set", name)
-		}
-
-	default:
-		return "", fmt.Errorf("domain %q: expected a path or a mapping, got %s", name, kindName(value.Kind))
-	}
-}
-
-// resolveDomainValue accepts a plain path or an `mxl://` URL.
-func resolveDomainValue(name, value string) (string, error) {
-	value = strings.TrimSpace(value)
-	if value == "" {
-		return "", fmt.Errorf("domain %q: empty path", name)
-	}
-
-	if !strings.Contains(value, "://") {
-		return cleanAbs(name, value)
-	}
-
-	parsed, err := url.Parse(value)
-	if err != nil {
-		return "", fmt.Errorf("domain %q: %w", name, err)
-	}
-	if parsed.Scheme != "mxl" {
-		return "", fmt.Errorf("domain %q: scheme %q is not mxl", name, parsed.Scheme)
-	}
-	if parsed.Host != "" {
-		// The legacy config used `mxl://host/path` for *remote* domains, which this agent has no
-		// business mapping: a domain block names directories on this host, and a remote flow is
-		// addressed by (node, domain) through the API now.
-		return "", fmt.Errorf("domain %q: %q names a host, but a domain mapping is local to this node", name, value)
-	}
-	return cleanAbs(name, parsed.Path)
-}
-
-func cleanAbs(name, path string) (string, error) {
-	if !filepath.IsAbs(path) {
-		// A relative path is interpreted against the agent's working directory, which is not
-		// something the operator controls under a DaemonSet.
-		return "", fmt.Errorf("domain %q: path %q must be absolute", name, path)
-	}
-	return filepath.Clean(path), nil
-}
-
 // LoadAgent reads and merges configuration files, in order.
 //
-// Merge rules, chosen to be predictable rather than clever: **maps merge per key and lists
-// replace**. A later file adding a domain keeps the earlier ones; a later file with a `fabrics:`
-// block replaces the whole list, because an attachment list is one description of a node's
+// Merge rule, chosen to be predictable rather than clever: **a later file replaces a list it
+// declares and leaves alone one it does not**. An attachment list is one description of a node's
 // connectivity and half-overriding it is never what anyone means.
 func LoadAgent(paths ...string) (*Agent, error) {
 	merged := &Agent{}
@@ -220,10 +98,10 @@ func loadAgentFile(path string) (*Agent, error) {
 
 	var loaded Agent
 	decoder := yaml.NewDecoder(strings.NewReader(string(raw)))
-	// Unknown keys are an error: a mistyped `fabrics:` that silently did nothing would present
-	// as a node with no connectivity, which reads as missing hardware rather than a typo. The
-	// one place unknown keys are tolerated is inside a domain mapping, where they are the legacy
-	// file's own fields (see [Domains]).
+	// Unknown keys are an error, with no exceptions: a mistyped `fabrics:` that silently did
+	// nothing would present as a node with no connectivity, which reads as missing hardware rather
+	// than a typo. *The one tolerated case used to be inside a domain mapping, where the keys were
+	// the legacy file's own; that block is gone (§16).*
 	decoder.KnownFields(true)
 	if err := decoder.Decode(&loaded); err != nil && err.Error() != "EOF" {
 		return nil, fmt.Errorf("config: parse %s: %w", path, err)
@@ -242,17 +120,8 @@ func (a *Agent) merge(other *Agent) {
 	if len(other.Fabrics) > 0 {
 		a.Fabrics = slices.Clone(other.Fabrics)
 	}
-	if len(other.SearchPaths) > 0 {
-		a.SearchPaths = slices.Clone(other.SearchPaths)
-	}
-	if len(other.OutputRoots) > 0 {
-		a.OutputRoots = slices.Clone(other.OutputRoots)
-	}
-	for name, path := range other.Domains {
-		if a.Domains == nil {
-			a.Domains = Domains{}
-		}
-		a.Domains[name] = path
+	if len(other.Areas) > 0 {
+		a.Areas = slices.Clone(other.Areas)
 	}
 }
 
@@ -260,30 +129,20 @@ func (a *Agent) merge(other *Agent) {
 func (a *Agent) Validate() error {
 	var errs []error
 
-	for name, path := range a.Domains {
-		// The same rule the inventory applies, so a name is refused where it is typed rather than
-		// several layers down (§10.6).
-		if err := api.ValidDomainName(name); err != nil {
-			errs = append(errs, fmt.Errorf("domains: name %q: %w", name, err))
+	// Per-entry only. Whether two areas share a path is a property of the *merged* configuration —
+	// file plus flags — so it is checked once there rather than twice with one of them seeing half
+	// the picture (§10.6).
+	for i, area := range a.Areas {
+		if err := api.ValidDomainName(area.Name); err != nil {
+			errs = append(errs, fmt.Errorf("areas[%d]: name %q: %w", i, area.Name, err))
 		}
-		if !filepath.IsAbs(path) {
-			errs = append(errs, fmt.Errorf("domain %q: path %q must be absolute", name, path))
+		if !filepath.IsAbs(area.Path) {
+			errs = append(errs, fmt.Errorf("area %q: path %q must be absolute", area.Name, area.Path))
 		}
-	}
-	for _, path := range a.SearchPaths {
-		if !filepath.IsAbs(path) {
-			errs = append(errs, fmt.Errorf("search path %q must be absolute", path))
-		}
-	}
-	// Per-entry only. Whether the roots overlap each other, a domain mapping or a search path is
-	// a property of the *merged* configuration — file plus flags — so it is checked once there
-	// rather than twice with one of them seeing half the picture (§10.6).
-	for i, root := range a.OutputRoots {
-		if err := api.ValidDomainName(root.Name); err != nil {
-			errs = append(errs, fmt.Errorf("output_roots[%d]: name %q: %w", i, root.Name, err))
-		}
-		if !filepath.IsAbs(root.Path) {
-			errs = append(errs, fmt.Errorf("output root %q: path %q must be absolute", root.Name, root.Path))
+		if !area.Read && !area.Write {
+			// A line that does nothing. Refused rather than ignored, because an operator who wrote
+			// it believes the node has an area there (§10.6).
+			errs = append(errs, fmt.Errorf("area %q grants neither read nor write", area.Name))
 		}
 	}
 	for i, attachment := range a.Fabrics {
@@ -293,6 +152,61 @@ func (a *Agent) Validate() error {
 	}
 
 	return errors.Join(errs...)
+}
+
+// ParseArea reads an area from a compact `name=path:grants` flag value (§10.6):
+//
+//	media=/dev/shm/mxl:r
+//	fast=/dev/shm/mxl/replicated:rw
+//	bulk=/mnt/nvme/mxl:w
+//
+// The flag exists for the common case; anything more wants the `areas:` YAML block, which is the
+// precedent `fabrics:` already sets.
+//
+// **The grants are not optional and there is no default.** Both default false in the model
+// (§10.6), so a flag that guessed would be granting this project authority over a host's
+// filesystem on the strength of an omission — and an area granting neither is refused anyway, so
+// omitting them could only ever mean an error with a worse message.
+//
+// The path is taken as everything between the first `=` and the last `:`, so a directory
+// containing `=` works and one containing `:` is the operator's problem, which is the right way
+// round: the grant suffix is this project's syntax and the path is the host's.
+func ParseArea(value string) (api.Area, error) {
+	name, rest, ok := strings.Cut(value, "=")
+	if !ok {
+		return api.Area{}, fmt.Errorf("area %q: expected name=path:grants, e.g. media=/dev/shm/mxl:r", value)
+	}
+
+	path, grants, ok := cutLast(rest, ":")
+	if !ok {
+		return api.Area{}, fmt.Errorf("area %q: names no grants; append :r, :w or :rw", value)
+	}
+
+	area := api.Area{Name: strings.TrimSpace(name), Path: strings.TrimSpace(path)}
+	for _, grant := range grants {
+		switch grant {
+		case 'r':
+			area.Read = true
+		case 'w':
+			area.Write = true
+		default:
+			return api.Area{}, fmt.Errorf("area %q: unknown grant %q, want some of r and w", value, string(grant))
+		}
+	}
+	if !area.Read && !area.Write {
+		return api.Area{}, fmt.Errorf("area %q: names no grants; append :r, :w or :rw", value)
+	}
+	return area, nil
+}
+
+// cutLast is [strings.Cut] on the *last* occurrence, which is what lets a path hold the separator
+// this syntax also uses.
+func cutLast(s, sep string) (before, after string, found bool) {
+	i := strings.LastIndex(s, sep)
+	if i < 0 {
+		return s, "", false
+	}
+	return s[:i], s[i+len(sep):], true
 }
 
 // ParseFabric reads an attachment from a compact `key=value,key=value` flag value:
@@ -341,17 +255,4 @@ func ParseFabric(value string) (probe.Attachment, error) {
 		return probe.Attachment{}, fmt.Errorf("fabric %q: %w", value, err)
 	}
 	return attachment, nil
-}
-
-func kindName(kind yaml.Kind) string {
-	switch kind {
-	case yaml.SequenceNode:
-		return "a list"
-	case yaml.MappingNode:
-		return "a mapping"
-	case yaml.ScalarNode:
-		return "a scalar"
-	default:
-		return "something else"
-	}
 }

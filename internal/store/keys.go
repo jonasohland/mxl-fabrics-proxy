@@ -32,9 +32,29 @@ const (
 	// created them (§7.1).
 	PrefixNodes = PrefixDesired + "nodes/"
 
+	// PrefixNamespaces holds namespace records: the partitions requests are named within, and
+	// what carries whether requests inside one may share a path (§9.3).
+	//
+	// Desired state, so it is not leased, and it is inside the reconciler's single List("") for
+	// free (§7.3) — which is what lets the overlap rule consult a namespace's policy with no new
+	// signalling and no second read.
+	PrefixNamespaces = PrefixDesired + "namespaces/"
+
 	// PrefixRequests holds replication requests: durable user intent, never cancelled by the
 	// system because a session is failing (§11).
+	//
+	// **Two levels**, `<ns>/<name>`, because a request's ID is the pair (§9.1). A flat key space
+	// with a rendered ID in it would work for lookup and fail for listing: "every request in
+	// namespace nab" is a prefix scan here and a full scan with a filter there.
 	PrefixRequests = PrefixDesired + "requests/"
+
+	// PrefixDomains holds the operator's labels on a node's domains (§10.7).
+	//
+	// Under `/desired/`, so it is **not leased** — a label is durable user intent about a node,
+	// written by a user rather than by the agent (§4) — and it is inside the reconciler's single
+	// List("") for free (§7.3). That is what makes a relabel move a request's expansion through
+	// the ordinary reconcile with no new signalling.
+	PrefixDomains = PrefixDesired + "domains/"
 
 	// PrefixLeases holds one key per live agent instance, under that agent's own lease.
 	PrefixLeases = PrefixObserved + "leases/"
@@ -73,8 +93,29 @@ const KeyReconciler = PrefixDerived + "reconciler"
 // NodeKey is the registration for one node.
 func NodeKey(node string) string { return PrefixNodes + escape(node) }
 
-// RequestKey is one replication request.
-func RequestKey(id string) string { return PrefixRequests + escape(id) }
+// NamespaceKey is one namespace record.
+func NamespaceKey(ns string) string { return PrefixNamespaces + escape(ns) }
+
+// NamespaceRequestsPrefix is every request in one namespace, for a scoped list.
+func NamespaceRequestsPrefix(ns string) string { return PrefixRequests + escape(ns) + "/" }
+
+// RequestKey is one replication request, keyed on the `(namespace, name)` pair that is its ID.
+//
+// Two segments, each escaped independently, so the separator between them is the only unescaped
+// slash in the key and a prefix scan splits exactly where it is meant to.
+func RequestKey(ns, name string) string { return NamespaceRequestsPrefix(ns) + escape(name) }
+
+// DomainLabelsPrefix is every label record for one node, for a scoped list.
+func DomainLabelsPrefix(node string) string { return PrefixDomains + escape(node) + "/" }
+
+// DomainLabelsKey is the label record for one `(node, domain)`.
+//
+// **The domain name contains `/`**, and [escape] is what keeps that from splitting the key: it is
+// [url.PathEscape], which percent-encodes a separator (`fast/ingest` → `fast%2Fingest`), so the
+// record stays one key segment and the two-level prefix scan splits where it is meant to. The
+// property belongs to the standard library's escaping mode rather than to anything in this tree,
+// which is why it is pinned by a test rather than left to this comment.
+func DomainLabelsKey(node, domain string) string { return DomainLabelsPrefix(node) + escape(domain) }
 
 // LeaseKey is one agent instance's liveness record. Write it under that agent's lease.
 func LeaseKey(node string) string { return PrefixLeases + escape(node) }

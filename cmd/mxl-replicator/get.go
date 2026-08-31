@@ -23,14 +23,15 @@ import (
 // The kinds are §3's nouns, plural or singular — `get path` and `get paths` are the same command,
 // because insisting on one is a rule with no purpose behind it.
 type GetCmd struct {
-	Kind string `arg:"" enum:"node,nodes,flow,flows,request,requests,path,paths,session,sessions" help:"One of: nodes, flows, requests, paths, sessions."`
+	Kind string `arg:"" enum:"node,nodes,domain,domains,flow,flows,request,requests,path,paths,session,sessions,namespace,namespaces" help:"One of: nodes, domains, flows, requests, paths, sessions, namespaces."`
 
 	// Filters. Each applies to some kinds and not others, and naming one that does not apply is
 	// an error rather than a no-op: a filter that silently does nothing is how someone concludes
 	// a flow is missing when they only mistyped which field they were narrowing on.
-	Node     string   `help:"Only things on this node. Applies to flows, paths and sessions."`
-	Domain   string   `help:"Only things in this domain. Applies to flows."`
-	Selector []string `short:"l" help:"Only requests with these labels, key=value. Repeatable; all must match."`
+	Node      string   `help:"Only things on this node. Applies to flows, paths and sessions."`
+	Domain    string   `help:"Only things in this domain. Applies to flows."`
+	Namespace string   `short:"n" help:"Only requests in this namespace. Applies to requests."`
+	Selector  []string `short:"l" help:"Only requests with these labels, key=value. Repeatable; all must match."`
 
 	ClientFlags `embed:""`
 	OutputFlags `embed:""`
@@ -55,6 +56,8 @@ func (c *GetCmd) Run(ctx context.Context) error {
 	switch kind {
 	case "node":
 		return c.nodes(ctx, user)
+	case "domain":
+		return c.domains(ctx, user)
 	case "flow":
 		return c.flows(ctx, user)
 	case "request":
@@ -63,6 +66,8 @@ func (c *GetCmd) Run(ctx context.Context) error {
 		return c.paths(ctx, user)
 	case "session":
 		return c.sessions(ctx, user)
+	case "namespace":
+		return c.namespaces(ctx, user)
 	default:
 		return fmt.Errorf("unknown kind %q", c.Kind)
 	}
@@ -71,15 +76,18 @@ func (c *GetCmd) Run(ctx context.Context) error {
 // checkFilters refuses a filter that cannot apply to the kind being listed.
 func (c *GetCmd) checkFilters(kind string, selector map[string]string) error {
 	applies := map[string]map[string]bool{
-		"node":    {},
-		"flow":    {"--node": true, "--domain": true},
-		"request": {"--selector": true},
-		"path":    {"--node": true},
-		"session": {"--node": true},
+		"node":      {},
+		"domain":    {"--node": true},
+		"flow":      {"--node": true, "--domain": true},
+		"request":   {"--selector": true, "--namespace": true},
+		"path":      {"--node": true},
+		"session":   {"--node": true},
+		"namespace": {},
 	}[kind]
 
 	for flag, given := range map[string]bool{
-		"--node": c.Node != "", "--domain": c.Domain != "", "--selector": len(selector) > 0,
+		"--node": c.Node != "", "--domain": c.Domain != "",
+		"--namespace": c.Namespace != "", "--selector": len(selector) > 0,
 	} {
 		if given && !applies[flag] {
 			return fmt.Errorf("%s applies to %s, not to %s", flag, kindsFor(flag), c.Kind)
@@ -91,7 +99,7 @@ func (c *GetCmd) checkFilters(kind string, selector map[string]string) error {
 func kindsFor(flag string) string {
 	switch flag {
 	case "--node":
-		return "flows, paths and sessions"
+		return "domains, flows, paths and sessions"
 	case "--domain":
 		return "flows"
 	default:
@@ -110,7 +118,10 @@ func (c *GetCmd) nodes(ctx context.Context, user *client.Client) error {
 			fmt.Println("no registered nodes")
 			return
 		}
-		out := table("NAME", "LIVE", "INPUT DOMAINS", "OUTPUT ROOTS", "FABRICS", "REPLICATOR")
+		// **No domains column.** A node's domains are observed rather than registered (§6), so
+		// they are not on the node object at all — `get domains` and `describe node` answer for
+		// them, both from inventory. What a node declares is its *areas*.
+		out := table("NAME", "LIVE", "AREAS", "FABRICS", "REPLICATOR")
 		for _, node := range nodes {
 			// Registration is durable and survives the agent being down; only the lease goes
 			// away, and an expired lease is not proof that the node's workers stopped (§4.2).
@@ -118,12 +129,59 @@ func (c *GetCmd) nodes(ctx context.Context, user *client.Client) error {
 			if node.Live {
 				live = "yes"
 			}
-			fmt.Fprintf(out, "%s\t%s\t%s\t%s\t%s\t%s\n",
+			fmt.Fprintf(out, "%s\t%s\t%s\t%s\t%s\n",
 				node.Name, live,
-				domainNames(node.Domains),
-				rootNames(node.Capabilities.OutputRoots),
+				areaNames(node.Capabilities.Areas),
 				fabricNames(node.Capabilities.Fabrics),
 				shortVersion(node.Capabilities.Versions.Replicator))
+		}
+		_ = out.Flush()
+	})
+}
+
+// domains lists the domains the fleet is observing (§6, §10.6).
+//
+// One request per node, because domains are per-node observed state and there is no fleet-wide
+// endpoint for them. The node list is small and this is a CLI; the alternative is a second
+// aggregate endpoint for one verb.
+func (c *GetCmd) domains(ctx context.Context, user *client.Client) error {
+	nodes, err := user.Nodes(ctx)
+	if err != nil {
+		return err
+	}
+
+	type row struct {
+		Node   string `json:"node"`
+		Domain string `json:"domain"`
+		Flows  int    `json:"flows"`
+	}
+	var rows []row
+	settling := false
+	for _, node := range nodes {
+		if c.Node != "" && node.Name != c.Node {
+			continue
+		}
+		list, err := user.NodeDomains(ctx, node.Name)
+		if err != nil {
+			return err
+		}
+		settling = settling || list.Settling
+		for _, domain := range list.Domains {
+			rows = append(rows, row{Node: node.Name, Domain: domain.Domain.String(), Flows: len(domain.Flows)})
+		}
+	}
+	if settling {
+		warn("still settling: not every node has reported yet")
+	}
+
+	return renderAs(c.Output, rows, func() {
+		if len(rows) == 0 {
+			fmt.Println("no domains observed")
+			return
+		}
+		out := table("NODE", "DOMAIN", "FLOWS")
+		for _, r := range rows {
+			fmt.Fprintf(out, "%s\t%s\t%d\n", r.Node, r.Domain, r.Flows)
 		}
 		_ = out.Flush()
 	})
@@ -140,7 +198,10 @@ func (c *GetCmd) flows(ctx context.Context, user *client.Client) error {
 			fmt.Println("no flows observed")
 			return
 		}
-		out := table("NODE", "DOMAIN", "FLOW", "PRODUCING", "GROUP HINT")
+		// REPLICATED is a column of its own, not decoration: a label selector never matches a flow
+		// this project is writing, so without it a broad selector silently skips flows and there
+		// is nothing anywhere to say why (§9.1, §10.7).
+		out := table("NODE", "DOMAIN", "FLOW", "PRODUCING", "REPLICATED", "GROUP HINT")
 		for _, entry := range entries {
 			// Coarse and hysteretic, never a head index: inventory is a full snapshot written to
 			// the store, and a field that changed every frame would turn it into a per-heartbeat
@@ -149,15 +210,16 @@ func (c *GetCmd) flows(ctx context.Context, user *client.Client) error {
 			if entry.Producing {
 				producing = "yes"
 			}
-			fmt.Fprintf(out, "%s\t%s\t%s\t%s\t%s\n",
-				entry.Node, entry.Domain, entry.ID, producing, groupHintText(entry.GroupHint))
+			fmt.Fprintf(out, "%s\t%s\t%s\t%s\t%s\t%s\n",
+				entry.Node, entry.Domain, entry.ID, producing, replicatedText(entry.Replicated),
+				groupHintText(entry.GroupHint))
 		}
 		_ = out.Flush()
 	})
 }
 
 func (c *GetCmd) requests(ctx context.Context, user *client.Client, selector map[string]string) error {
-	requests, err := user.Requests(ctx)
+	requests, err := user.Requests(ctx, c.Namespace)
 	if err != nil {
 		return err
 	}
@@ -172,6 +234,29 @@ func (c *GetCmd) requests(ctx context.Context, user *client.Client, selector map
 	}
 
 	return renderAs(c.Output, requests, func() { printRequestTable(requests) })
+}
+
+// namespaces lists the request partitions (§9.3).
+//
+// `paths` and the request count are the two things worth a column: the first is the one rule a
+// namespace carries, and the second is what a DELETE will be refused over.
+func (c *GetCmd) namespaces(ctx context.Context, user *client.Client) error {
+	namespaces, err := user.Namespaces(ctx)
+	if err != nil {
+		return err
+	}
+
+	return renderAs(c.Output, namespaces, func() {
+		if len(namespaces) == 0 {
+			fmt.Println("no namespaces")
+			return
+		}
+		out := table("NAME", "PATHS", "REQUESTS", "DESCRIPTION")
+		for _, ns := range namespaces {
+			fmt.Fprintf(out, "%s\t%s\t%d\t%s\n", ns.Name, ns.Paths, ns.Requests, ns.Description)
+		}
+		_ = out.Flush()
+	})
 }
 
 func (c *GetCmd) paths(ctx context.Context, user *client.Client) error {
@@ -305,6 +390,15 @@ func workerText(endpoint *api.SessionEndpoint) string {
 	return text
 }
 
+// replicatedText renders the provenance flag. "no" rather than blank, because the distinction
+// between "this node is not writing it" and "nobody said" is the whole point of the column.
+func replicatedText(replicated bool) string {
+	if replicated {
+		return "yes"
+	}
+	return "no"
+}
+
 func groupHintText(hint *api.GroupHint) string {
 	switch {
 	case hint == nil:
@@ -316,30 +410,24 @@ func groupHintText(hint *api.GroupHint) string {
 	}
 }
 
-func domainNames(domains []api.DomainMapping) string {
-	names := make([]string, 0, len(domains))
-	for _, domain := range domains {
-		name := domain.Name
-		if !domain.Configured {
-			name += "*"
-		}
-		names = append(names, name)
-	}
-	if len(names) == 0 {
-		return "—"
-	}
-	return strings.Join(names, ",")
-}
-
-func rootNames(roots []api.OutputRoot) string {
-	if len(roots) == 0 {
-		// Worth saying rather than leaving blank: a node with no root is not a replication
-		// destination at all, and that is the first thing to check when a request is INVALID.
+// areaNames renders a node's areas with their grants, `name:rw` — the same spelling the
+// `--agent-area` flag takes, so what an operator reads back matches what they typed.
+func areaNames(areas []api.Area) string {
+	if len(areas) == 0 {
+		// Worth saying rather than leaving blank: a node with no area offers no sources and
+		// accepts no destinations, and that is the first thing to check when a request is INVALID.
 		return "none"
 	}
-	names := make([]string, 0, len(roots))
-	for _, root := range roots {
-		names = append(names, root.Name)
+	names := make([]string, 0, len(areas))
+	for _, area := range areas {
+		grants := ""
+		if area.Read {
+			grants += "r"
+		}
+		if area.Write {
+			grants += "w"
+		}
+		names = append(names, area.Name+":"+grants)
 	}
 	return strings.Join(names, ",")
 }

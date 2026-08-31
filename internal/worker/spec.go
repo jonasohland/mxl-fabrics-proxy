@@ -138,6 +138,11 @@ type Spec struct {
 	// Ignored by a target, which is passive.
 	ConnectTimeout time.Duration
 
+	// Namespace is the partition the request behind this session belongs to, emitted as a metric
+	// label (§9.3, §12). Like [Spec.Labels] it is scrape-time decoration the worker never sees,
+	// and is deliberately excluded from [Spec.Key] — see there.
+	Namespace string
+
 	// Labels are the requesting user's labels for this worker's metrics (§12). The worker
 	// ignores the config key of the same name (WRS §3 "fields the C++ worker ignores"); the
 	// agent applies them when it scrapes.

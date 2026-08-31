@@ -129,7 +129,7 @@ type Agent struct {
 	rejected map[unitKey]string
 	caps     api.Capabilities
 
-	// outputs are the output domains currently materialised on this node, name → resolved path
+	// outputs are the domains currently materialised on this node, resolved path → rendered name
 	// (§10.6). Derived from the target assignments on every reconcile rather than counted, so it
 	// cannot drift from the workers it exists for.
 	outputs map[string]string
@@ -233,12 +233,10 @@ func (a *Agent) now() time.Time { return a.cfg.Now() }
 func (a *Agent) Run(ctx context.Context) error {
 	a.root = ctx
 
-	if err := a.cfg.Inventory.CreateDomains(); err != nil {
-		return fmt.Errorf("agent: %w", err)
-	}
-	// Both at startup, so only the leaf MkdirAll for an output domain is ever on the
-	// establishment path (§6.1, §10.6).
-	if err := a.cfg.Inventory.CreateRoots(); err != nil {
+	// At startup, so only the leaf MkdirAll for an output domain is ever on the establishment
+	// path (§6.1, §10.6). *There used to be a second call beside it, pre-creating the configured
+	// domain directories; there are no configured domains any more (§6).*
+	if err := a.cfg.Inventory.CreateAreas(); err != nil {
 		return fmt.Errorf("agent: %w", err)
 	}
 
@@ -274,23 +272,19 @@ type session struct {
 	heartbeat time.Duration
 }
 
-// outputRoots renders this node's configured roots for registration (§10.2, §10.6).
+// areas renders this node's configured areas for registration (§10.2, §10.6).
 //
-// Empty is the ordinary case and not an error: most nodes in a fleet are sources only, and a node
-// with no roots is simply not a replication destination. The server refuses any request aimed at
-// it with a reason that says so, which is the right place for that to surface — an operator
-// setting up a destination hears about it when they ask for one.
-func (a *Agent) outputRoots() []api.OutputRoot {
-	roots := a.cfg.Inventory.Roots()
-	if len(roots) == 0 {
-		return nil
-	}
-
-	out := make([]api.OutputRoot, 0, len(roots))
-	for _, root := range roots {
-		out = append(out, api.OutputRoot{Name: root.Name, Path: root.Path})
-	}
-	return out
+// Empty is the ordinary case and not an error: a node with no area at all offers no sources and
+// accepts no destinations, which is the correct posture for the one piece of configuration that
+// grants this project any authority over a host's filesystem. The server refuses any request
+// aimed at it with a reason that says so, which is the right place for that to surface — an
+// operator setting up a destination hears about it when they ask for one.
+//
+// **Readable areas are advertised as well as writable ones**, which is a change (§10.2): a
+// domain's name is `<area>/<elements>`, so a server that does not hold this table cannot render a
+// domain's identity or resolve a name in a request.
+func (a *Agent) areas() []api.Area {
+	return a.cfg.Inventory.Areas()
 }
 
 // register loops until the server accepts this node, or ctx ends.
@@ -304,19 +298,18 @@ func (a *Agent) register(ctx context.Context) (session, bool) {
 	for ctx.Err() == nil {
 		capabilities, err := a.probe(ctx)
 		if err == nil {
-			// Output roots are not probed: they are static agent configuration, and the probe
-			// reports what the host offers rather than what the operator permits (§10.2, §10.6).
-			// They are added here so that every registration and re-registration advertises the
-			// current set, and so that what this node advertises is read off the same inventory
-			// its destination resolver answers from — one list, not two that agree today.
-			capabilities.OutputRoots = a.outputRoots()
+			// Areas are not probed: they are static agent configuration, and the probe reports
+			// what the host offers rather than what the operator permits (§10.2, §10.6). They are
+			// added here so that every registration and re-registration advertises the current
+			// set, and so that what this node advertises is read off the same inventory its
+			// destination resolver answers from — one list, not two that agree today.
+			capabilities.Areas = a.areas()
 
 			var accepted *api.RegistrationResponse
 			accepted, err = a.cfg.Client.Register(ctx, api.NodeRegistration{
 				Node:         a.cfg.Node,
 				Instance:     a.cfg.Instance,
 				Capabilities: capabilities,
-				Domains:      a.cfg.Inventory.Mappings(),
 			})
 			if err == nil {
 				a.setCapabilities(capabilities)

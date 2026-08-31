@@ -2,6 +2,8 @@ package reconcile
 
 import (
 	"encoding/json"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -35,29 +37,30 @@ type fleetBuilder struct {
 
 func newFleet() *fleetBuilder {
 	return &fleetBuilder{fleet: &state.Fleet{
-		Revision:    100,
-		Nodes:       map[string]state.Entry[state.NodeRecord]{},
-		Leases:      map[string]state.Entry[state.LeaseRecord]{},
-		Inventory:   map[string]state.Entry[api.InventorySnapshot]{},
-		Status:      map[string]state.Entry[api.StatusSnapshot]{},
-		Requests:    map[string]state.Entry[state.RequestRecord]{},
-		Sessions:    map[string]state.Entry[state.SessionRecord]{},
-		Assignments: map[string]state.Entry[api.AssignmentSet]{},
+		Revision:     100,
+		Nodes:        map[string]state.Entry[state.NodeRecord]{},
+		Leases:       map[string]state.Entry[state.LeaseRecord]{},
+		Inventory:    map[string]state.Entry[api.InventorySnapshot]{},
+		Status:       map[string]state.Entry[api.StatusSnapshot]{},
+		Namespaces:   map[string]state.Entry[state.NamespaceRecord]{},
+		DomainLabels: map[state.DomainKey]state.Entry[api.DomainLabels]{},
+		Requests:     map[api.RequestID]state.Entry[state.RequestRecord]{},
+		Sessions:     map[string]state.Entry[state.SessionRecord]{},
+		Assignments:  map[string]state.Entry[api.AssignmentSet]{},
 	}}
 }
 
-func (b *fleetBuilder) node(name string, domains ...api.DomainMapping) *fleetBuilder {
+func (b *fleetBuilder) node(name string) *fleetBuilder {
 	b.fleet.Nodes[name] = state.Entry[state.NodeRecord]{Found: true, Value: state.NodeRecord{
-		Node:    name,
-		Domains: domains,
+		Node: name,
 		Capabilities: api.Capabilities{
 			Fabrics: []api.FabricAttachment{{
 				Provider: api.ProviderTCP, Fabric: "dc1", Address: "10.0.0." + name[len(name)-1:],
 				CapFlags: []api.CapFlag{api.CapRemoteWrite, api.CapSendReceive},
 			}},
-			// One output root on every node, so any of them can be a destination and a request
-			// can name one without spelling the root (§10.6).
-			OutputRoots: []api.OutputRoot{{Name: "fast", Path: "/dev/shm/mxl"}},
+			// One writable area on every node, so any of them can be a destination; a
+			// destination always names its area now (§10.6).
+			Areas: []api.Area{{Name: "fast", Path: "/dev/shm/mxl", Read: true, Write: true}},
 		},
 	}}
 	b.fleet.Leases[name] = state.Entry[state.LeaseRecord]{Found: true, Value: state.LeaseRecord{Node: name, Instance: "i-" + name}}
@@ -76,30 +79,53 @@ func (b *fleetBuilder) unlease(name string) *fleetBuilder {
 	return b
 }
 
+// flow adds one observed flow. The domain is written the way a manifest spells it,
+// `<area>/<elements>`, and split here because a test is allowed the convenience the rest of the
+// tree is not — an agent computes the identity from its own area table (§10.6).
 func (b *fleetBuilder) flow(node, domain string, flow api.FlowInventory) *fleetBuilder {
 	entry := b.fleet.Inventory[node]
 	entry.Found = true
 	entry.Value.Node = node
 
 	for i := range entry.Value.Domains {
-		if entry.Value.Domains[i].Name == domain {
+		if entry.Value.Domains[i].Domain.String() == domain {
 			entry.Value.Domains[i].Flows = append(entry.Value.Domains[i].Flows, flow)
 			b.fleet.Inventory[node] = entry
 			return b
 		}
 	}
+	segments := strings.Split(domain, "/")
 	entry.Value.Domains = append(entry.Value.Domains, api.DomainInventory{
-		Name: domain, Configured: true, Flows: []api.FlowInventory{flow},
+		Domain: api.Domain{Area: segments[0], Elements: segments[1:]},
+		Flows:  []api.FlowInventory{flow},
 	})
 	b.fleet.Inventory[node] = entry
 	return b
 }
 
-func (b *fleetBuilder) request(id string, spec api.RequestSpec) *fleetBuilder {
+// request adds one request. The name is a bare string for brevity; the ID is the pair, defaulted
+// from the spec's namespace exactly as the server does on write (§9.3).
+func (b *fleetBuilder) request(name string, spec api.RequestSpec) *fleetBuilder {
+	spec.Name = name
+	id := spec.RequestID()
 	b.fleet.Requests[id] = state.Entry[state.RequestRecord]{Found: true, Value: state.RequestRecord{
 		ID: id, Spec: spec, CreatedAt: created,
 	}}
 	return b
+}
+
+// namespace declares one, which is what makes its `paths` policy anything but the default.
+func (b *fleetBuilder) namespace(name string, paths api.PathPolicy) *fleetBuilder {
+	b.fleet.Namespaces[name] = state.Entry[state.NamespaceRecord]{Found: true, Value: state.NamespaceRecord{
+		Name: name, Spec: api.Namespace{Name: name, Paths: paths},
+	}}
+	return b
+}
+
+// rid is the ID of a request in the default namespace, which is where the tests below put
+// everything they do not say otherwise about.
+func rid(name string) api.RequestID {
+	return api.RequestID{Namespace: api.DefaultNamespace, Name: name}
 }
 
 func (b *fleetBuilder) sessionStatus(node string, status api.SessionStatus) *fleetBuilder {
@@ -127,27 +153,25 @@ func (b *fleetBuilder) build() *state.Fleet { return b.fleet }
 func flowRequest(name string) api.RequestSpec {
 	return api.RequestSpec{
 		Name:         name,
-		Source:       api.Source{Node: "studio-a", Domain: "cameras", Select: api.Selector{Flow: "flow-1"}},
-		Destinations: []api.Destination{{Node: "edge-01", Domain: []string{"ingest"}}},
+		Source:       api.Source{Node: "studio-a", Domain: named("media/cameras"), Select: api.Selector{Flow: "flow-1"}},
+		Destinations: []api.Destination{{Node: "edge-01", Domain: api.Domain{Area: "fast", Elements: []string{"ingest"}}}},
 	}
 }
 
-// inNamespace puts a spec in a namespace. Sharing a path across requests is legal exactly when
-// they are in different ones (§7b), so the tests that exercise refcounting say which.
+// inNamespace puts a spec in a namespace. Sharing a path is refused only inside a namespace whose
+// `paths` policy is exclusive (§9.3), so the tests that exercise the rule say which namespace each
+// request is in *and* declare that namespace exclusive.
 func inNamespace(spec api.RequestSpec, ns string) api.RequestSpec {
-	if spec.Labels == nil {
-		spec.Labels = map[string]string{}
-	}
-	spec.Labels[api.LabelNamespace] = ns
+	spec.Namespace = ns
 	return spec
 }
 
 // base is the ordinary fleet: two registered nodes, one request, one flow being produced.
 func base() *fleetBuilder {
 	return newFleet().
-		node("studio-a", api.DomainMapping{Name: "cameras", Configured: true}).
+		node("studio-a").
 		node("edge-01").
-		flow("studio-a", "cameras", api.FlowInventory{ID: "flow-1", Definition: flowDef, Producing: true}).
+		flow("studio-a", "media/cameras", api.FlowInventory{ID: "flow-1", Definition: flowDef, Producing: true}).
 		request("cam1", flowRequest("cam1"))
 }
 
@@ -160,16 +184,16 @@ func TestARequestFansOutToOnePathPerDestination(t *testing.T) {
 
 	spec := flowRequest("cam1")
 	spec.Destinations = []api.Destination{
-		{Node: "edge-01", Domain: []string{"ingest"}},
-		{Node: "edge-02", Domain: []string{"ingest"}},
-		{Node: "archive-01", Domain: []string{"capture"}},
+		{Node: "edge-01", Domain: api.Domain{Area: "fast", Elements: []string{"ingest"}}},
+		{Node: "edge-02", Domain: api.Domain{Area: "fast", Elements: []string{"ingest"}}},
+		{Node: "archive-01", Domain: api.Domain{Area: "fast", Elements: []string{"capture"}}},
 	}
 
 	fleet := base().node("edge-02").node("archive-01").request("cam1", spec).build()
 	result := Compute(fleet, Config{})
 
 	require.Len(t, result.Paths, 3)
-	require.Len(t, result.Requests["cam1"].Paths, 3)
+	require.Len(t, result.Requests[rid("cam1")].Paths, 3)
 
 	// Every destination gets its own path, its own session, and a target assignment on its own
 	// node. The source node carries one initiator per destination: fan-out is N workers reading
@@ -178,10 +202,12 @@ func TestARequestFansOutToOnePathPerDestination(t *testing.T) {
 	for _, path := range result.Paths {
 		seen[path.Destination.Endpoint()] = true
 		assert.Equal(t, "flow-1", path.Source.Flow)
-		assert.Equal(t, "fast", path.Destination.Root, "the resolved root goes into the identity")
-		assert.Equal(t, []string{"cam1"}, path.Requests)
+		assert.Equal(t, "fast", path.Destination.Domain.Area, "the area is inside the domain's name")
+		assert.Equal(t, []string{"default/cam1"}, path.Requests)
 	}
-	assert.Equal(t, map[string]bool{"edge-01/ingest": true, "edge-02/ingest": true, "archive-01/capture": true}, seen)
+	assert.Equal(t, map[string]bool{
+		"edge-01/fast/ingest": true, "edge-02/fast/ingest": true, "archive-01/fast/capture": true,
+	}, seen)
 
 	for _, node := range []string{"edge-01", "edge-02", "archive-01"} {
 		assert.Len(t, result.Assignments[node].Assignments, 1, "one target on %s", node)
@@ -189,8 +215,8 @@ func TestARequestFansOutToOnePathPerDestination(t *testing.T) {
 	assert.Len(t, result.Assignments["studio-a"].Assignments, 0,
 		"no initiator until each target has reported an epoch (invariant 3)")
 
-	assert.Equal(t, api.StateEstablishing, result.Requests["cam1"].State)
-	assert.Equal(t, 3, result.Requests["cam1"].Counts[api.StateEstablishing])
+	assert.Equal(t, api.StateEstablishing, result.Requests[rid("cam1")].State)
+	assert.Equal(t, 3, result.Requests[rid("cam1")].Counts[api.StateEstablishing])
 }
 
 // **The point of validating per destination.** One unusable destination makes the request
@@ -201,17 +227,17 @@ func TestOneInvalidDestinationDoesNotStopTheOthers(t *testing.T) {
 
 	spec := flowRequest("cam1")
 	spec.Destinations = []api.Destination{
-		{Node: "edge-01", Domain: []string{"ingest"}},
-		{Node: "edge-02", Domain: []string{"ingest"}, Root: "bulk"}, // edge-02 advertises only "fast"
+		{Node: "edge-01", Domain: api.Domain{Area: "fast", Elements: []string{"ingest"}}},
+		{Node: "edge-02", Domain: api.Domain{Area: "bulk", Elements: []string{"ingest"}}}, // edge-02 advertises only "fast"
 	}
 
 	fleet := base().node("edge-02").request("cam1", spec).build()
 	result := Compute(fleet, Config{})
 
-	status := result.Requests["cam1"]
+	status := result.Requests[rid("cam1")]
 	assert.Equal(t, api.StateInvalid, status.State)
-	assert.Equal(t, api.ReasonUnknownOutputRoot, status.ReasonCode)
-	assert.Contains(t, status.Reason, "edge-02/ingest",
+	assert.Equal(t, api.ReasonUnknownArea, status.ReasonCode)
+	assert.Contains(t, status.Reason, "edge-02/bulk/ingest",
 		"the reason must name which destination failed, or an operator cannot find it")
 
 	// The good leg is a real path with a real session and a real assignment...
@@ -233,17 +259,17 @@ func TestARequestWideFailureDoesNotBlameADestination(t *testing.T) {
 	spec := flowRequest("cam1")
 	spec.Source.Node = "typo" // never registered: nothing about any destination is wrong
 	spec.Destinations = []api.Destination{
-		{Node: "edge-01", Domain: []string{"ingest"}},
-		{Node: "edge-02", Domain: []string{"ingest"}},
+		{Node: "edge-01", Domain: api.Domain{Area: "fast", Elements: []string{"ingest"}}},
+		{Node: "edge-02", Domain: api.Domain{Area: "fast", Elements: []string{"ingest"}}},
 	}
 
 	fleet := base().node("edge-02").request("cam1", spec).build()
-	status := Compute(fleet, Config{}).Requests["cam1"]
+	status := Compute(fleet, Config{}).Requests[rid("cam1")]
 
 	assert.Equal(t, api.StateInvalid, status.State)
 	assert.Equal(t, api.ReasonNodeNotRegistered, status.ReasonCode)
 	assert.Contains(t, status.Reason, `source node "typo"`)
-	assert.NotContains(t, status.Reason, "destination edge-01/ingest")
+	assert.NotContains(t, status.Reason, "destination edge-01/fast/ingest")
 	assert.NotContains(t, status.Reason, "more destination")
 }
 
@@ -255,13 +281,13 @@ func TestAnUnusableDestinationIsInvalidEvenWithNothingToExpandOnto(t *testing.T)
 
 	spec := flowRequest("cam1")
 	spec.Source.Select = api.Selector{Flow: "flow-does-not-exist-yet"}
-	spec.Destinations = []api.Destination{{Node: "edge-01", Domain: []string{"ingest"}, Root: "bulk"}}
+	spec.Destinations = []api.Destination{{Node: "edge-01", Domain: api.Domain{Area: "bulk", Elements: []string{"ingest"}}}}
 
 	result := Compute(base().request("cam1", spec).build(), Config{})
 
-	status := result.Requests["cam1"]
+	status := result.Requests[rid("cam1")]
 	assert.Equal(t, api.StateInvalid, status.State, "not WAITING: the destination can never work")
-	assert.Equal(t, api.ReasonUnknownOutputRoot, status.ReasonCode)
+	assert.Equal(t, api.ReasonUnknownArea, status.ReasonCode)
 }
 
 // A per-destination pin overrides the request-level one rather than intersecting it, so
@@ -272,8 +298,8 @@ func TestAPerDestinationPinOverridesTheRequestPin(t *testing.T) {
 	spec := flowRequest("cam1")
 	spec.Provider = api.ProviderPin{api.ProviderEFA} // not viable for these fixture nodes
 	spec.Destinations = []api.Destination{
-		{Node: "edge-01", Domain: []string{"ingest"}, Provider: api.ProviderPin{api.ProviderTCP}},
-		{Node: "edge-02", Domain: []string{"ingest"}},
+		{Node: "edge-01", Domain: api.Domain{Area: "fast", Elements: []string{"ingest"}}, Provider: api.ProviderPin{api.ProviderTCP}},
+		{Node: "edge-02", Domain: api.Domain{Area: "fast", Elements: []string{"ingest"}}},
 	}
 
 	fleet := base().node("edge-02").request("cam1", spec).build()
@@ -301,16 +327,16 @@ func TestFanOutStillDeduplicatesSharedPaths(t *testing.T) {
 
 	wide := flowRequest("wide")
 	wide.Destinations = []api.Destination{
-		{Node: "edge-01", Domain: []string{"ingest"}},
-		{Node: "edge-02", Domain: []string{"ingest"}},
+		{Node: "edge-01", Domain: api.Domain{Area: "fast", Elements: []string{"ingest"}}},
+		{Node: "edge-02", Domain: api.Domain{Area: "fast", Elements: []string{"ingest"}}},
 	}
 	narrow := inNamespace(flowRequest("narrow"), "archive")
-	narrow.Destinations = []api.Destination{{Node: "edge-02", Domain: []string{"ingest"}}}
+	narrow.Destinations = []api.Destination{{Node: "edge-02", Domain: api.Domain{Area: "fast", Elements: []string{"ingest"}}}}
 
 	fleet := newFleet().
-		node("studio-a", api.DomainMapping{Name: "cameras", Configured: true}).
+		node("studio-a").
 		node("edge-01").node("edge-02").
-		flow("studio-a", "cameras", api.FlowInventory{ID: "flow-1", Definition: flowDef, Producing: true}).
+		flow("studio-a", "media/cameras", api.FlowInventory{ID: "flow-1", Definition: flowDef, Producing: true}).
 		request("wide", wide).request("narrow", narrow).
 		build()
 	result := Compute(fleet, Config{})
@@ -318,9 +344,9 @@ func TestFanOutStillDeduplicatesSharedPaths(t *testing.T) {
 	require.Len(t, result.Paths, 2, "three destination entries, two distinct edges")
 	for _, path := range result.Paths {
 		if path.Destination.Node == "edge-02" {
-			assert.Equal(t, []string{"narrow", "wide"}, path.Requests)
+			assert.Equal(t, []string{"archive/narrow", "default/wide"}, path.Requests)
 		} else {
-			assert.Equal(t, []string{"wide"}, path.Requests)
+			assert.Equal(t, []string{"default/wide"}, path.Requests)
 		}
 	}
 	assert.Len(t, result.Sessions, 2)
@@ -360,7 +386,7 @@ func TestTargetIsAssignedFirstAndAloneUntilAnEpochExists(t *testing.T) {
 
 	target := find(result.Assignments["edge-01"], api.RoleTarget)
 	require.NotNil(t, target)
-	assert.Equal(t, "ingest", target.Domain)
+	assert.Equal(t, api.Domain{Area: "fast", Elements: []string{"ingest"}}, target.Domain)
 	assert.Equal(t, "flow-1", target.FlowID)
 	assert.JSONEq(t, string(flowDef), string(target.FlowDef))
 	assert.Equal(t, api.ProviderTCP, target.Interface.Provider)
@@ -390,7 +416,8 @@ func TestInitiatorIsAssignedOnceTheEpochIsReported(t *testing.T) {
 	require.NotNil(t, initiator)
 	assert.Equal(t, "epoch-a", initiator.Epoch)
 	assert.Equal(t, `{"id":"x"}`, initiator.TargetInfo)
-	assert.Equal(t, "cameras", initiator.Domain, "an initiator reads its own local domain")
+	assert.Equal(t, api.Domain{Area: "media", Elements: []string{"cameras"}}, initiator.Domain,
+		"an initiator reads its own local domain, in the same grammar the target's carries")
 	assert.Empty(t, initiator.FlowDef, "only a target creates a flow")
 	require.NotNil(t, initiator.Peer)
 	assert.Equal(t, api.PeerEndpoint{Node: "edge-01", Address: "10.0.0.1", Service: "24001"}, *initiator.Peer)
@@ -458,10 +485,10 @@ func established(t *testing.T, destinationProducing bool, sourceProducing bool) 
 	sessionID := sessionIDFor(fleet)
 
 	b := newFleet().
-		node("studio-a", api.DomainMapping{Name: "cameras", Configured: true}).
+		node("studio-a").
 		node("edge-01").
-		flow("studio-a", "cameras", api.FlowInventory{ID: "flow-1", Definition: flowDef, Producing: sourceProducing}).
-		flow("edge-01", "ingest", api.FlowInventory{ID: "flow-1", Definition: flowDef, Producing: destinationProducing}).
+		flow("studio-a", "media/cameras", api.FlowInventory{ID: "flow-1", Definition: flowDef, Producing: sourceProducing}).
+		flow("edge-01", "fast/ingest", api.FlowInventory{ID: "flow-1", Definition: flowDef, Producing: destinationProducing}).
 		request("cam1", flowRequest("cam1")).
 		session(state.SessionRecord{
 			ID: sessionID, Path: pathOf(fleet), FlowDefHash: state.FlowDefHash(flowDef),
@@ -509,10 +536,10 @@ func TestDegradedAndFailedComeFromRestartRate(t *testing.T) {
 
 	withRestarts := func(n int) *Result {
 		b := newFleet().
-			node("studio-a", api.DomainMapping{Name: "cameras", Configured: true}).
+			node("studio-a").
 			node("edge-01").
-			flow("studio-a", "cameras", api.FlowInventory{ID: "flow-1", Definition: flowDef, Producing: true}).
-			flow("edge-01", "ingest", api.FlowInventory{ID: "flow-1", Definition: flowDef, Producing: true}).
+			flow("studio-a", "media/cameras", api.FlowInventory{ID: "flow-1", Definition: flowDef, Producing: true}).
+			flow("edge-01", "fast/ingest", api.FlowInventory{ID: "flow-1", Definition: flowDef, Producing: true}).
 			request("cam1", flowRequest("cam1")).
 			session(state.SessionRecord{ID: sessionID, Path: pathOf(fleet), FlowDefHash: state.FlowDefHash(flowDef), Fabric: "dc1", Interface: tcpInterface}).
 			sessionStatus("edge-01", api.SessionStatus{
@@ -542,9 +569,9 @@ func TestADormantSourceStartsNoWorkers(t *testing.T) {
 	t.Parallel()
 
 	fleet := newFleet().
-		node("studio-a", api.DomainMapping{Name: "cameras", Configured: true}).
+		node("studio-a").
 		node("edge-01").
-		flow("studio-a", "cameras", api.FlowInventory{ID: "flow-1", Definition: flowDef, Producing: false}).
+		flow("studio-a", "media/cameras", api.FlowInventory{ID: "flow-1", Definition: flowDef, Producing: false}).
 		request("cam1", flowRequest("cam1")).
 		build()
 
@@ -568,9 +595,9 @@ func TestIdleTeardownIsTwoTiered(t *testing.T) {
 
 	withIdle := func(idle time.Duration) *Result {
 		b := newFleet().
-			node("studio-a", api.DomainMapping{Name: "cameras", Configured: true}).
+			node("studio-a").
 			node("edge-01").
-			flow("studio-a", "cameras", api.FlowInventory{ID: "flow-1", Definition: flowDef, Producing: false}).
+			flow("studio-a", "media/cameras", api.FlowInventory{ID: "flow-1", Definition: flowDef, Producing: false}).
 			request("cam1", flowRequest("cam1")).
 			session(state.SessionRecord{ID: sessionID, Path: pathOf(fleet), FlowDefHash: state.FlowDefHash(flowDef), Fabric: "dc1", Interface: tcpInterface}).
 			sessionStatus("edge-01", api.SessionStatus{
@@ -612,9 +639,9 @@ func withTeardownDisabled(fleet *state.Fleet, sessionID string) *state.Fleet {
 	spec.IdleTeardown = &zero
 
 	return newFleet().
-		node("studio-a", api.DomainMapping{Name: "cameras", Configured: true}).
+		node("studio-a").
 		node("edge-01").
-		flow("studio-a", "cameras", api.FlowInventory{ID: "flow-1", Definition: flowDef, Producing: false}).
+		flow("studio-a", "media/cameras", api.FlowInventory{ID: "flow-1", Definition: flowDef, Producing: false}).
 		request("cam1", spec).
 		session(state.SessionRecord{ID: sessionID, Path: pathOf(fleet), FlowDefHash: state.FlowDefHash(flowDef), Fabric: "dc1", Interface: tcpInterface}).
 		build()
@@ -632,18 +659,20 @@ func TestAnAgentLosingItsLeaseWithdrawsNothing(t *testing.T) {
 	sessionID := sessionIDFor(fleet)
 
 	running := api.AssignmentSet{Assignments: []api.Assignment{{
-		SessionID: sessionID, Role: api.RoleInitiator, Domain: "cameras", FlowID: "flow-1",
+		SessionID: sessionID, Role: api.RoleInitiator,
+		Domain: api.Domain{Area: "media", Elements: []string{"cameras"}}, FlowID: "flow-1",
 		Epoch: "epoch-a", TargetInfo: `{"id":"x"}`,
 	}}}
 
 	b := newFleet().
-		node("studio-a", api.DomainMapping{Name: "cameras", Configured: true}).
+		node("studio-a").
 		node("edge-01").
 		request("cam1", flowRequest("cam1")).
 		session(state.SessionRecord{ID: sessionID, Path: pathOf(fleet), FlowDefHash: state.FlowDefHash(flowDef), Fabric: "dc1", Interface: tcpInterface}).
 		assignments("studio-a", running).
 		assignments("edge-01", api.AssignmentSet{Assignments: []api.Assignment{{
-			SessionID: sessionID, Role: api.RoleTarget, Domain: "ingest", FlowID: "flow-1", FlowDef: flowDef,
+			SessionID: sessionID, Role: api.RoleTarget,
+			Domain: api.Domain{Area: "fast", Elements: []string{"ingest"}}, FlowID: "flow-1", FlowDef: flowDef,
 		}}}).
 		unlease("edge-01")
 
@@ -672,7 +701,7 @@ func TestAGroupHintRequestDoesNotCollapseWhenItsSourceAgentIsGone(t *testing.T) 
 	sessionID := sessionIDFor(fleet)
 
 	b := newFleet().
-		node("studio-a", api.DomainMapping{Name: "cameras", Configured: true}).
+		node("studio-a").
 		node("edge-01").
 		request("cam1", spec).
 		session(state.SessionRecord{ID: sessionID, Path: pathOf(fleet), FlowDefHash: state.FlowDefHash(flowDef), Fabric: "dc1", Interface: tcpInterface}).
@@ -686,8 +715,8 @@ func TestAGroupHintRequestDoesNotCollapseWhenItsSourceAgentIsGone(t *testing.T) 
 
 	// And it is attributed to the request rather than showing up as an orphan.
 	path := onlyPath(t, result)
-	assert.Equal(t, []string{"cam1"}, path.Requests)
-	assert.Equal(t, api.StateWaiting, result.Requests["cam1"].State)
+	assert.Equal(t, []string{"default/cam1"}, path.Requests)
+	assert.Equal(t, api.StateWaiting, result.Requests[rid("cam1")].State)
 }
 
 // With both agents reporting, a flow that is not there really is not there — that is the case
@@ -699,7 +728,7 @@ func TestAMissingFlowWithBothAgentsLiveWithdrawsTheSession(t *testing.T) {
 	sessionID := sessionIDFor(fleet)
 
 	b := newFleet().
-		node("studio-a", api.DomainMapping{Name: "cameras", Configured: true}).
+		node("studio-a").
 		node("edge-01").
 		request("cam1", flowRequest("cam1")).
 		session(state.SessionRecord{ID: sessionID, Path: pathOf(fleet), FlowDefHash: state.FlowDefHash(flowDef), Fabric: "dc1", Interface: tcpInterface}).
@@ -723,21 +752,21 @@ func TestGroupHintExpansion(t *testing.T) {
 	spec.Source.Select = api.Selector{GroupHint: &api.GroupHintSelector{Name: "Studio A:Camera 1"}}
 
 	fleet := newFleet().
-		node("studio-a", api.DomainMapping{Name: "cameras", Configured: true}).
+		node("studio-a").
 		node("edge-01").
-		flow("studio-a", "cameras", api.FlowInventory{
+		flow("studio-a", "media/cameras", api.FlowInventory{
 			ID: "flow-video", Definition: flowDef, Producing: true,
 			GroupHint: &api.GroupHint{Name: "Studio A:Camera 1", Type: "video"},
 		}).
-		flow("studio-a", "cameras", api.FlowInventory{
+		flow("studio-a", "media/cameras", api.FlowInventory{
 			ID: "flow-audio", Definition: flowDef, Producing: true,
 			GroupHint: &api.GroupHint{Name: "Studio A:Camera 1", Type: "audio"},
 		}).
-		flow("studio-a", "cameras", api.FlowInventory{
+		flow("studio-a", "media/cameras", api.FlowInventory{
 			ID: "flow-other", Definition: flowDef, Producing: true,
 			GroupHint: &api.GroupHint{Name: "Studio A:Camera 2", Type: "video"},
 		}).
-		flow("studio-a", "cameras", api.FlowInventory{ID: "flow-untagged", Definition: flowDef, Producing: true}).
+		flow("studio-a", "media/cameras", api.FlowInventory{ID: "flow-untagged", Definition: flowDef, Producing: true}).
 		request("camera-1", spec).
 		build()
 
@@ -748,17 +777,17 @@ func TestGroupHintExpansion(t *testing.T) {
 	assert.Len(t, result.Paths, 2)
 	assert.Len(t, result.Sessions, 2)
 	assert.Len(t, result.Assignments["edge-01"].Assignments, 2)
-	assert.Len(t, result.Requests["camera-1"].Paths, 2)
+	assert.Len(t, result.Requests[rid("camera-1")].Paths, 2)
 
 	spec.Source.Select.GroupHint.Type = "video"
 	narrowed := Compute(newFleetFrom(fleet, "camera-1", spec), Config{})
 	assert.Len(t, narrowed.Paths, 1)
 }
 
-func newFleetFrom(fleet *state.Fleet, id string, spec api.RequestSpec) *state.Fleet {
-	entry := fleet.Requests[id]
+func newFleetFrom(fleet *state.Fleet, name string, spec api.RequestSpec) *state.Fleet {
+	entry := fleet.Requests[rid(name)]
 	entry.Value.Spec = spec
-	fleet.Requests[id] = entry
+	fleet.Requests[rid(name)] = entry
 	return fleet
 }
 
@@ -767,22 +796,22 @@ func newFleetFrom(fleet *state.Fleet, id string, spec api.RequestSpec) *state.Fl
 func TestRequestsSharingAPathAreRefcounted(t *testing.T) {
 	t.Parallel()
 
-	// A second namespace, because refcounting across requests is exactly what is legal there
-	// and forbidden inside one — see TestTwoRequestsInOneNamespaceMayNotShareAPath.
-	two := base().request("cam1-again", inNamespace(flowRequest("cam1-again"), "archive")).build()
+	// Both in the default namespace, which is `shared`: refcounting is the base model and
+	// forbidding it is the special case a namespace opts into (§9.3).
+	two := base().request("cam1-again", flowRequest("cam1-again")).build()
 	result := Compute(two, Config{})
 
 	assert.Len(t, result.Paths, 1)
 	assert.Len(t, result.Sessions, 1)
-	assert.Equal(t, []string{"cam1", "cam1-again"}, onlyPath(t, result).Requests)
+	assert.Equal(t, []string{"default/cam1", "default/cam1-again"}, onlyPath(t, result).Requests)
 	assert.Len(t, result.Assignments["edge-01"].Assignments, 1)
 
 	// One cancelled: the path stays, because the other request still wants it.
-	delete(two.Requests, "cam1-again")
+	delete(two.Requests, rid("cam1-again"))
 	assert.Len(t, Compute(two, Config{}).Sessions, 1)
 
 	// The last one cancelled: it goes.
-	delete(two.Requests, "cam1")
+	delete(two.Requests, rid("cam1"))
 	assert.Empty(t, Compute(two, Config{}).Sessions)
 	assert.Empty(t, Compute(two, Config{}).Assignments["edge-01"].Assignments)
 }
@@ -792,18 +821,17 @@ func TestRequestsSharingAPathAreRefcounted(t *testing.T) {
 func TestSharedPathSettingsResolveConservatively(t *testing.T) {
 	t.Parallel()
 
-	// Different namespaces: sharing a path is legal exactly there. The namespace label is set
-	// alongside the user labels rather than by inNamespace, because assigning Labels wholesale
-	// after it would drop it — which is the same trap a caller could fall into.
+	// Both in the default namespace, which is `shared` — sharing a path is the ordinary case
+	// and only an `exclusive` namespace forbids it (§9.3).
 	pinned := flowRequest("pinned")
 	pinned.Provider = api.ProviderPin{api.ProviderTCP, api.ProviderVerbs}
-	pinned.Labels = map[string]string{"a": "1", api.LabelNamespace: "live"}
+	pinned.Labels = map[string]string{"a": "1"}
 	prio := 40
 	pinned.SchedPrio = &prio
 
 	other := flowRequest("other")
 	other.Provider = api.ProviderPin{api.ProviderVerbs, api.ProviderTCP}
-	other.Labels = map[string]string{"b": "2", api.LabelNamespace: "archive"}
+	other.Labels = map[string]string{"b": "2"}
 	higher := 80
 	other.SchedPrio = &higher
 
@@ -812,9 +840,9 @@ func TestSharedPathSettingsResolveConservatively(t *testing.T) {
 		entry.Value.Capabilities.SchedPrio = true
 		fleet.Nodes[name] = entry
 	}
-	delete(fleet.Requests, "cam1")
-	fleet.Requests["pinned"] = state.Entry[state.RequestRecord]{Found: true, Value: state.RequestRecord{ID: "pinned", Spec: pinned, CreatedAt: created}}
-	fleet.Requests["other"] = state.Entry[state.RequestRecord]{Found: true, Value: state.RequestRecord{ID: "other", Spec: other, CreatedAt: created}}
+	delete(fleet.Requests, rid("cam1"))
+	fleet.Requests[rid("pinned")] = state.Entry[state.RequestRecord]{Found: true, Value: state.RequestRecord{ID: rid("pinned"), Spec: pinned, CreatedAt: created}}
+	fleet.Requests[rid("other")] = state.Entry[state.RequestRecord]{Found: true, Value: state.RequestRecord{ID: rid("other"), Spec: other, CreatedAt: created}}
 
 	result := Compute(fleet, Config{})
 
@@ -822,11 +850,11 @@ func TestSharedPathSettingsResolveConservatively(t *testing.T) {
 	require.NotNil(t, target)
 	require.NotNil(t, target.SchedPrio)
 	assert.Equal(t, 80, *target.SchedPrio, "the shared workers get the highest priority asked for")
-	// The namespace rides into worker metrics like any other label, and on a path shared across
-	// two of them the merge picks the last request ID — arbitrary, but deterministic, which is
-	// the same rule every other label follows here. There is no single right answer for a path
-	// two namespaces hold.
-	assert.Equal(t, map[string]string{"a": "1", "b": "2", api.LabelNamespace: "live"}, target.Labels)
+	assert.Equal(t, map[string]string{"a": "1", "b": "2"}, target.Labels)
+	// The namespace is a metric dimension of its own now (§12), merged like a label: on a path
+	// shared across two of them the last merged one wins — arbitrary, but deterministic, which is
+	// what matters, since a value that differed between replicas would restart workers.
+	assert.Equal(t, api.DefaultNamespace, target.Namespace)
 
 	// Pins intersect: a path shared by a verbs-only request and a tcp-only one cannot satisfy
 	// both, and says so rather than quietly satisfying one. Both nodes offer both providers, so
@@ -839,9 +867,9 @@ func TestSharedPathSettingsResolveConservatively(t *testing.T) {
 		fleet.Nodes[name] = entry
 	}
 	pinned.Provider = api.ProviderPin{api.ProviderTCP}
-	fleet.Requests["pinned"] = state.Entry[state.RequestRecord]{Found: true, Value: state.RequestRecord{ID: "pinned", Spec: pinned, CreatedAt: created}}
+	fleet.Requests[rid("pinned")] = state.Entry[state.RequestRecord]{Found: true, Value: state.RequestRecord{ID: rid("pinned"), Spec: pinned, CreatedAt: created}}
 	other.Provider = api.ProviderPin{api.ProviderVerbs}
-	fleet.Requests["other"] = state.Entry[state.RequestRecord]{Found: true, Value: state.RequestRecord{ID: "other", Spec: other, CreatedAt: created}}
+	fleet.Requests[rid("other")] = state.Entry[state.RequestRecord]{Found: true, Value: state.RequestRecord{ID: rid("other"), Spec: other, CreatedAt: created}}
 	conflicted := Compute(fleet, Config{})
 	assert.Equal(t, api.StateInvalid, onlyPath(t, conflicted).State)
 	assert.Equal(t, api.ReasonPinNotViable, onlyPath(t, conflicted).ReasonCode)
@@ -859,9 +887,9 @@ func TestARepublishedFlowRebuildsTheSession(t *testing.T) {
 	oldID := sessionIDFor(fleet)
 
 	changed := newFleet().
-		node("studio-a", api.DomainMapping{Name: "cameras", Configured: true}).
+		node("studio-a").
 		node("edge-01").
-		flow("studio-a", "cameras", api.FlowInventory{ID: "flow-1", Definition: flowDef2, Producing: true}).
+		flow("studio-a", "media/cameras", api.FlowInventory{ID: "flow-1", Definition: flowDef2, Producing: true}).
 		request("cam1", flowRequest("cam1")).
 		session(state.SessionRecord{ID: oldID, Path: pathOf(fleet), FlowDefHash: state.FlowDefHash(flowDef), Fabric: "dc1", Interface: tcpInterface}).
 		build()
@@ -890,11 +918,13 @@ func TestAVanishedFabricFailsTheSessionWithoutRenegotiating(t *testing.T) {
 		Fabric: "dc1", Interface: tcpInterface,
 	}).
 		assignments("edge-01", api.AssignmentSet{Assignments: []api.Assignment{{
-			SessionID: sessionID, Role: api.RoleTarget, Domain: "ingest", FlowID: "flow-1", FlowDef: flowDef,
+			SessionID: sessionID, Role: api.RoleTarget,
+			Domain: api.Domain{Area: "fast", Elements: []string{"ingest"}}, FlowID: "flow-1", FlowDef: flowDef,
 			Fabric: "dc1", Interface: tcpInterface,
 		}}}).
 		assignments("studio-a", api.AssignmentSet{Assignments: []api.Assignment{{
-			SessionID: sessionID, Role: api.RoleInitiator, Domain: "cameras", FlowID: "flow-1",
+			SessionID: sessionID, Role: api.RoleInitiator,
+			Domain: api.Domain{Area: "media", Elements: []string{"cameras"}}, FlowID: "flow-1",
 			Fabric: "dc1", Interface: tcpInterface, Epoch: "epoch-a", TargetInfo: `{"id":"x"}`,
 		}}})
 	entry := b.fleet.Nodes["edge-01"]
@@ -923,21 +953,21 @@ func TestAnInvalidRequestStartsNothing(t *testing.T) {
 	t.Parallel()
 
 	spec := flowRequest("bad")
-	spec.Destinations[0].Root = "bulk"
+	spec.Destinations[0].Domain.Area = "bulk"
 
 	fleet := base().request("bad", spec).build()
 	result := Compute(fleet, Config{})
 
-	assert.Equal(t, api.StateInvalid, result.Requests["bad"].State)
-	assert.Equal(t, api.ReasonUnknownOutputRoot, result.Requests["bad"].ReasonCode)
+	assert.Equal(t, api.StateInvalid, result.Requests[rid("bad")].State)
+	assert.Equal(t, api.ReasonUnknownArea, result.Requests[rid("bad")].ReasonCode)
 
-	require.Len(t, result.Requests["bad"].Paths, 1)
-	assert.Equal(t, api.StateInvalid, result.Requests["bad"].Paths[0].State)
-	assert.Empty(t, result.Requests["bad"].Paths[0].SessionID)
+	require.Len(t, result.Requests[rid("bad")].Paths, 1)
+	assert.Equal(t, api.StateInvalid, result.Requests[rid("bad")].Paths[0].State)
+	assert.Empty(t, result.Requests[rid("bad")].Paths[0].SessionID)
 	assert.Len(t, result.Sessions, 1, "only the valid request has a session")
 
 	// And the valid request alongside it is untouched.
-	assert.Equal(t, api.StateEstablishing, result.Requests["cam1"].State)
+	assert.Equal(t, api.StateEstablishing, result.Requests[rid("cam1")].State)
 	assert.Len(t, result.Assignments["edge-01"].Assignments, 1)
 }
 
@@ -948,22 +978,22 @@ func TestTwoSourcesIntoOneDestinationFlowIsRejected(t *testing.T) {
 	second.Source.Node = "studio-b"
 
 	fleet := base().
-		node("studio-b", api.DomainMapping{Name: "cameras", Configured: true}).
-		flow("studio-b", "cameras", api.FlowInventory{ID: "flow-1", Definition: flowDef, Producing: true}).
+		node("studio-b").
+		flow("studio-b", "media/cameras", api.FlowInventory{ID: "flow-1", Definition: flowDef, Producing: true}).
 		request("from-b", second).
 		build()
 
 	// The later request is the one that fails; the older path is the one probably already
 	// carrying media.
-	entry := fleet.Requests["from-b"]
+	entry := fleet.Requests[rid("from-b")]
 	entry.Value.CreatedAt = created.Add(time.Hour)
-	fleet.Requests["from-b"] = entry
+	fleet.Requests[rid("from-b")] = entry
 
 	result := Compute(fleet, Config{})
 
-	assert.Equal(t, api.StateEstablishing, result.Requests["cam1"].State)
-	assert.Equal(t, api.StateInvalid, result.Requests["from-b"].State)
-	assert.Equal(t, api.ReasonFlowConflict, result.Requests["from-b"].ReasonCode)
+	assert.Equal(t, api.StateEstablishing, result.Requests[rid("cam1")].State)
+	assert.Equal(t, api.StateInvalid, result.Requests[rid("from-b")].State)
+	assert.Equal(t, api.ReasonFlowConflict, result.Requests[rid("from-b")].ReasonCode)
 	assert.Len(t, result.Sessions, 1)
 }
 
@@ -978,20 +1008,20 @@ func TestRequestStatusAggregatesOverItsPaths(t *testing.T) {
 	spec.Source.Select = api.Selector{GroupHint: &api.GroupHintSelector{Name: "Studio A:Camera 1"}}
 
 	fleet := newFleet().
-		node("studio-a", api.DomainMapping{Name: "cameras", Configured: true}).
+		node("studio-a").
 		node("edge-01").
-		flow("studio-a", "cameras", api.FlowInventory{
+		flow("studio-a", "media/cameras", api.FlowInventory{
 			ID: "flow-video", Definition: flowDef, Producing: true,
 			GroupHint: &api.GroupHint{Name: "Studio A:Camera 1", Type: "video"},
 		}).
-		flow("studio-a", "cameras", api.FlowInventory{
+		flow("studio-a", "media/cameras", api.FlowInventory{
 			ID: "flow-audio", Definition: flowDef, Producing: false,
 			GroupHint: &api.GroupHint{Name: "Studio A:Camera 1", Type: "audio"},
 		}).
 		request("camera-1", spec).
 		build()
 
-	status := Compute(fleet, Config{}).Requests["camera-1"]
+	status := Compute(fleet, Config{}).Requests[rid("camera-1")]
 
 	assert.Len(t, status.Paths, 2)
 	assert.Equal(t, 1, status.Counts[api.StateEstablishing])
@@ -1008,11 +1038,11 @@ func TestASelectorMatchingNothingWaits(t *testing.T) {
 	spec.Source.Select = api.Selector{GroupHint: &api.GroupHintSelector{Name: "nothing"}}
 
 	result := Compute(base().request("camera-9", spec).build(), Config{})
-	assert.Equal(t, api.StateWaiting, result.Requests["camera-9"].State)
-	assert.Equal(t, api.ReasonFlowNotFound, result.Requests["camera-9"].ReasonCode)
+	assert.Equal(t, api.StateWaiting, result.Requests[rid("camera-9")].State)
+	assert.Equal(t, api.ReasonFlowNotFound, result.Requests[rid("camera-9")].ReasonCode)
 
 	gone := base().request("camera-9", spec).unlease("studio-a").build()
-	waiting := Compute(gone, Config{}).Requests["camera-9"]
+	waiting := Compute(gone, Config{}).Requests[rid("camera-9")]
 	assert.Equal(t, api.StateWaiting, waiting.State)
 	assert.Equal(t, api.ReasonAgentNotLeased, waiting.ReasonCode,
 		"an agent that is not reporting has not told us the selector matched nothing")
@@ -1028,7 +1058,7 @@ func TestComputeIsDeterministic(t *testing.T) {
 	spec.Source.Select = api.Selector{GroupHint: &api.GroupHintSelector{Name: "Studio A:Camera 1"}}
 
 	fleet := newFleet().
-		node("studio-a", api.DomainMapping{Name: "cameras", Configured: true}).
+		node("studio-a").
 		node("edge-01").
 		request("camera-1", spec).
 		request("cam1", flowRequest("cam1")).
@@ -1055,7 +1085,7 @@ func newFleetWithFlow(fleet *state.Fleet, id string) {
 		GroupHint: &api.GroupHint{Name: "Studio A:Camera 1", Type: "video"},
 	}
 	if len(entry.Value.Domains) == 0 {
-		entry.Value.Domains = []api.DomainInventory{{Name: "cameras", Configured: true}}
+		entry.Value.Domains = []api.DomainInventory{{Domain: api.Domain{Area: "media", Elements: []string{"cameras"}}}}
 	}
 	entry.Value.Domains[0].Flows = append(entry.Value.Domains[0].Flows, flow)
 	fleet.Inventory["studio-a"] = entry
@@ -1068,8 +1098,8 @@ func newFleetWithFlow(fleet *state.Fleet, id string) {
 // the identity and the session ID are derived from (§10.6).
 func pathOf(fleet *state.Fleet) state.PathIdentity {
 	return state.PathIdentity{
-		Source:      api.FlowAddress{Node: "studio-a", Domain: "cameras", Flow: "flow-1"},
-		Destination: api.Destination{Node: "edge-01", Domain: []string{"ingest"}, Root: "fast"},
+		Source:      api.FlowAddress{Node: "studio-a", Domain: "media/cameras", Flow: "flow-1"},
+		Destination: api.Destination{Node: "edge-01", Domain: api.Domain{Area: "fast", Elements: []string{"ingest"}}},
 	}
 }
 
@@ -1077,22 +1107,28 @@ func sessionIDFor(fleet *state.Fleet) string {
 	return state.SessionID(pathOf(fleet), state.FlowDefHash(flowDef))
 }
 
-// --- namespaces: requests are a partition (§7b) ------------------------------------------
+// --- namespaces: an opt-in partition (§9.3) -----------------------------------------------
 
 // requestAt is `request` with an explicit UpdatedAt, which is what namespace-overlap precedence
 // turns on. The builder's default is the zero time, so tests that do not care get a tie broken
 // by request ID.
-func requestAt(b *fleetBuilder, id string, spec api.RequestSpec, updated time.Time) *fleetBuilder {
+func requestAt(b *fleetBuilder, name string, spec api.RequestSpec, updated time.Time) *fleetBuilder {
+	spec.Name = name
+	id := spec.RequestID()
 	b.fleet.Requests[id] = state.Entry[state.RequestRecord]{Found: true, Value: state.RequestRecord{
 		ID: id, Spec: spec, CreatedAt: created, UpdatedAt: updated,
 	}}
 	return b
 }
 
-// Two requests in one namespace may not carry the same path. The path is not the problem — it
-// is refcounted and works — but a namespace claims to be a partition, and a set of requests that
-// can quietly share an edge is not one.
-func TestTwoRequestsInOneNamespaceMayNotShareAPath(t *testing.T) {
+// **The default is `shared`, and overlap in it is free.** Two requests expanding onto one path
+// share one path, one session and one worker pair, which is §9.1's refcounting working exactly as
+// designed: nothing is doubled and nothing is corrupted.
+//
+// *This inverts the behaviour the tree had, where every namespace was exclusive.* That was the
+// position §9.3 supersedes, and the direction of the change is the permissive one — requests the
+// server used to refuse are now accepted.
+func TestOverlapIsPermittedInASharedNamespace(t *testing.T) {
 	t.Parallel()
 
 	fleet := base().build()
@@ -1100,56 +1136,117 @@ func TestTwoRequestsInOneNamespaceMayNotShareAPath(t *testing.T) {
 
 	result := Compute(fleet, Config{})
 
+	require.Len(t, result.Paths, 1, "one edge, held twice")
+	assert.Equal(t, []string{"default/cam1", "default/cam1-again"}, onlyPath(t, result).Requests,
+		"the refcount carries both")
+	assert.Equal(t, api.StateEstablishing, result.Requests[rid("cam1")].State)
+	assert.Equal(t, api.StateEstablishing, result.Requests[rid("cam1-again")].State)
+	assert.Empty(t, result.Requests[rid("cam1-again")].ReasonCode)
+	assert.Len(t, result.Sessions, 1)
+}
+
+// An explicit `shared` reads the same as an unset one. The zero value has a meaning and a record
+// that spells it out must not mean something else, or a re-apply of a namespace document would
+// change behaviour.
+func TestAnExplicitlySharedNamespaceIsTheSameAsNone(t *testing.T) {
+	t.Parallel()
+
+	fleet := base().namespace(api.DefaultNamespace, api.PathsShared).build()
+	requestAt(&fleetBuilder{fleet: fleet}, "cam1-again", flowRequest("cam1-again"), created.Add(time.Hour))
+
+	assert.Len(t, Compute(fleet, Config{}).Paths, 1)
+	assert.Equal(t, api.StateEstablishing, Compute(fleet, Config{}).Requests[rid("cam1-again")].State)
+}
+
+// Inside an `exclusive` namespace, two requests may not carry the same path. The path is not the
+// problem — it is refcounted and works — but such a namespace claims to be a partition, and a set
+// of requests that can quietly share an edge is not one.
+func TestTwoRequestsInAnExclusiveNamespaceMayNotShareAPath(t *testing.T) {
+	t.Parallel()
+
+	fleet := base().namespace(api.DefaultNamespace, api.PathsExclusive).build()
+	requestAt(&fleetBuilder{fleet: fleet}, "cam1-again", flowRequest("cam1-again"), created.Add(time.Hour))
+
+	result := Compute(fleet, Config{})
+
 	// The winner is untouched: one path, one session, and it is *not* refcounted to the loser.
 	require.Len(t, result.Paths, 1)
-	assert.Equal(t, []string{"cam1"}, onlyPath(t, result).Requests)
-	assert.Equal(t, api.StateEstablishing, result.Requests["cam1"].State)
-	assert.Empty(t, result.Requests["cam1"].ReasonCode)
+	assert.Equal(t, []string{"default/cam1"}, onlyPath(t, result).Requests)
+	assert.Equal(t, api.StateEstablishing, result.Requests[rid("cam1")].State)
+	assert.Empty(t, result.Requests[rid("cam1")].ReasonCode)
 
 	// The loser is INVALID and the message names who has it and what to do.
-	loser := result.Requests["cam1-again"]
+	loser := result.Requests[rid("cam1-again")]
 	assert.Equal(t, api.StateInvalid, loser.State)
 	assert.Equal(t, api.ReasonNamespaceOverlap, loser.ReasonCode)
 	assert.Contains(t, loser.Reason, `request "cam1" already replicates`)
-	assert.Contains(t, loser.Reason, "edge-01/ingest")
+	assert.Contains(t, loser.Reason, "edge-01/fast/ingest")
 	assert.Contains(t, loser.Reason, `namespace "default"`)
 }
 
-// The default namespace is a real namespace, not an exemption. A fleet driven from the CLI has
-// everything in it, so exempting it would buy nothing at all.
-func TestTheDefaultNamespaceIsNotExempt(t *testing.T) {
+// The rule is per namespace, and a namespace's policy reaches only its own requests. An exclusive
+// namespace beside a shared one must not make the shared one's overlaps illegal.
+func TestOneNamespacesPolicyDoesNotReachAnother(t *testing.T) {
 	t.Parallel()
 
-	fleet := base().request("cam1-again", flowRequest("cam1-again")).build()
-	result := Compute(fleet, Config{})
+	fleet := base().
+		namespace("strict", api.PathsExclusive).
+		request("arch", inNamespace(flowRequest("arch"), "archive")).
+		build()
 
-	assert.Equal(t, api.StateInvalid, result.Requests["cam1-again"].State,
-		"neither request carries a namespace label, so both are in %q", api.DefaultNamespace)
-	assert.Equal(t, api.ReasonNamespaceOverlap, result.Requests["cam1-again"].ReasonCode)
-}
-
-// Across namespaces sharing stays legal and refcounted — that is how fan-in is expressed, and
-// the rule must not reach it.
-func TestSharingAcrossNamespacesIsUntouched(t *testing.T) {
-	t.Parallel()
-
-	fleet := base().request("arch", inNamespace(flowRequest("arch"), "archive")).build()
 	result := Compute(fleet, Config{})
 
 	require.Len(t, result.Paths, 1)
-	assert.Equal(t, []string{"arch", "cam1"}, onlyPath(t, result).Requests)
-	assert.Equal(t, api.StateEstablishing, result.Requests["cam1"].State)
-	assert.Equal(t, api.StateEstablishing, result.Requests["arch"].State)
+	assert.Equal(t, []string{"archive/arch", "default/cam1"}, onlyPath(t, result).Requests)
+	assert.Equal(t, api.StateEstablishing, result.Requests[rid("cam1")].State)
+	assert.Equal(t, api.StateEstablishing,
+		result.Requests[api.RequestID{Namespace: "archive", Name: "arch"}].State)
+}
+
+// Across namespaces sharing stays legal even when both are exclusive — that is how fan-in is
+// expressed, and the rule must not reach it (§9.3).
+func TestSharingAcrossExclusiveNamespacesIsUntouched(t *testing.T) {
+	t.Parallel()
+
+	fleet := base().
+		namespace(api.DefaultNamespace, api.PathsExclusive).
+		namespace("archive", api.PathsExclusive).
+		request("arch", inNamespace(flowRequest("arch"), "archive")).
+		build()
+
+	result := Compute(fleet, Config{})
+
+	require.Len(t, result.Paths, 1)
+	assert.Equal(t, []string{"archive/arch", "default/cam1"}, onlyPath(t, result).Requests)
+	assert.Equal(t, api.StateEstablishing, result.Requests[rid("cam1")].State)
+	assert.Equal(t, api.StateEstablishing,
+		result.Requests[api.RequestID{Namespace: "archive", Name: "arch"}].State)
+}
+
+// Two requests of one *name* in two namespaces are two requests. That is the whole point of
+// scoping names to the namespace rather than fleet-wide (§9.3).
+func TestOneNameInTwoNamespacesIsTwoRequests(t *testing.T) {
+	t.Parallel()
+
+	fleet := base().request("cam1", inNamespace(flowRequest("cam1"), "archive")).build()
+
+	require.Len(t, fleet.Requests, 2)
+	result := Compute(fleet, Config{})
+	assert.Equal(t, api.StateEstablishing, result.Requests[rid("cam1")].State)
+	assert.Equal(t, api.StateEstablishing,
+		result.Requests[api.RequestID{Namespace: "archive", Name: "cam1"}].State)
+	assert.Equal(t, []string{"archive/cam1", "default/cam1"}, onlyPath(t, result).Requests,
+		"the refcount carries the qualified ID, or the two would be indistinguishable")
 }
 
 // **Losing an overlap does not stop media.** An overlapping leg goes down the same route as any
 // other invalid leg: it stops the request gaining new sessions, and the path itself — held by
-// the winner — carries on. This is the property that makes the rule safe to add to a fleet that
-// already has overlaps in it.
+// the winner — carries on. This is the property that makes the rule safe to turn on for a
+// namespace that already has overlaps in it.
 func TestAnOverlapLoserDoesNotDisturbTheRunningPath(t *testing.T) {
 	t.Parallel()
 
-	fleet := base().build()
+	fleet := base().namespace(api.DefaultNamespace, api.PathsExclusive).build()
 	requestAt(&fleetBuilder{fleet: fleet}, "cam1-again", flowRequest("cam1-again"), created.Add(time.Hour))
 	result := Compute(fleet, Config{})
 
@@ -1158,8 +1255,24 @@ func TestAnOverlapLoserDoesNotDisturbTheRunningPath(t *testing.T) {
 
 	// And the loser still reports the path, so an operator sees what it collided with rather
 	// than an empty request.
-	require.Len(t, result.Requests["cam1-again"].Paths, 1)
-	assert.Equal(t, api.StateEstablishing, result.Requests["cam1-again"].Paths[0].State)
+	require.Len(t, result.Requests[rid("cam1-again")].Paths, 1)
+	assert.Equal(t, api.StateEstablishing, result.Requests[rid("cam1-again")].Paths[0].State)
+}
+
+// An overlap makes the loser INVALID and does **not** make it unacceptable: it depends on another
+// request's expansion, which its author did not write and cannot enumerate. So it stays out of
+// [Result.Structural], which is the only thing a POST refuses (§7.2).
+func TestAnOverlapIsNotStructural(t *testing.T) {
+	t.Parallel()
+
+	fleet := base().namespace(api.DefaultNamespace, api.PathsExclusive).build()
+	requestAt(&fleetBuilder{fleet: fleet}, "cam1-again", flowRequest("cam1-again"), created.Add(time.Hour))
+	result := Compute(fleet, Config{})
+
+	assert.Equal(t, api.StateInvalid, result.Requests[rid("cam1-again")].State)
+	assert.NotContains(t, result.Structural, rid("cam1-again"),
+		"a POST would accept it and report the collision")
+	assert.Empty(t, result.Structural)
 }
 
 // Precedence is by UpdatedAt, so the request that was written most recently is the one refused.
@@ -1168,19 +1281,19 @@ func TestAnOverlapLoserDoesNotDisturbTheRunningPath(t *testing.T) {
 func TestTheMoreRecentlyWrittenRequestLosesTheOverlap(t *testing.T) {
 	t.Parallel()
 
-	older := base().build()
+	older := base().namespace(api.DefaultNamespace, api.PathsExclusive).build()
 	requestAt(&fleetBuilder{fleet: older}, "cam1", flowRequest("cam1"), created)
 	requestAt(&fleetBuilder{fleet: older}, "cam1-again", flowRequest("cam1-again"), created.Add(time.Hour))
-	assert.Equal(t, api.StateInvalid, Compute(older, Config{}).Requests["cam1-again"].State)
+	assert.Equal(t, api.StateInvalid, Compute(older, Config{}).Requests[rid("cam1-again")].State)
 
 	// Flip which one was written last and the verdict flips with it, even though "cam1" sorts
 	// first and was created at the same instant.
-	newer := base().build()
+	newer := base().namespace(api.DefaultNamespace, api.PathsExclusive).build()
 	requestAt(&fleetBuilder{fleet: newer}, "cam1", flowRequest("cam1"), created.Add(time.Hour))
 	requestAt(&fleetBuilder{fleet: newer}, "cam1-again", flowRequest("cam1-again"), created)
 	flipped := Compute(newer, Config{})
-	assert.Equal(t, api.StateInvalid, flipped.Requests["cam1"].State)
-	assert.Equal(t, api.StateEstablishing, flipped.Requests["cam1-again"].State)
+	assert.Equal(t, api.StateInvalid, flipped.Requests[rid("cam1")].State)
+	assert.Equal(t, api.StateEstablishing, flipped.Requests[rid("cam1-again")].State)
 }
 
 // Only the colliding leg is refused. A request fanning out to three destinations where one
@@ -1191,26 +1304,26 @@ func TestOnlyTheOverlappingLegIsRefused(t *testing.T) {
 
 	wide := flowRequest("wide")
 	wide.Destinations = []api.Destination{
-		{Node: "edge-01", Domain: []string{"ingest"}},
-		{Node: "edge-02", Domain: []string{"ingest"}},
+		{Node: "edge-01", Domain: api.Domain{Area: "fast", Elements: []string{"ingest"}}},
+		{Node: "edge-02", Domain: api.Domain{Area: "fast", Elements: []string{"ingest"}}},
 	}
 
-	fleet := base().node("edge-02").build()
+	fleet := base().namespace(api.DefaultNamespace, api.PathsExclusive).node("edge-02").build()
 	requestAt(&fleetBuilder{fleet: fleet}, "wide", wide, created.Add(time.Hour))
 	result := Compute(fleet, Config{})
 
 	// edge-01 collides with `cam1`; edge-02 does not and establishes.
 	require.Len(t, result.Paths, 2)
-	assert.Equal(t, api.StateInvalid, result.Requests["wide"].State)
-	assert.Equal(t, api.ReasonNamespaceOverlap, result.Requests["wide"].ReasonCode)
-	assert.Contains(t, result.Requests["wide"].Reason, "destination edge-01/ingest",
+	assert.Equal(t, api.StateInvalid, result.Requests[rid("wide")].State)
+	assert.Equal(t, api.ReasonNamespaceOverlap, result.Requests[rid("wide")].ReasonCode)
+	assert.Contains(t, result.Requests[rid("wide")].Reason, "destination edge-01/fast/ingest",
 		"the leg is named, because the sibling leg is fine")
 
 	for _, path := range result.Paths {
 		if path.Destination.Node == "edge-02" {
-			assert.Equal(t, []string{"wide"}, path.Requests)
+			assert.Equal(t, []string{"default/wide"}, path.Requests)
 		} else {
-			assert.Equal(t, []string{"cam1"}, path.Requests)
+			assert.Equal(t, []string{"default/cam1"}, path.Requests)
 		}
 	}
 }
@@ -1226,13 +1339,14 @@ func TestAnOverlapCanArriveWhenAProducerRetagsAFlow(t *testing.T) {
 
 	build := func(tag *api.GroupHint) *state.Fleet {
 		b := newFleet().
-			node("studio-a", api.DomainMapping{Name: "cameras", Configured: true}).
+			namespace(api.DefaultNamespace, api.PathsExclusive).
+			node("studio-a").
 			node("edge-01").
-			flow("studio-a", "cameras", api.FlowInventory{
+			flow("studio-a", "media/cameras", api.FlowInventory{
 				ID: "flow-video", Definition: flowDef, Producing: true,
 				GroupHint: &api.GroupHint{Name: "Studio A:Camera 1", Type: "video"},
 			}).
-			flow("studio-a", "cameras", api.FlowInventory{ID: "flow-1", Definition: flowDef, Producing: true, GroupHint: tag})
+			flow("studio-a", "media/cameras", api.FlowInventory{ID: "flow-1", Definition: flowDef, Producing: true, GroupHint: tag})
 		requestAt(b, "camera-1", hint, created)
 		requestAt(b, "pinned", flowRequest("pinned"), created.Add(time.Hour))
 		return b.build()
@@ -1240,16 +1354,277 @@ func TestAnOverlapCanArriveWhenAProducerRetagsAFlow(t *testing.T) {
 
 	// While flow-1 carries no hint, the two selectors are disjoint and both are fine.
 	before := Compute(build(nil), Config{})
-	assert.Equal(t, api.StateEstablishing, before.Requests["pinned"].State)
-	assert.Equal(t, api.StateEstablishing, before.Requests["camera-1"].State)
+	assert.Equal(t, api.StateEstablishing, before.Requests[rid("pinned")].State)
+	assert.Equal(t, api.StateEstablishing, before.Requests[rid("camera-1")].State)
 	assert.Len(t, before.Paths, 2)
 
 	// The producer republishes flow-1 under the hint the other request selects. Nothing was
 	// written, and the more recently written request is now INVALID.
 	after := Compute(build(&api.GroupHint{Name: "Studio A:Camera 1", Type: "audio"}), Config{})
-	assert.Equal(t, api.StateInvalid, after.Requests["pinned"].State)
-	assert.Equal(t, api.ReasonNamespaceOverlap, after.Requests["pinned"].ReasonCode)
-	assert.Equal(t, api.StateEstablishing, after.Requests["camera-1"].State,
+	assert.Equal(t, api.StateInvalid, after.Requests[rid("pinned")].State)
+	assert.Equal(t, api.ReasonNamespaceOverlap, after.Requests[rid("pinned")].ReasonCode)
+	assert.Equal(t, api.StateEstablishing, after.Requests[rid("camera-1")].State,
 		"the standing selector keeps both of its flows")
-	assert.Len(t, after.Requests["camera-1"].Paths, 2)
+	assert.Len(t, after.Requests[rid("camera-1")].Paths, 2)
+}
+
+// named builds a `name` domain selector from the `<area>/<elements>` spelling, splitting it the
+// way a manifest does. Tests are allowed the convenience the rest of the tree is not (§10.6).
+func named(domain string) api.DomainSelector {
+	segments := strings.Split(domain, "/")
+	return api.SelectDomain(api.Domain{Area: segments[0], Elements: segments[1:]})
+}
+
+// --- domain label selectors (§10.7) ------------------------------------------------------------
+
+// label attaches labels to one (node, domain).
+func (b *fleetBuilder) label(node, domain string, labels map[string]string) *fleetBuilder {
+	segments := strings.Split(domain, "/")
+	key := state.DomainKey{Node: node, Domain: domain}
+	b.fleet.DomainLabels[key] = state.Entry[api.DomainLabels]{Found: true, Value: api.DomainLabels{
+		Node:   node,
+		Domain: api.Domain{Area: segments[0], Elements: segments[1:]},
+		Labels: labels,
+	}}
+	return b
+}
+
+// selects returns a request whose source selects domains by label.
+func labelRequest(name string, labels map[string]string) api.RequestSpec {
+	spec := flowRequest(name)
+	spec.Source.Domain = api.SelectLabels(labels)
+	spec.Source.Select = api.Selector{GroupHint: &api.GroupHintSelector{Name: "Studio A:Camera 1"}}
+	return spec
+}
+
+// **The test to write first, and the one whose omission is silent** (§17). A broad label selector
+// on a node that is *also* a replication destination expands to a fixed path set and does not grow
+// on subsequent reconciles, because a label selector never matches a flow this project is itself
+// writing (§10.7).
+//
+// Every other label test passes with that filter missing.
+func TestALabelSelectorNeverMatchesThisProjectsOwnOutput(t *testing.T) {
+	t.Parallel()
+
+	hint := &api.GroupHint{Name: "Studio A:Camera 1", Type: "video"}
+
+	// One node, both a source and a destination: `media/cameras` holds a locally produced flow,
+	// and `fast/ingest` holds one this node's own target worker is writing.
+	fleet := newFleet().
+		node("studio-a").
+		node("edge-01").
+		flow("studio-a", "media/cameras", api.FlowInventory{
+			ID: "flow-local", Definition: flowDef, Producing: true, GroupHint: hint,
+		}).
+		flow("studio-a", "fast/ingest", api.FlowInventory{
+			ID: "flow-replicated", Definition: flowDef, Producing: true, GroupHint: hint, Replicated: true,
+		}).
+		// A sibling in the *same* domain that this node did not write. It is selectable like any
+		// other, which is the precision the per-flow rule buys over the directory-granular one it
+		// replaces (§10.7).
+		flow("studio-a", "fast/ingest", api.FlowInventory{
+			ID: "flow-sibling", Definition: flowDef, Producing: true, GroupHint: hint,
+		}).
+		label("studio-a", "media/cameras", map[string]string{"role": "cameras"}).
+		label("studio-a", "fast/ingest", map[string]string{"role": "cameras"}).
+		request("wide", labelRequest("wide", map[string]string{"role": "cameras"})).
+		build()
+
+	result := Compute(fleet, Config{})
+
+	flows := map[string]bool{}
+	for _, path := range result.Paths {
+		flows[path.Source.Flow] = true
+	}
+	assert.Equal(t, map[string]bool{"flow-local": true, "flow-sibling": true}, flows,
+		"the replicated flow is skipped; the one beside it is not")
+
+	// **And the skip is reported**, or the finer granularity is the less legible one: the domain is
+	// present, the flow is in GET /v1/flows, it matches the labels, and it quietly does not appear
+	// in the expansion (§9.1, §10.7).
+	status := result.Requests[rid("wide")]
+	require.Len(t, status.Excluded, 1)
+	assert.Equal(t, api.Exclusion{
+		Node: "studio-a", Domain: "fast/ingest", Flow: "flow-replicated",
+		Reason: api.ExclusionSelfOutput,
+	}, status.Excluded[0])
+	assert.Zero(t, status.ExcludedDropped)
+
+	// It does not grow on a second pass — the property this whole rule exists for. Compute is pure,
+	// so running it again over the same snapshot is the honest form of "the next reconcile".
+	assert.Len(t, Compute(fleet, Config{}).Paths, len(result.Paths))
+}
+
+// **Naming a domain directly reaches everything**, including a flow this node is writing (§10.7).
+// Explicit chaining is intent; matched chaining is emergence, and that is the cut.
+func TestNamingADomainDirectlyReachesItsReplicatedFlows(t *testing.T) {
+	t.Parallel()
+
+	spec := flowRequest("chain")
+	spec.Source.Domain = named("fast/ingest")
+	spec.Source.Select = api.Selector{Flow: "flow-replicated"}
+
+	fleet := newFleet().
+		node("studio-a").
+		node("edge-01").
+		flow("studio-a", "fast/ingest", api.FlowInventory{
+			ID: "flow-replicated", Definition: flowDef, Producing: true, Replicated: true,
+		}).
+		request("chain", spec).
+		build()
+
+	result := Compute(fleet, Config{})
+	require.Len(t, result.Paths, 1)
+	assert.Equal(t, "flow-replicated", onlyPath(t, result).Source.Flow)
+	assert.Empty(t, result.Requests[rid("chain")].Excluded, "nothing was skipped")
+}
+
+// **A label on a domain the node does not report is inert** (§10.7): it must expand to nothing
+// rather than to a path that cannot resolve. That is the pending case §10.7's "before or after" is
+// entirely about, and it resolves by itself when a producer appears.
+func TestALabelOnAnUnobservedDomainExpandsToNothing(t *testing.T) {
+	t.Parallel()
+
+	build := func(observed bool) *state.Fleet {
+		b := newFleet().node("studio-a").node("edge-01").
+			label("studio-a", "media/cameras", map[string]string{"role": "cameras"}).
+			request("wide", labelRequest("wide", map[string]string{"role": "cameras"}))
+		if observed {
+			b.flow("studio-a", "media/cameras", api.FlowInventory{
+				ID: "flow-1", Definition: flowDef, Producing: true,
+				GroupHint: &api.GroupHint{Name: "Studio A:Camera 1", Type: "video"},
+			})
+		}
+		return b.build()
+	}
+
+	pending := Compute(build(false), Config{})
+	assert.Empty(t, pending.Paths)
+	assert.Equal(t, api.StateWaiting, pending.Requests[rid("wide")].State,
+		"WAITING, which §7.2 already files as legitimately not an error")
+	assert.Empty(t, pending.Requests[rid("wide")].Excluded,
+		`"there is no such domain" is not an exclusion; nothing matched`)
+
+	assert.Len(t, Compute(build(true), Config{}).Paths, 1, "a producer appearing resolves it")
+}
+
+// Two keys ANDed: a domain carrying one of them does not match (§10.7).
+func TestALabelSelectorAndsItsKeys(t *testing.T) {
+	t.Parallel()
+
+	hint := &api.GroupHint{Name: "Studio A:Camera 1", Type: "video"}
+	fleet := newFleet().
+		node("studio-a").
+		node("edge-01").
+		flow("studio-a", "media/both", api.FlowInventory{ID: "flow-both", Definition: flowDef, Producing: true, GroupHint: hint}).
+		flow("studio-a", "media/one", api.FlowInventory{ID: "flow-one", Definition: flowDef, Producing: true, GroupHint: hint}).
+		label("studio-a", "media/both", map[string]string{"role": "cameras", "site": "studio-a"}).
+		label("studio-a", "media/one", map[string]string{"role": "cameras"}).
+		request("wide", labelRequest("wide", map[string]string{"role": "cameras", "site": "studio-a"})).
+		build()
+
+	result := Compute(fleet, Config{})
+	require.Len(t, result.Paths, 1)
+	assert.Equal(t, "flow-both", onlyPath(t, result).Source.Flow)
+}
+
+// **A self-pair a selector produced is elided, not rejected** (§7.2, §10.7).
+//
+// A named source resolving to the destination is an operator having written the same string twice
+// — a typo, decidable from the request, and refused as `same_endpoint`. A label selector matching
+// the destination's own domain is not a typo: it is the selector doing what it was asked to, and
+// refusing the request would put its author at the mercy of which domains happen to carry a label.
+func TestASelectorMatchingItsOwnDestinationIsElided(t *testing.T) {
+	t.Parallel()
+
+	hint := &api.GroupHint{Name: "Studio A:Camera 1", Type: "video"}
+
+	// Both domains are on the destination node, and both carry the label. One of them *is* the
+	// destination.
+	spec := labelRequest("wide", map[string]string{"role": "cameras"})
+	spec.Source.Node = "edge-01"
+	spec.Destinations = []api.Destination{{Node: "edge-01", Domain: api.Domain{Area: "fast", Elements: []string{"ingest"}}}}
+
+	fleet := newFleet().
+		node("edge-01").
+		node("edge-02").
+		flow("edge-01", "fast/ingest", api.FlowInventory{ID: "flow-a", Definition: flowDef, Producing: true, GroupHint: hint}).
+		flow("edge-01", "media/cameras", api.FlowInventory{ID: "flow-b", Definition: flowDef, Producing: true, GroupHint: hint}).
+		label("edge-01", "fast/ingest", map[string]string{"role": "cameras"}).
+		label("edge-01", "media/cameras", map[string]string{"role": "cameras"}).
+		request("wide", spec).
+		build()
+
+	result := Compute(fleet, Config{})
+
+	// The self-pairing is gone and the rest of the expansion stands.
+	require.Len(t, result.Paths, 1)
+	assert.Equal(t, "media/cameras", onlyPath(t, result).Source.Domain)
+	assert.NotEqual(t, api.StateInvalid, result.Requests[rid("wide")].State,
+		"eliding is not refusing: the request is perfectly good")
+
+	// The named form of the same pairing is refused, which is the other half of the cut.
+	named := flowRequest("typo")
+	named.Source.Node = "edge-01"
+	named.Source.Domain = api.SelectDomain(api.Domain{Area: "fast", Elements: []string{"ingest"}})
+	named.Source.Select = api.Selector{Flow: "flow-a"}
+	named.Destinations = spec.Destinations
+
+	refused := Compute(newFleet().node("edge-01").node("edge-02").request("typo", named).build(), Config{})
+	assert.Equal(t, api.ReasonSameEndpoint, refused.Requests[rid("typo")].ReasonCode)
+}
+
+// The exclusion list is capped, and a truncated one **reports its own count** — a silent cap here
+// reads as "nothing else was excluded" (§9.1).
+func TestTheExclusionListReportsWhatItDropped(t *testing.T) {
+	t.Parallel()
+
+	hint := &api.GroupHint{Name: "Studio A:Camera 1", Type: "video"}
+	b := newFleet().node("studio-a").node("edge-01").
+		label("studio-a", "fast/ingest", map[string]string{"role": "cameras"}).
+		request("wide", labelRequest("wide", map[string]string{"role": "cameras"}))
+
+	for i := range api.MaxExclusions + 5 {
+		b.flow("studio-a", "fast/ingest", api.FlowInventory{
+			ID: fmt.Sprintf("flow-%03d", i), Definition: flowDef,
+			Producing: true, GroupHint: hint, Replicated: true,
+		})
+	}
+
+	status := Compute(b.build(), Config{}).Requests[rid("wide")]
+	assert.Len(t, status.Excluded, api.MaxExclusions)
+	assert.Equal(t, 5, status.ExcludedDropped)
+}
+
+// A relabel moves a request's expansion, and it does so through the **ordinary reconcile**: label
+// records are desired state under `/desired/`, so they are inside the single List("") the snapshot
+// already takes and there is no new signalling (§8, §10.7).
+//
+// And a path the relabel still matches keeps its identity, which is the property the
+// annotate-don't-rename decision exists for (§5.4, §17).
+func TestARelabelMovesTheExpansionWithoutMovingIdentity(t *testing.T) {
+	t.Parallel()
+
+	hint := &api.GroupHint{Name: "Studio A:Camera 1", Type: "video"}
+	build := func(labels map[string]string) *state.Fleet {
+		return newFleet().node("studio-a").node("edge-01").
+			flow("studio-a", "media/cameras", api.FlowInventory{ID: "flow-1", Definition: flowDef, Producing: true, GroupHint: hint}).
+			flow("studio-a", "media/audio", api.FlowInventory{ID: "flow-2", Definition: flowDef, Producing: true, GroupHint: hint}).
+			label("studio-a", "media/cameras", map[string]string{"role": "cameras"}).
+			label("studio-a", "media/audio", labels).
+			request("wide", labelRequest("wide", map[string]string{"role": "cameras"})).
+			build()
+	}
+
+	before := Compute(build(map[string]string{"role": "audio"}), Config{})
+	require.Len(t, before.Paths, 1)
+
+	after := Compute(build(map[string]string{"role": "cameras"}), Config{})
+	require.Len(t, after.Paths, 2, "the relabel joined the second domain to the expansion")
+
+	// The path that matched before still has the same ID, so its session — and its worker — is
+	// untouched. A label is not in path identity (§5.4).
+	for id := range before.Paths {
+		assert.Contains(t, after.Paths, id, "an existing path must not be re-identified by a relabel")
+	}
 }

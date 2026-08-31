@@ -24,6 +24,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -38,9 +39,12 @@ import (
 // created it — the node still exists while its agent is being upgraded — and merging the two
 // would make a restarting agent look like a node that had never been configured.
 type NodeRecord struct {
-	Node         string              `json:"node"`
-	Capabilities api.Capabilities    `json:"capabilities"`
-	Domains      []api.DomainMapping `json:"domains"`
+	Node         string           `json:"node"`
+	Capabilities api.Capabilities `json:"capabilities"`
+
+	// **No domains.** A node's domains are discovered, so they are observed state and arrive
+	// through inventory (§6). *This record used to carry the agent's configured name→path
+	// mappings*, which is what the `-m` flag produced; both are gone (§16).
 
 	// RegisteredAt is when this node first registered, preserved across re-registrations so it
 	// reads as "known since" rather than "restarted at".
@@ -48,16 +52,6 @@ type NodeRecord struct {
 
 	// UpdatedAt is when the advertised capabilities last changed.
 	UpdatedAt time.Time `json:"updated_at"`
-}
-
-// Domain returns the node's mapping for a domain name.
-func (n NodeRecord) Domain(name string) (api.DomainMapping, bool) {
-	for _, mapping := range n.Domains {
-		if mapping.Name == name {
-			return mapping, true
-		}
-	}
-	return api.DomainMapping{}, false
 }
 
 // LeaseRecord is the liveness lease: observed state saying an agent instance currently holds
@@ -82,11 +76,40 @@ type LeaseRecord struct {
 	AcquiredAt time.Time `json:"acquired_at"`
 }
 
+// DomainKey addresses one label record: a node and a domain's rendered identity.
+//
+// The domain is the **rendered** string rather than the structured value, because a map key has to
+// be comparable and [api.Domain] holds a slice. Injective either way — neither an area name nor an
+// element can contain the separator (§10.6) — so nothing is lost.
+type DomainKey struct {
+	Node   string
+	Domain string
+}
+
+// NamespaceRecord is a namespace: durable desired state saying this partition exists and what
+// its rules are (§9.3).
+//
+// It is written eagerly, on the request write, when a request names a namespace with no record —
+// create-if-absent, never write-if-present, and before the request itself. Deriving a missing one
+// lazily at read time would be cheaper by one write and would quietly give back the property this
+// object exists for: a `GET /v1/namespaces` that invents rows is the label spelling again,
+// wearing a record's clothes.
+type NamespaceRecord struct {
+	Name string        `json:"name"`
+	Spec api.Namespace `json:"spec"`
+
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
 // RequestRecord is durable user intent (§3, §9.1).
 //
 // A request is never cancelled because its session is failing. Only a user removes one.
 type RequestRecord struct {
-	ID        string          `json:"id"`
+	// ID is the `(namespace, name)` pair. Stored rather than derived from the key, so that the
+	// key and its contents cannot disagree about which request they describe — the same
+	// discipline every other record here follows (see [decodeInto]).
+	ID        api.RequestID   `json:"id"`
 	Spec      api.RequestSpec `json:"spec"`
 	CreatedAt time.Time       `json:"created_at"`
 	UpdatedAt time.Time       `json:"updated_at"`
@@ -205,7 +228,16 @@ type Fleet struct {
 	Inventory map[string]Entry[api.InventorySnapshot]
 	Status    map[string]Entry[api.StatusSnapshot]
 
-	Requests map[string]Entry[RequestRecord]
+	Namespaces map[string]Entry[NamespaceRecord]
+
+	// DomainLabels is what an operator has called this fleet's domains, keyed on `(node, domain)`
+	// (§10.7). Desired state written by a user *about* a node, which is why it does not live
+	// under the node's registration — that key is written by the agent (§4).
+	DomainLabels map[DomainKey]Entry[api.DomainLabels]
+
+	// Requests is keyed on the whole ID, not on a bare name: two requests called `cam1` in two
+	// namespaces are two requests (§9.3).
+	Requests map[api.RequestID]Entry[RequestRecord]
 
 	Sessions    map[string]Entry[SessionRecord]
 	Assignments map[string]Entry[api.AssignmentSet]
@@ -232,22 +264,30 @@ func Load(ctx context.Context, s store.Store) (*Fleet, error) {
 	}
 
 	fleet := &Fleet{
-		Revision:    revision,
-		Nodes:       map[string]Entry[NodeRecord]{},
-		Leases:      map[string]Entry[LeaseRecord]{},
-		Inventory:   map[string]Entry[api.InventorySnapshot]{},
-		Status:      map[string]Entry[api.StatusSnapshot]{},
-		Requests:    map[string]Entry[RequestRecord]{},
-		Sessions:    map[string]Entry[SessionRecord]{},
-		Assignments: map[string]Entry[api.AssignmentSet]{},
+		Revision:     revision,
+		Nodes:        map[string]Entry[NodeRecord]{},
+		Leases:       map[string]Entry[LeaseRecord]{},
+		Inventory:    map[string]Entry[api.InventorySnapshot]{},
+		Status:       map[string]Entry[api.StatusSnapshot]{},
+		Namespaces:   map[string]Entry[NamespaceRecord]{},
+		DomainLabels: map[DomainKey]Entry[api.DomainLabels]{},
+		Requests:     map[api.RequestID]Entry[RequestRecord]{},
+		Sessions:     map[string]Entry[SessionRecord]{},
+		Assignments:  map[string]Entry[api.AssignmentSet]{},
 	}
 
 	for _, kv := range kvs {
 		switch {
 		case strings.HasPrefix(kv.Key, store.PrefixNodes):
 			decodeInto(fleet, kv, fleet.Nodes, func(r NodeRecord) string { return r.Node })
+		case strings.HasPrefix(kv.Key, store.PrefixDomains):
+			decodeInto(fleet, kv, fleet.DomainLabels, func(r api.DomainLabels) DomainKey {
+				return DomainKey{Node: r.Node, Domain: r.Domain.String()}
+			})
+		case strings.HasPrefix(kv.Key, store.PrefixNamespaces):
+			decodeInto(fleet, kv, fleet.Namespaces, func(r NamespaceRecord) string { return r.Name })
 		case strings.HasPrefix(kv.Key, store.PrefixRequests):
-			decodeInto(fleet, kv, fleet.Requests, func(r RequestRecord) string { return r.ID })
+			decodeInto(fleet, kv, fleet.Requests, func(r RequestRecord) api.RequestID { return r.ID })
 		case strings.HasPrefix(kv.Key, store.PrefixLeases):
 			decodeInto(fleet, kv, fleet.Leases, func(r LeaseRecord) string { return r.Node })
 		case strings.HasPrefix(kv.Key, store.PrefixInventory):
@@ -278,14 +318,18 @@ func Load(ctx context.Context, s store.Store) (*Fleet, error) {
 // unescaped original. Reading the name back out of the record means there is exactly one
 // unescaping in the system — none — and no way for a key and its contents to disagree about
 // which node they describe.
-func decodeInto[T any](fleet *Fleet, kv store.KV, into map[string]Entry[T], name func(T) string) {
+// The key type is a parameter because a request is keyed on the (namespace, name) pair while
+// everything else is keyed on a name (§9.3). A zero key is malformed either way: a record that
+// does not say what it is has nothing to be indexed by.
+func decodeInto[T any, K comparable](fleet *Fleet, kv store.KV, into map[K]Entry[T], name func(T) K) {
 	entry, err := decode[T](kv)
 	if err != nil {
 		fleet.Malformed = append(fleet.Malformed, Malformed{Key: kv.Key, Err: err})
 		return
 	}
 	key := name(entry.Value)
-	if key == "" {
+	var zero K
+	if key == zero {
 		fleet.Malformed = append(fleet.Malformed, Malformed{Key: kv.Key, Err: fmt.Errorf("record carries no name")})
 		return
 	}
@@ -304,6 +348,78 @@ func decode[T any](kv store.KV) (Entry[T], error) {
 		Rev:   kv.ModRevision,
 		Lease: kv.Lease,
 	}, nil
+}
+
+// Namespace returns a namespace's rules, defaulted for one with no record.
+//
+// A missing record is not an error and must not be treated as one: a namespace is auto-created on
+// first reference (§9.3), so the window between a request being written and its namespace record
+// existing is a real one — and a reader that refused to answer during it would report the request
+// as broken rather than as new.
+func (f *Fleet) Namespace(name string) api.Namespace {
+	if entry, ok := f.Namespaces[name]; ok {
+		return entry.Value.Spec.Normalise()
+	}
+	return api.Namespace{Name: name}.Normalise()
+}
+
+// NamespacesInUse counts the requests referencing each namespace, including ones with no record.
+//
+// It is what makes a refused DELETE legible — the count goes in the message — and what
+// `GET /v1/namespaces` reports beside each row.
+func (f *Fleet) NamespacesInUse() map[string]int {
+	counts := map[string]int{}
+	for id := range f.Requests {
+		counts[id.Namespace]++
+	}
+	return counts
+}
+
+// SortedRequestIDs returns every request ID in a stable order: by namespace, then by name.
+func (f *Fleet) SortedRequestIDs() []api.RequestID {
+	ids := make([]api.RequestID, 0, len(f.Requests))
+	for id := range f.Requests {
+		ids = append(ids, id)
+	}
+	SortRequestIDs(ids)
+	return ids
+}
+
+// SortRequestIDs orders IDs by namespace, then name — the order every rendering and every
+// deterministic pass over the request set uses.
+func SortRequestIDs(ids []api.RequestID) {
+	sort.Slice(ids, func(i, j int) bool {
+		if ids[i].Namespace != ids[j].Namespace {
+			return ids[i].Namespace < ids[j].Namespace
+		}
+		return ids[i].Name < ids[j].Name
+	})
+}
+
+// LabelsFor returns the operator's labels on one `(node, domain)`, or nil.
+//
+// A missing record is not an error and is the ordinary case: most domains carry no labels.
+func (f *Fleet) LabelsFor(node, domain string) map[string]string {
+	entry, ok := f.DomainLabels[DomainKey{Node: node, Domain: domain}]
+	if !ok {
+		return nil
+	}
+	return entry.Value.Labels
+}
+
+// SortedDomainKeys returns every label record's key in a stable order: by node, then by domain.
+func (f *Fleet) SortedDomainKeys() []DomainKey {
+	keys := make([]DomainKey, 0, len(f.DomainLabels))
+	for key := range f.DomainLabels {
+		keys = append(keys, key)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		if keys[i].Node != keys[j].Node {
+			return keys[i].Node < keys[j].Node
+		}
+		return keys[i].Domain < keys[j].Domain
+	})
+	return keys
 }
 
 // Live reports whether an agent instance currently holds this node's identity.
@@ -345,11 +461,30 @@ func (f *Fleet) Flows(node, domain string) []api.FlowInventory {
 		return nil
 	}
 	for _, d := range entry.Value.Domains {
-		if d.Name == domain {
+		if d.Domain.String() == domain {
 			return d.Flows
 		}
 	}
 	return nil
+}
+
+// Domain returns the structured identity of one observed domain, given its rendered name.
+//
+// The structure comes from the agent's own report rather than from splitting the string, which is
+// what keeps "a domain string is parsed at exactly one boundary" true: the manifest parses one,
+// and nothing else in the tree does (§10.6). It is what an assignment carries, so that the agent's
+// resolver takes structure and never text.
+func (f *Fleet) Domain(node, domain string) (api.Domain, bool) {
+	entry, ok := f.Inventory[node]
+	if !ok {
+		return api.Domain{}, false
+	}
+	for _, d := range entry.Value.Domains {
+		if d.Domain.String() == domain {
+			return d.Domain, true
+		}
+	}
+	return api.Domain{}, false
 }
 
 // SessionStatus returns what a node last reported about one session, by role.
@@ -388,18 +523,20 @@ const idLength = 32
 // and it stays the same path when the producer republishes the flow with a different
 // definition. The session underneath it is what changes; see [SessionID].
 //
-// The **output root is in it**, which §3's "(src flow address) → (dst node, dst domain)" does
-// not say and is worth the sentence. It is always the *resolved* root by the time an identity is
-// built, so two requests spelling one destination differently — one naming the node's only root,
-// one omitting it — still produce one path. What it separates is two requests naming the same
-// domain under *different* roots, and separating them is the point: that is one name over two
-// directories, which is the flat-namespace violation, and a violation has to be two things
-// before it can be reported as a conflict between them (§10.6). Folded into one ID they would
-// instead silently share a path and take whichever root merged first.
+// *The resolved output root used to be a term of its own here*, because a session's target worker
+// writes into a directory derived from it and a destination that moved to another root had to be a
+// different path rather than the same one relocated. The area is the first segment of the domain's
+// name now, so the term is redundant rather than dropped: `fast/ingest` and `bulk/ingest` are
+// already two identities (§5.4, §10.6).
+//
+// What that changes, deliberately: repointing an area's **directory** while keeping its name does
+// *not* re-identify a path, where moving a domain to another **area** still does. The first is an
+// operator relocating a mount, which every path through it should survive; the second is an
+// operator choosing a different destination, which is a different path by any reading.
 func (p PathIdentity) ID() string {
 	return hashID(pathIDTag,
 		p.Source.Node, p.Source.Domain, p.Source.Flow,
-		p.Destination.Node, p.Destination.DomainName(), p.Destination.Root)
+		p.Destination.Node, p.Destination.DomainName())
 }
 
 // SessionID derives a session's stable identifier from the path it realises and the source flow
@@ -410,14 +547,14 @@ func (p PathIdentity) ID() string {
 // happens the destination's local flow is wrong in a way no amount of reconnecting fixes. Since
 // the ID changes, the old session is torn down and a new one is built, which is the only
 // correct outcome.
-// The output root is in it for the same reason it is in [PathIdentity.ID], plus a stronger one:
-// a session's target worker writes into a directory derived from it, so a session that changed
-// root while keeping its ID would be one worker's flow moving house underneath a running
-// initiator (§10.6).
+// The area is inside [api.Destination.DomainName] rather than a term of its own, for the reason
+// given on [PathIdentity.ID] — and it matters more here, since a session's target worker writes
+// into a directory derived from it: a session that changed area while keeping its ID would be one
+// worker's flow moving house underneath a running initiator (§10.6).
 func SessionID(path PathIdentity, flowDefHash string) string {
 	return hashID(sessionIDTag,
 		path.Source.Node, path.Source.Domain, path.Source.Flow,
-		path.Destination.Node, path.Destination.DomainName(), path.Destination.Root,
+		path.Destination.Node, path.Destination.DomainName(),
 		flowDefHash)
 }
 

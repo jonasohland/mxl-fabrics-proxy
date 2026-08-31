@@ -179,40 +179,71 @@ type Capabilities struct {
 	// deliberately kept out of a job it cannot verify.
 	PortRange string `json:"port_range,omitempty"`
 
-	// OutputRoots are the directories this node permits replication to create domains under
-	// (§10.6). Empty means this node is not a replication destination at all, which is the
-	// default and the right posture for the one piece of configuration that grants the control
-	// plane write authority over a host's filesystem.
+	// Areas are the directories an operator has designated on this node as somewhere MXL domains
+	// live, each with its own `read` and `write` grants (§10.6). Empty means a node that offers no
+	// sources and accepts no destinations — the default, and the right posture for the one piece of
+	// configuration that grants this project any authority over a host's filesystem.
 	//
-	// A capability by the sharp test (§10.2): without it the server would accept a request whose
-	// destination cannot be materialised, and it is what the destination resolver's error message
-	// is built from.
-	OutputRoots []OutputRoot `json:"output_roots,omitempty"`
+	// **Readable areas are advertised too, and they pass the capability test rather than bending
+	// it** (§10.2). *An earlier reading had it the other way — search paths were not advertised, on
+	// the correct observation that the server made no wrong decision without them.* It does now: a
+	// domain's name is `<area>/<elements>`, so a server that does not hold the area table cannot
+	// render a domain's identity, resolve a name in a request, or tell an operator which area a
+	// label landed outside of. The grants come with the entry because "may this name be a
+	// destination" is request-time validation.
+	Areas []Area `json:"areas,omitempty"`
 }
 
-// OutputRoot is one directory an operator has designated as a place output domains may be
-// created (§10.6).
+// Area is one directory an operator has designated on a node as somewhere MXL domains live,
+// with a name and two independent grants (§10.6).
 //
-// Roots rather than output domains, which is the same shape as fabric attachments and for the
-// same reason: a node declares what it *has*, and a request names what it *wants* inside that.
-// An output domain has no meaning without a session behind it, so modelling it as durable node
-// configuration would mean provisioning every destination twice — once on the node, once in the
-// request — and would put a piece of high-level intent in the one place that cannot see it.
-type OutputRoot struct {
-	// Name is how a request names the root. It never becomes part of a path: the agent looks it
-	// up among the roots it advertises and joins the domain name onto the path it finds.
+// **`read` is the whole of this project's authority to discover and observe domains under that
+// directory; `write` is the whole of its authority to create them and write flows into them.**
+// Neither implies the other, both default false, and an area granting neither is refused at
+// startup as a line that does nothing.
+//
+// *This supersedes `--search-path` and `--output-root` as separate concepts.* They were already
+// counterparts and already had to be read as a pair; making them one noun with two bits is what
+// that was asking for. The arrangement an operator actually reaches for — one MXL area per host,
+// with a subtree replication may write into — stops being an exception to an overlap rule and
+// becomes two ordinary areas.
+//
+// Areas rather than domains, which is the same shape as fabric attachments and for the same
+// reason: a node declares what it *has*, and a request names what it *wants* inside that. A
+// domain has no lifecycle of its own — it is materialised by the first path that targets it and
+// forgotten when the last one goes — so modelling one as durable node configuration would mean
+// provisioning every destination twice.
+type Area struct {
+	// Name is how a domain in this area is addressed: it is the **first segment of that domain's
+	// fleet-wide name** (§10.6). It never becomes part of a path — the agent looks it up among
+	// the areas it advertises and joins the domain's elements onto the path it finds.
+	//
+	// Unique per node, which is what keeps a rendered domain name unambiguous about where its
+	// first segment stops.
 	Name string `json:"name"`
 
-	// Path is the local directory. Diagnostics only — the server never sends a path to an agent,
-	// exactly as with [DomainMapping.Path].
+	// Path is the local directory. Diagnostics only — the server never sends a path to an agent;
+	// it sends the name and the agent resolves it against its own configuration.
+	//
+	// Repointing it while keeping the name **does not re-identify anything** on the node: a
+	// domain's name is `<area>/<elements>`, so paths and sessions survive the move rather than
+	// rebuilding (§5.4).
 	Path string `json:"path,omitempty"`
+
+	// Read grants discovering and observing domains under this directory. A node with no readable
+	// area offers no sources.
+	Read bool `json:"read"`
+
+	// Write grants creating domains here and writing flows into them. A node with no writable
+	// area accepts no destinations at all.
+	Write bool `json:"write"`
 }
 
-// FindRoot returns the advertised output root of that name, or nil.
-func (c Capabilities) FindRoot(name string) *OutputRoot {
-	for i := range c.OutputRoots {
-		if c.OutputRoots[i].Name == name {
-			return &c.OutputRoots[i]
+// FindArea returns the advertised area of that name, or nil.
+func (c Capabilities) FindArea(name string) *Area {
+	for i := range c.Areas {
+		if c.Areas[i].Name == name {
+			return &c.Areas[i]
 		}
 	}
 	return nil
@@ -226,35 +257,6 @@ func (c Capabilities) FindFabric(provider Provider, fabric string) *FabricAttach
 		}
 	}
 	return nil
-}
-
-// DomainMapping is one **input** MXL domain the agent knows about: somewhere this node reads
-// from, and a replication source (§6.2, §10.6).
-//
-// Destinations are not here and never were a kind of mapping. An output domain is named by a
-// request and materialised under an [OutputRoot]; the two roles are separate mechanisms because
-// they sit in different layers — an input domain is observed state, something the node *has*,
-// while an output domain is derived state, something a request *asks for* (§4, §10.6).
-type DomainMapping struct {
-	// Name is how the domain is addressed fleet-wide. Paths are agent-local and are never
-	// accepted from the API (§7.2).
-	Name string `json:"name"`
-
-	// Path is the local filesystem path. Diagnostics only — the server never sends a path back
-	// to an agent, it sends the name and the agent resolves it.
-	Path string `json:"path,omitempty"`
-
-	// Configured distinguishes an explicitly mapped input domain from one found by a search
-	// path. It is **descriptive**, and nothing keys authority off it.
-	//
-	// It used to be the security bit: before output roots existed, a destination was an input
-	// mapping and this field was what separated one from a directory that merely happened to be
-	// discovered (§7.2, §13). That is no longer how a destination is authorised — the resolver
-	// consults no observed state at all now, only the node's configured roots and the two names
-	// in the assignment (§10.6) — and this field is left as what it always literally said: where
-	// this domain came from. It is what `GET /v1/nodes/{node}/domains` renders, and it is why a
-	// discovered domain is absent from registration but present in inventory.
-	Configured bool `json:"configured"`
 }
 
 // NodeRegistration is POST /agent/v1/register (§9.2).
@@ -271,8 +273,11 @@ type NodeRegistration struct {
 	// with [CodeNodeClaimed] rather than quietly taking over.
 	Instance string `json:"instance"`
 
-	Capabilities Capabilities    `json:"capabilities"`
-	Domains      []DomainMapping `json:"domains"`
+	// **Registration carries no domains** (§6). *This supersedes a `domains` field carrying the
+	// agent's configured name→path mappings.* There are none to carry: a node's domains are
+	// discovered, so they are observed state and reach the server through inventory, and what they
+	// are *called* is an API concern rather than agent configuration (§10.7).
+	Capabilities Capabilities `json:"capabilities"`
 }
 
 // RegistrationResponse is the server's answer to a successful registration.

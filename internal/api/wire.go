@@ -96,37 +96,31 @@ type ReasonCode string
 const (
 	// --- INVALID: needs user action, never resolves by itself (§7.2) ---
 
-	// ReasonDomainNotMapped is a destination domain that is not an explicitly configured
-	// mapping on the destination agent.
+	// ReasonUnknownArea is a destination naming an area the node does not advertise (§10.6).
 	//
-	// **No longer emitted (§10.6).** A destination is a name materialised under an output root
-	// now, not an input mapping, so the four codes below replace this one. Retained because it
-	// is a value older servers produced and a client switching on it should keep working.
-	ReasonDomainNotMapped ReasonCode = "domain_not_mapped"
-
-	// ReasonNoOutputRoot is a destination node advertising no output root at all, and therefore
-	// not a replication destination (§10.6).
+	// This and [ReasonAreaNotWritable] carry the single most important invariant in the design
+	// (§13): **a destination is always a name inside an area the operator granted writing on**,
+	// never a path from the API, which is what stops this being a remote arbitrary-filesystem-write
+	// primitive on every node in the fleet. It holds regardless of what authentication is
+	// configured. A node advertising no writable area at all is this code with a reason string
+	// saying so, rather than a code of its own.
 	//
-	// This and the three below are what carry the single most important invariant in the design
-	// (§13): a destination is always a name inside an operator-configured root, never a path
-	// from the API, which is what stops this being a remote arbitrary-filesystem-write primitive
-	// on every node in the fleet. It holds regardless of what authentication is configured.
+	// *This supersedes `no_output_root`, `unknown_output_root` and `ambiguous_output_root`* (§7.2).
+	// The third is structurally unreachable now that a destination always names its area — there is
+	// no "advertises several and the request named none" — and the first collapsed into the second
+	// once the grant became a field on an entry rather than the identity of a separate table.
+	ReasonUnknownArea ReasonCode = "unknown_area"
+
+	// ReasonAreaNotWritable is a destination naming an area the node advertises without the
+	// `write` grant (§10.6).
 	//
-	// Distinct from [ReasonUnknownOutputRoot] because they are different operator problems: this
-	// one is a node that was never configured to receive, that one is a typo or a request aimed
-	// at the wrong node.
-	ReasonNoOutputRoot ReasonCode = "no_output_root"
+	// Distinct from [ReasonUnknownArea] because they are different operator problems: this one is
+	// an area that exists and is read-only, that one is a typo or a request aimed at the wrong
+	// node.
+	ReasonAreaNotWritable ReasonCode = "area_not_writable"
 
-	// ReasonUnknownOutputRoot is a request naming an output root the destination node does not
-	// advertise.
-	ReasonUnknownOutputRoot ReasonCode = "unknown_output_root"
-
-	// ReasonAmbiguousOutputRoot is a request naming no root against a node advertising more than
-	// one. The candidates are in the accompanying prose; the server never picks one (§10.6).
-	ReasonAmbiguousOutputRoot ReasonCode = "ambiguous_output_root"
-
-	// ReasonMalformedDomainName is a destination domain name that is not a single plain path
-	// element ([ValidDomainName]).
+	// ReasonMalformedDomainName is a destination domain that is not an area name plus a list of
+	// clean path elements ([Domain.Valid]).
 	//
 	// Ordinarily unreachable from the user API, which refuses the same names at POST with a 400.
 	// It exists for the reconcile path, which re-validates stored requests: one written directly
@@ -134,27 +128,19 @@ const (
 	// agent.
 	ReasonMalformedDomainName ReasonCode = "malformed_domain_name"
 
-	// ReasonDomainNameInUse is a destination domain name that already means something else on
-	// that node — an input mapping, a discovered domain, or an output domain another request is
-	// materialising under a different root.
+	// ReasonDomainNameInUse is a destination domain that **nests** with one another path is
+	// already materialising on that node — `fast/studio-a` against `fast/studio-a/cam1`.
 	//
-	// Names are flat per node (§10.6), and this is not tidiness: the assignment, the path
-	// identity, the session identity and the `domain` metric label all carry a single string, so
-	// two roots holding an "ingest" each would be two paths with one address. Resolved
-	// oldest-first like the other conflicts, so a new request never invalidates a path that is
-	// probably already carrying media.
+	// One domain directory containing another is a shape nothing else in the design has: the
+	// outer one's flows and the inner one's would share a tree, and removing either is a question
+	// with no answer. It governs what a request may ask to *create*; a directory layout some other
+	// actor produces is that actor's business, and discovery reports what it finds (§10.6).
+	//
+	// *It used to cover two more collisions, and there was a `domain_path_in_use` beside it.* Two
+	// output domains sharing a name under different roots is unconstructible now that the area is
+	// in the name — `fast/ingest` and `bulk/ingest` are two strings — and the path collision went
+	// with the input mappings it policed (§6, §16).
 	ReasonDomainNameInUse ReasonCode = "domain_name_in_use"
-
-	// ReasonDomainPathInUse is a destination domain whose *name* is free on that node but whose
-	// resolved directory is one the node already maps as an input domain.
-	//
-	// Reachable only because an output root is permitted to be an ancestor of an input mapping
-	// (§10.6) — `-m cams=/dev/shm/mxl/cameras` under root `fast=/dev/shm/mxl` collides on the
-	// path while the names differ. Kept distinct from [ReasonDomainNameInUse] because the
-	// diagnosis and the fix are different: that one is two things called one name, this one is
-	// two names for one directory, and fixing it means renaming the output domain or re-mapping
-	// the input rather than picking a different root.
-	ReasonDomainPathInUse ReasonCode = "domain_path_in_use"
 
 	// ReasonSameEndpoint is a source and destination with the same (node, domain).
 	ReasonSameEndpoint ReasonCode = "same_endpoint"

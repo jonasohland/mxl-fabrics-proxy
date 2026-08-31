@@ -21,7 +21,7 @@ func TestUnknownFieldsAreIgnored(t *testing.T) {
 		require.NoError(t, json.Unmarshal([]byte(`{
 			"session_id": "s-1",
 			"role": "target",
-			"domain": "ingest",
+			"domain": {"area": "fast", "elements": ["ingest"]},
 			"bandwidth_budget_bps": 1250000000,
 			"interface": {"provider": "verbs", "caps_flags": ["REMOTE_WRITE"], "max_message_size": 1048576, "future_knob": true}
 		}`), &assignment))
@@ -44,14 +44,15 @@ func TestUnknownFieldsAreIgnored(t *testing.T) {
 			"instance": "1e1d",
 			"capabilities": {
 				"fabrics": [{"provider":"tcp","fabric":"dc1","address":"10.0.0.1","numa_node":0}],
-				"output_roots": [{"name":"fast","path":"/dev/shm/mxl","capacity_bytes":0}]
+				"areas": [{"name":"fast","path":"/dev/shm/mxl","read":true,"write":true,"capacity_bytes":0}]
 			},
 			"zone": "rack-3"
 		}`), &reg))
 		require.Len(t, reg.Capabilities.Fabrics, 1)
 		assert.Equal(t, "dc1", reg.Capabilities.Fabrics[0].Fabric)
-		require.Len(t, reg.Capabilities.OutputRoots, 1)
-		assert.Equal(t, "fast", reg.Capabilities.OutputRoots[0].Name)
+		require.Len(t, reg.Capabilities.Areas, 1)
+		assert.Equal(t, "fast", reg.Capabilities.Areas[0].Name)
+		assert.True(t, reg.Capabilities.Areas[0].Write)
 	})
 
 	t.Run("inventory", func(t *testing.T) {
@@ -113,8 +114,7 @@ func TestAssignmentRoleShapes(t *testing.T) {
 	target := Assignment{
 		SessionID: "s-1",
 		Role:      RoleTarget,
-		Domain:    "ingest",
-		Root:      "fast",
+		Domain:    Domain{Area: "fast", Elements: []string{"ingest"}},
 		FlowDef:   json.RawMessage(`{"id":"abc"}`),
 		Interface: InterfaceConfig{Provider: ProviderVerbs, CapFlags: []CapFlag{CapRemoteWrite}},
 		Fabric:    "ib-fabric-a",
@@ -124,16 +124,19 @@ func TestAssignmentRoleShapes(t *testing.T) {
 	assert.NotContains(t, string(encoded), `"epoch"`)
 	assert.NotContains(t, string(encoded), `"target_info"`)
 	assert.Contains(t, string(encoded), `"fabric":"ib-fabric-a"`)
-	// The root is meaningful for a target only: it is where the output domain is materialised
-	// (§10.6), and an initiator's domain is an input one resolved through inventory instead.
-	assert.Contains(t, string(encoded), `"root":"fast"`)
 	assert.True(t, target.Role.IsTarget())
+
+	// **One domain field, the same shape for both roles** (§10.6). *This supersedes a rendered
+	// `domain` string plus `output_domain` elements plus a `root` name that only a target used.*
+	assert.Contains(t, string(encoded), `"domain":{"area":"fast","elements":["ingest"]}`)
+	assert.NotContains(t, string(encoded), `"root"`)
+	assert.NotContains(t, string(encoded), `"output_domain"`)
 
 	initiator := Assignment{
 		SessionID:  "s-1",
 		Role:       RoleInitiator,
 		Epoch:      "sha256:...",
-		Domain:     "cameras",
+		Domain:     Domain{Area: "media", Elements: []string{"cameras"}},
 		FlowID:     "abc",
 		TargetInfo: `{"id":"1"}`,
 		Peer:       &PeerEndpoint{Node: "edge-01", Address: "10.0.2.4", Service: "24012"},
@@ -142,34 +145,9 @@ func TestAssignmentRoleShapes(t *testing.T) {
 	require.NoError(t, err)
 	assert.Contains(t, string(encoded), `"epoch"`)
 	assert.NotContains(t, string(encoded), `"flow_def"`)
-	assert.NotContains(t, string(encoded), `"root"`)
+	assert.Contains(t, string(encoded), `"domain":{"area":"media","elements":["cameras"]}`,
+		"the same field, carrying the same kind of value, whichever end this is")
 	assert.False(t, initiator.Role.IsTarget())
-}
-
-// Version skew resolves in the safe direction (§13.1, §10.6). Servers upgrade first, so the case
-// is a new server's assignment reaching an old agent: the agent ignores the root it does not
-// know about, looks the domain up among its input mappings, does not find it, and reports a
-// failed session with a reason. Legible, and it fails closed — which is why this needs no
-// protocol bump.
-func TestAnOlderAgentIgnoresTheOutputRoot(t *testing.T) {
-	t.Parallel()
-
-	// What such an agent's decoder amounts to: the type as it was before Root existed.
-	var old struct {
-		SessionID string `json:"session_id"`
-		Role      Role   `json:"role"`
-		Domain    string `json:"domain"`
-	}
-	encoded, err := json.Marshal(Assignment{
-		SessionID: "s-1", Role: RoleTarget, Domain: "ingest", Root: "fast",
-	})
-	require.NoError(t, err)
-	require.NoError(t, json.Unmarshal(encoded, &old))
-
-	assert.Equal(t, "ingest", old.Domain)
-	// The name it is left holding is a plain domain name, not a path — so the worst it can do is
-	// fail to resolve it. Nothing about dropping the root can widen where it writes.
-	assert.NoError(t, ValidDomainName(old.Domain))
 }
 
 // Path embeds PathStatus, so a request's per-path summary and the full path view agree on
@@ -221,6 +199,6 @@ func TestPathHelpersEscapeNodeNames(t *testing.T) {
 
 	assert.Equal(t, "/agent/v1/edge-01/assignments", AssignmentsPath("edge-01"))
 	assert.Equal(t, "/agent/v1/rack%2Fedge-01/inventory", InventoryPath("rack/edge-01"))
-	assert.Equal(t, "/v1/requests/a%20b", RequestPath("a b"))
+	assert.Equal(t, "/v1/namespaces/nab/requests/a%20b", RequestPath(RequestID{Namespace: "nab", Name: "a b"}))
 	assert.Equal(t, "/v1/nodes/edge-01/domains", NodeDomainsPath("edge-01"))
 }

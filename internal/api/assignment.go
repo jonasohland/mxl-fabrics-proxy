@@ -93,47 +93,26 @@ type Assignment struct {
 	// configurable connect timeout — on an unreachable target.
 	Epoch string `json:"epoch,omitempty"`
 
-	// Domain is a domain **name**, never a path. The server has no business knowing where a
-	// domain lives on disk, and accepting a path here would make the API a remote
-	// arbitrary-filesystem-write primitive (§7.2, §13).
+	// Domain is **one field for both roles**, carrying the same `(area, elements)` value whichever
+	// end this assignment is (§10.6). The server has no business knowing where a domain lives on
+	// disk, and accepting a path here would make the API a remote arbitrary-filesystem-write
+	// primitive (§7.2, §13).
 	//
-	// How the agent resolves it depends on the role, and the asymmetry is the point (§10.6). For
-	// an initiator it is an *input* domain, looked up among the domains this agent observes —
-	// configured mappings and search-path finds alike — because a source is by definition
-	// something the node already has. For a target it is an *output* domain, resolved from
-	// [Assignment.Root] and [Assignment.OutputDomain] with no reference to observed state at all.
+	// *This used to be three fields: a rendered `domain` string for both roles, plus `output_domain`
+	// elements and a `root` name that only a target used.* One identity grammar collapses them —
+	// a domain is `<area>/<elements>` whether this node reads it or writes it — and the collapse is
+	// the clearest single win of the change at the wire level.
 	//
-	// A **string in both roles**, because the two roles' domains are different kinds of thing and
-	// only one of them decomposes. An initiator's is an observed name, which for a discovered
-	// domain is an absolute path and is opaque; a target's is a rooted element list, and its
-	// elements travel in [Assignment.OutputDomain]. What this field carries in both cases is the
-	// name — what the agent logs, what the `domain` metric label reports, and what identifies the
-	// domain fleet-wide.
-	Domain string `json:"domain"`
-
-	// OutputDomain is the element list [Assignment.Domain] renders from, for [RoleTarget] only.
+	// The agent resolves it the same way in both directions, differing only in whether the `write`
+	// grant is required. For an initiator it is looked up among the domains this agent observes,
+	// because a source is by definition something the node already has; for a target it is resolved
+	// from this agent's own area table with no reference to observed state at all, which is what
+	// keeps the security-critical path a pure function of one config file and one name.
 	//
-	// The agent resolves the destination directory from *this* rather than by splitting the name,
-	// so that nothing outside the CLI's manifest parser ever turns a domain string back into path
-	// elements. The security-critical resolver takes structure and never text (§10.6, §13).
-	//
-	// Redundant with [Assignment.Domain] by construction, not by coincidence: the server derives
-	// both from one [Destination.Domain], and [DomainPath] is injective, so they cannot disagree.
-	OutputDomain []string `json:"output_domain,omitempty"`
-
-	// Root names which output root [Assignment.Domain] is materialised under, and is meaningful
-	// for [RoleTarget] only (§10.6).
-	//
-	// It must be a root the destination agent advertised in its registration; the agent checks
-	// that again itself, and the duplication is the one place in the tree where checking the
-	// control plane's work earns its keep (§13).
-	//
-	// Version skew (§13.1) resolves in the safe direction here. Servers upgrade first, so the
-	// case is a new server and an old agent: the old agent ignores this field, falls back to
-	// looking the name up among its input mappings, does not find it, and reports a failed
-	// session with a reason. Legible, and it fails closed — which is why this needs no protocol
-	// bump. The reverse, a new agent against an old server, is already refused outright.
-	Root string `json:"root,omitempty"`
+	// **Structure, never text.** The resolver takes the elements and the area name; nothing outside
+	// the CLI's manifest parser ever turns a domain string back into path elements (§10.6, §13).
+	// [Domain.String] is what the agent logs and what the `domain` metric label reports.
+	Domain Domain `json:"domain"`
 
 	// FlowID is the flow to read, for an initiator. The same ID exists on both nodes after
 	// replication — that is the point (§3).
@@ -194,6 +173,15 @@ type Assignment struct {
 
 	// ConnectTimeout bounds the initiator's connect loop, 0 meaning indefinitely (WRS §3).
 	ConnectTimeout Milliseconds `json:"connect_timeout_ms,omitempty"`
+
+	// Namespace is the partition the request behind this session belongs to (§9.3), applied to
+	// this worker's metrics as a dimension of its own (§12).
+	//
+	// It rode into metrics for free while a namespace was a user label; now that it is a real
+	// property it has to be carried deliberately. A path shared by requests in two namespaces
+	// takes one of them — merged the same way [Labels] is, and for the same reason: a value that
+	// differed between replicas would restart workers.
+	Namespace string `json:"namespace,omitempty"`
 
 	// Labels are the requesting user's labels, applied to this worker's metrics (§12).
 	Labels map[string]string `json:"labels,omitempty"`

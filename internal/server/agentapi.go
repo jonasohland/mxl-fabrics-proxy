@@ -106,7 +106,7 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 		"node", node,
 		"instance", registration.Instance,
 		"fabrics", len(registration.Capabilities.Fabrics),
-		"domains", len(registration.Domains),
+		"areas", len(registration.Capabilities.Areas),
 		"mxl", registration.Capabilities.Versions.MXL)
 
 	writeJSON(w, http.StatusOK, api.RegistrationResponse{
@@ -176,7 +176,6 @@ func (s *Server) writeRegistration(ctx context.Context, registration api.NodeReg
 	record := state.NodeRecord{
 		Node:         registration.Node,
 		Capabilities: registration.Capabilities,
-		Domains:      registration.Domains,
 		RegisteredAt: s.now(),
 		UpdatedAt:    s.now(),
 	}

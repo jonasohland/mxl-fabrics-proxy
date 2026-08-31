@@ -325,11 +325,6 @@ func validateRegistration(registration api.NodeRegistration) error {
 			return fmt.Errorf("capabilities.fabrics[%d]: fabric label is required", i)
 		}
 	}
-	for i, domain := range registration.Domains {
-		if domain.Name == "" {
-			return fmt.Errorf("domains[%d]: name is required", i)
-		}
-	}
 	return nil
 }
 
@@ -371,8 +366,7 @@ func canonicaliseSHM(registration *api.NodeRegistration) {
 
 // sameCapabilities reports whether a re-registration says anything new.
 func sameCapabilities(existing, candidate state.NodeRecord) bool {
-	return equalJSON(existing.Capabilities, candidate.Capabilities) &&
-		equalJSON(existing.Domains, candidate.Domains)
+	return equalJSON(existing.Capabilities, candidate.Capabilities)
 }
 
 // equalJSON compares two values by their encoded form.

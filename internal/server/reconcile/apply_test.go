@@ -57,8 +57,11 @@ func seed(t *testing.T, s store.Store, fleet *state.Fleet) {
 	for name, entry := range fleet.Status {
 		write(store.StatusKey(name), entry.Value, true)
 	}
+	for name, entry := range fleet.Namespaces {
+		write(store.NamespaceKey(name), entry.Value, false)
+	}
 	for id, entry := range fleet.Requests {
-		write(store.RequestKey(id), entry.Value, false)
+		write(store.RequestKey(id.Namespace, id.Name), entry.Value, false)
 	}
 	for id, entry := range fleet.Sessions {
 		write(store.SessionKey(id), entry.Value, false)
@@ -178,7 +181,7 @@ func TestApplyWithdrawsWhatIsNoLongerWanted(t *testing.T) {
 
 	// The request is cancelled: the path's refcount hits zero, the session goes, and the workers
 	// with it.
-	_, err = s.Delete(ctx, store.RequestKey("cam1"))
+	_, err = s.Delete(ctx, store.RequestKey(api.DefaultNamespace, "cam1"))
 	require.NoError(t, err)
 
 	fleet, err = state.Load(ctx, s)
@@ -380,7 +383,7 @@ func TestFlowDefinitionSurvivesTheStore(t *testing.T) {
 	loaded, err := state.Load(t.Context(), s)
 	require.NoError(t, err)
 
-	flow, ok := loaded.Flow("studio-a", "cameras", "flow-1")
+	flow, ok := loaded.Flow("studio-a", "media/cameras", "flow-1")
 	require.True(t, ok)
 	assert.JSONEq(t, string(definition), string(flow.Definition))
 	assert.Equal(t, state.FlowDefHash(definition), state.FlowDefHash(flow.Definition))

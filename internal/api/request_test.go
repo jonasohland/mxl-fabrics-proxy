@@ -76,8 +76,8 @@ func TestProviderPinValidateRejectsTypos(t *testing.T) {
 func validSpec() RequestSpec {
 	return RequestSpec{
 		Name:         "studio-a-cam1-to-edge",
-		Source:       Source{Node: "studio-a", Domain: "cameras", Select: Selector{Flow: "5592a23b"}},
-		Destinations: []Destination{{Node: "edge-01", Domain: []string{"ingest"}}},
+		Source:       Source{Node: "studio-a", Domain: SelectDomain(Domain{Area: "media", Elements: []string{"cameras"}}), Select: Selector{Flow: "5592a23b"}},
+		Destinations: []Destination{{Node: "edge-01", Domain: Domain{Area: "fast", Elements: []string{"ingest"}}}},
 	}
 }
 
@@ -91,30 +91,38 @@ func TestRequestSpecValidate(t *testing.T) {
 		"control char":     func(s *RequestSpec) { s.Name = "cam\n1" },
 		"overlong name":    func(s *RequestSpec) { s.Name = string(make([]byte, maxNameLength+1)) },
 		"no source node":   func(s *RequestSpec) { s.Source.Node = "" },
-		"no source domain": func(s *RequestSpec) { s.Source.Domain = "" },
+		"no source domain": func(s *RequestSpec) { s.Source.Domain = DomainSelector{} },
 		"no selector":      func(s *RequestSpec) { s.Source.Select = Selector{} },
 		"two selectors": func(s *RequestSpec) {
 			s.Source.Select.GroupHint = &GroupHintSelector{Name: "Studio A"}
 		},
 		"no destination node":   func(s *RequestSpec) { s.Destinations[0].Node = "" },
-		"no destination domain": func(s *RequestSpec) { s.Destinations[0].Domain = []string{""} },
+		"no destination domain": func(s *RequestSpec) { s.Destinations[0].Domain = Domain{} },
+		"destination names no area": func(s *RequestSpec) {
+			s.Destinations[0].Domain = Domain{Elements: []string{"ingest"}}
+		},
+		"destination names only an area": func(s *RequestSpec) {
+			s.Destinations[0].Domain = Domain{Area: "fast"}
+		},
 		// A destination domain is a directory this API is asking a node to create, so the name
 		// rule is structural (§10.6). The agent refuses these independently; the server reports
 		// ReasonMalformedDomainName for a stored request that somehow carries one.
-		"traversing destination domain": func(s *RequestSpec) { s.Destinations[0].Domain = []string{"../etc"} },
-		"nested destination domain":     func(s *RequestSpec) { s.Destinations[0].Domain = []string{"a/b"} },
-		"absolute destination domain":   func(s *RequestSpec) { s.Destinations[0].Domain = []string{"/etc"} },
-		"lookalike destination domain":  func(s *RequestSpec) { s.Destinations[0].Domain = []string{"іngest"} },
-		"malformed root":                func(s *RequestSpec) { s.Destinations[0].Root = "../fast" },
+		"traversing destination domain": func(s *RequestSpec) { s.Destinations[0].Domain.Elements = []string{"../etc"} },
+		"nested destination domain":     func(s *RequestSpec) { s.Destinations[0].Domain.Elements = []string{"a/b"} },
+		"absolute destination domain":   func(s *RequestSpec) { s.Destinations[0].Domain.Elements = []string{"/etc"} },
+		"lookalike destination domain":  func(s *RequestSpec) { s.Destinations[0].Domain.Elements = []string{"іngest"} },
+		"malformed area":                func(s *RequestSpec) { s.Destinations[0].Domain.Area = "../fast" },
 		"unknown provider":              func(s *RequestSpec) { s.Provider = ProviderPin{Provider("infiniband")} },
 		"no destinations":               func(s *RequestSpec) { s.Destinations = nil },
 		"unknown per-destination provider": func(s *RequestSpec) {
 			s.Destinations[0].Provider = ProviderPin{Provider("infiniband")}
 		},
 		// Two entries naming one (node, domain) are the same path written twice, and they can
-		// disagree about the root or the provider — at which point there is no answer to pick.
+		// disagree about the provider — at which point there is no answer to pick.
 		"duplicate destination": func(s *RequestSpec) {
-			s.Destinations = append(s.Destinations, Destination{Node: "edge-01", Domain: []string{"ingest"}, Root: "bulk"})
+			s.Destinations = append(s.Destinations, Destination{
+				Node: "edge-01", Domain: Domain{Area: "fast", Elements: []string{"ingest"}},
+			})
 		},
 		"negative teardown": func(s *RequestSpec) {
 			negative := Milliseconds(-1)
@@ -138,13 +146,13 @@ func TestRequestSpecDecodesTheDocumentedBody(t *testing.T) {
 	  "name": "cam1-distribution",
 	  "source": {
 	    "node": "studio-a",
-	    "domain": "cameras",
+	    "domain": { "name": { "area": "media", "elements": ["cameras"] } },
 	    "select": { "flow": "5592a23b-0974-45bb-9388-89ea81c42537" }
 	  },
 	  "destinations": [
-	    { "node": "edge-01", "domain": ["ingest"], "root": "fast" },
-	    { "node": "edge-02", "domain": ["studio-a", "cam1"], "root": "fast" },
-	    { "node": "archive-01", "domain": ["capture"], "provider": "tcp" }
+	    { "node": "edge-01", "domain": {"area": "fast", "elements": ["ingest"]} },
+	    { "node": "edge-02", "domain": {"area": "fast", "elements": ["studio-a", "cam1"]} },
+	    { "node": "archive-01", "domain": {"area": "bulk", "elements": ["capture"]}, "provider": "tcp" }
 	  ],
 	  "provider": "verbs"
 	}`
@@ -163,22 +171,24 @@ func TestRequestSpecDecodesTheDocumentedBody(t *testing.T) {
 	// ordinary fan-out it is (§10.4).
 	assert.Equal(t, ProviderPin{ProviderVerbs}, spec.ProviderFor(spec.Destinations[0]))
 	assert.Equal(t, ProviderPin{ProviderTCP}, spec.ProviderFor(spec.Destinations[2]))
-	assert.Equal(t, "fast", spec.Destinations[0].Root)
 
-	// A domain is a list of elements on the wire, never a path. `studio-a/cam1` exists only in a
-	// manifest, where the CLI splits it (§10.6).
-	assert.Equal(t, []string{"studio-a", "cam1"}, spec.Destinations[1].Domain)
-	assert.Equal(t, "studio-a/cam1", spec.Destinations[1].DomainName())
-	assert.Equal(t, "edge-02/studio-a/cam1", spec.Destinations[1].Endpoint())
+	// A domain is an area name and a list of elements on the wire, never a path.
+	// `fast/studio-a/cam1` exists only in a manifest, where the CLI splits it (§10.6).
+	assert.Equal(t, Domain{Area: "fast", Elements: []string{"studio-a", "cam1"}}, spec.Destinations[1].Domain)
+	assert.Equal(t, "fast/studio-a/cam1", spec.Destinations[1].DomainName())
+	assert.Equal(t, "edge-02/fast/studio-a/cam1", spec.Destinations[1].Endpoint())
 
-	// The root is optional, and omitting it is the common case: it is only needed by a node
-	// advertising more than one (§10.6). It must stay off the wire when unset, so a request that
-	// named no root is distinguishable from one that named the empty string.
-	spec.Destinations[0].Root = ""
-	require.NoError(t, spec.Validate())
-	encoded, err := json.Marshal(spec.Destinations[0])
-	require.NoError(t, err)
-	assert.NotContains(t, string(encoded), `"root"`)
+	// **Two entries naming one domain under two areas are two destinations**, which is what makes
+	// the old `domain_name_in_use` collision unconstructible: they no longer render to one
+	// address (§7.2, §10.6).
+	assert.NotEqual(t, spec.Destinations[0].Endpoint(),
+		Destination{Node: "edge-01", Domain: Domain{Area: "bulk", Elements: []string{"ingest"}}}.Endpoint())
+
+	// *There used to be an optional `root:` field beside the elements, omittable on a node
+	// advertising exactly one.* The area is the first segment of the name now, so a destination
+	// that names none is refused rather than resolved.
+	spec.Destinations[0].Domain.Area = ""
+	assert.Error(t, spec.Validate())
 }
 
 // Request embeds RequestSpec, so the spec's fields must stay flat on the wire rather than

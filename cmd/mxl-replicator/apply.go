@@ -17,8 +17,10 @@ import (
 // ApplyCmd is `mxl-replicator apply -f <manifest>`.
 //
 // The file is the interface an operator keeps; the HTTP API underneath is the contract. This
-// needs no protocol of its own because `POST /v1/requests` is already create-or-update on the
-// request's name (§9.1) — one document is one POST.
+// needs no protocol of its own because `POST /v1/namespaces/{ns}/requests` is already
+// create-or-update on the request's `(namespace, name)` pair (§9.1, §9.3) — one document is one
+// POST. `kind: namespace` and `kind: domain` documents go to their own endpoints on the same
+// principle.
 //
 // **Not atomic, deliberately.** Documents are applied in file order; a failure reports which one
 // failed, leaves the earlier ones applied, and exits non-zero. Requests are independent durable
@@ -28,7 +30,7 @@ import (
 // **The output is a list, not a table** — `<name> <what happened>` per document, in the shape
 // `kubectl apply` uses. It was padded to a fixed column width and read as a table with a missing
 // header row; it is not one. The second field is prose of unbounded length (`created`, but also
-// `INVALID (unknown_output_root): …`), so no honest heading exists for it, and the padding broke
+// `INVALID (unknown_area): …`), so no honest heading exists for it, and the padding broke
 // on any name longer than the column anyway. Tabwriter is not the fix either: lines are printed
 // as each POST returns, which is the feedback that matters when a document is about to fail, and
 // a tabwriter would buffer them all until the end. The tables live in `get` and `status`.
@@ -37,8 +39,9 @@ type ApplyCmd struct {
 
 	DryRun bool `help:"Validate and report what would happen, without writing anything."`
 
-	Prune    bool     `help:"Cancel requests matching --selector that this manifest does not name. Requires --selector."`
-	Selector []string `short:"l" help:"Label selector, key=value. Repeatable; all must match."`
+	Prune     bool     `help:"Cancel requests in --namespace that this manifest does not name. Requires --namespace."`
+	Namespace string   `short:"n" help:"Namespace to scope --prune to."`
+	Selector  []string `short:"l" help:"Label selector, key=value, narrowing --prune within --namespace. Repeatable; all must match."`
 
 	ClientFlags `embed:""`
 }
@@ -49,28 +52,34 @@ func (c *ApplyCmd) Run(ctx context.Context) error {
 		return err
 	}
 
-	// **--prune requires a selector** (invariant 14). A whole-fleet prune would cancel anything
+	// **--prune requires a scope** (invariant 14). A whole-fleet prune would cancel anything
 	// created by another operator or by the Kubernetes adapter, and the object being cancelled is
-	// moving video. The selector is the guard, which is also why there is no confirmation prompt:
-	// a prompt in a tool meant to run in CI is a trap, and this has a --dry-run instead.
-	if c.Prune && len(selector) == 0 {
-		return errors.New("--prune requires --selector")
+	// moving video. There is no confirmation prompt for the same reason there is none anywhere
+	// else here: a prompt in a tool meant to run in CI is a trap, and this has a --dry-run instead.
+	//
+	// **A namespace satisfies that requirement better than a label selector does** (§9.1), since it
+	// is a declared partition rather than an ad-hoc tag — so `-n` is the primary spelling and `-l`
+	// narrows within it. *This supersedes "--prune requires --selector".*
+	if c.Prune && c.Namespace == "" {
+		return errors.New("--prune requires --namespace")
 	}
-	if !c.Prune && len(selector) > 0 {
-		return errors.New("--selector is only meaningful with --prune")
+	if !c.Prune && (c.Namespace != "" || len(selector) > 0) {
+		return errors.New("--namespace and --selector are only meaningful with --prune")
 	}
 
 	docs, err := manifest.Load(c.Files)
 	if err != nil {
 		return err
 	}
-	// apply needs every document to be a complete, valid request; delete needs only the names.
-	specs, err := manifest.Specs(docs)
-	if err != nil {
-		return err
-	}
+	// Namespaces, then domains, then requests, whatever order the file is in (§9.1). The end state
+	// does not depend on it, since namespaces auto-create on reference and `Compute` is
+	// recomputed; the intermediate state does — a request applied ahead of the document that makes
+	// its namespace exclusive is admitted and then invalidated, and one applied ahead of the labels
+	// its selector matches expands to nothing and then to something. Both read as the apply having
+	// broken something.
+	docs = manifest.SortForApply(docs)
 
-	api, err := c.client()
+	cl, err := c.client()
 	if err != nil {
 		return err
 	}
@@ -82,22 +91,24 @@ func (c *ApplyCmd) Run(ctx context.Context) error {
 		warn("dry run: nothing will be written")
 	}
 
-	named := make(map[string]bool, len(specs))
-	var failed int
-	for _, spec := range specs {
-		named[spec.Name] = true
-
-		applied, err := api.Apply(ctx, spec, c.DryRun)
-		if err != nil {
-			fmt.Printf("%s %s\n", spec.Name, applyError(err))
-			failed++
-			continue
+	named := make(map[api.RequestID]bool, len(docs))
+	var failed, total int
+	for _, doc := range docs {
+		total++
+		switch doc.Kind {
+		case manifest.KindNamespace:
+			failed += c.applyNamespace(ctx, cl, doc)
+		case manifest.KindDomain:
+			failed += c.applyDomain(ctx, cl, doc)
+		default:
+			id := doc.ID()
+			named[id] = true
+			failed += c.applyRequest(ctx, cl, doc, id)
 		}
-		fmt.Printf("%s %s%s\n", spec.Name, applied.Outcome, statusSuffix(applied.Request.Status))
 	}
 
 	if c.Prune {
-		pruned, err := c.prune(ctx, api, selector, named)
+		pruned, err := c.prune(ctx, cl, selector, named)
 		if err != nil {
 			return err
 		}
@@ -105,37 +116,76 @@ func (c *ApplyCmd) Run(ctx context.Context) error {
 	}
 
 	if failed > 0 {
-		return fmt.Errorf("%d of %d requests could not be applied", failed, len(specs))
+		return fmt.Errorf("%d of %d documents could not be applied", failed, total)
 	}
 	return nil
 }
 
-// prune cancels requests matching the selector that the manifest did not name.
+// applyRequest posts one request document and prints its line. Returns 1 if it failed.
+func (c *ApplyCmd) applyRequest(ctx context.Context, cl *client.Client, doc manifest.Document, id api.RequestID) int {
+	spec, err := doc.Request.Spec()
+	if err != nil {
+		fmt.Printf("%s error: %s\n", id, err)
+		return 1
+	}
+	applied, err := cl.Apply(ctx, spec, c.DryRun)
+	if err != nil {
+		fmt.Printf("%s %s\n", id, applyError(err))
+		return 1
+	}
+	fmt.Printf("%s %s%s\n", id, applied.Outcome, statusSuffix(applied.Request.Status))
+	return 0
+}
+
+// applyNamespace posts one namespace document and prints its line. Returns 1 if it failed.
+func (c *ApplyCmd) applyNamespace(ctx context.Context, cl *client.Client, doc manifest.Document) int {
+	spec, err := doc.Namespace.Spec()
+	if err != nil {
+		fmt.Printf("namespace/%s error: %s\n", doc.Name(), err)
+		return 1
+	}
+	_, outcome, err := cl.ApplyNamespace(ctx, spec, c.DryRun)
+	if err != nil {
+		fmt.Printf("namespace/%s %s\n", spec.Name, applyError(err))
+		return 1
+	}
+	fmt.Printf("namespace/%s %s\n", spec.Name, outcome)
+	return 0
+}
+
+// prune cancels requests in the scoped namespace that the manifest did not name.
 //
-// Matching is **client-side**, over the full request list. The list is small, the server has no
-// index for it, and adding a selector query language to the user API for one CLI feature is the
+// **Requests only** (§9.1). It never removes a namespace and never removes a domain label, even
+// when the file contains documents of those kinds: a file naming three domain labels would
+// otherwise prune the other forty on the fleet, and a pruned namespace is a delete the server
+// refuses anyway while requests reference it. Prune exists to make a file authoritative over
+// *intent*, and a label is a fact about a host.
+//
+// Matching is **client-side**, over the namespace's request list. The list is small, the server has
+// no index for it, and adding a selector query language to the user API for one CLI feature is the
 // wrong trade.
-func (c *ApplyCmd) prune(ctx context.Context, api *client.Client, selector map[string]string, named map[string]bool) (int, error) {
-	existing, err := api.Requests(ctx)
+func (c *ApplyCmd) prune(ctx context.Context, cl *client.Client, selector map[string]string, named map[api.RequestID]bool) (int, error) {
+	existing, err := cl.Requests(ctx, c.Namespace)
 	if err != nil {
 		return 0, fmt.Errorf("list requests to prune: %w", err)
 	}
 
 	var failed int
 	for _, request := range existing {
-		if named[request.Name] || !matchesSelector(request.Labels, selector) {
+		id := request.RequestID()
+		if named[id] || !matchesSelector(request.Labels, selector) {
 			continue
 		}
 		if c.DryRun {
-			fmt.Printf("%s would be pruned\n", request.Name)
+			fmt.Printf("%s would be pruned\n", id)
 			continue
 		}
-		if _, err := api.DeleteRequest(ctx, request.Name); err != nil {
-			fmt.Printf("%s prune failed: %s\n", request.Name, err)
+		if _, err := cl.DeleteRequest(ctx, id); err != nil {
+			fmt.Printf("%s prune failed: %s\n", id, err)
 			failed++
 			continue
 		}
-		fmt.Printf("%s pruned\n", request.Name)
+		fmt.Printf("%s pruned\n", id)
 	}
 	return failed, nil
 }
@@ -158,14 +208,12 @@ func parseSelector(pairs []string) (map[string]string, error) {
 
 // matchesSelector reports whether a request's labels satisfy every term.
 //
-// An empty selector matches nothing rather than everything. That is the opposite of the usual
-// convention and it is deliberate: the only caller is prune, where "matches everything" is the
-// blast radius the required-selector rule exists to prevent, and a bug that produced an empty
-// selector would otherwise cancel the fleet.
+// An empty selector matches everything, which is the usual convention and is now correct here:
+// the blast radius is bounded by `--prune`'s required `--namespace`, so `-l` narrows within a
+// scope rather than being the scope. *Under the superseded "--prune requires --selector" rule this
+// returned false for an empty selector*, because there the empty case was reachable only through a
+// bug and "matches everything" would have cancelled the fleet.
 func matchesSelector(labels, selector map[string]string) bool {
-	if len(selector) == 0 {
-		return false
-	}
 	for key, want := range selector {
 		if labels[key] != want {
 			return false

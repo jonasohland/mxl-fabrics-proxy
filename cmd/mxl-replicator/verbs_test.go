@@ -8,9 +8,11 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/alecthomas/kong"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -58,7 +60,7 @@ func fleet(t *testing.T) string {
 	// until the source is actually being written to (§11.1).
 	post(t, http.URL, api.InventoryPath("studio-a"), api.InventorySnapshot{
 		Node: "studio-a", Instance: "i-studio-a",
-		Domains: []api.DomainInventory{{Name: "cameras", Configured: true, Flows: []api.FlowInventory{{
+		Domains: []api.DomainInventory{{Domain: api.Domain{Area: "media", Elements: []string{"cameras"}}, Flows: []api.FlowInventory{{
 			ID:         "flow-1",
 			Definition: json.RawMessage(`{"id":"flow-1","label":"Camera 1","format":"urn:x-nmos:format:video","media_type":"video/v210"}`),
 			GroupHint:  &api.GroupHint{Name: "Studio A Camera 1", Type: "video"},
@@ -87,14 +89,16 @@ func register(t *testing.T, base, node string) {
 	body, err := json.Marshal(api.NodeRegistration{
 		Node:     node,
 		Instance: "i-" + node,
-		Domains:  []api.DomainMapping{{Name: "cameras", Path: "/dev/shm/" + node, Configured: true}},
 		Capabilities: api.Capabilities{
 			Versions: api.Versions{Protocol: api.ProtocolVersion, Replicator: "test"},
 			Fabrics: []api.FabricAttachment{{
 				Provider: api.ProviderTCP, Fabric: "dc1", Address: "10.0.0.1",
 				CapFlags: []api.CapFlag{api.CapRemoteWrite, api.CapSendReceive},
 			}},
-			OutputRoots: []api.OutputRoot{{Name: "fast", Path: "/dev/shm/mxl"}},
+			Areas: []api.Area{
+				{Name: "media", Path: "/dev/shm/mxl-in", Read: true},
+				{Name: "fast", Path: "/dev/shm/mxl", Read: true, Write: true},
+			},
 		},
 	})
 	require.NoError(t, err)
@@ -122,15 +126,15 @@ func manifestFile(t *testing.T, body string) string {
 
 const twoRequests = `
 name: cam1
-source: {node: studio-a, domain: cameras, flow: flow-1}
+source: {node: studio-a, domain: media/cameras, flow: flow-1}
 destinations:
-  - {node: edge-01, domain: ingest}
-  - {node: edge-02, domain: ingest}
+  - {node: edge-01, domain: fast/ingest}
+  - {node: edge-02, domain: fast/ingest}
 labels: {show: nab}
 ---
 name: cam2
-source: {node: studio-a, domain: cameras, flow: flow-2}
-destinations: [{node: edge-01, domain: ingest2}]
+source: {node: studio-a, domain: media/cameras, flow: flow-2}
+destinations: [{node: edge-01, domain: fast/ingest2}]
 labels: {show: nab}
 `
 
@@ -144,7 +148,7 @@ func TestApplyThenDelete(t *testing.T) {
 	require.NoError(t, (&ApplyCmd{Files: []string{path}, ClientFlags: flags}).Run(t.Context()))
 
 	user := userClient(t, flags)
-	requests, err := user.Requests(t.Context())
+	requests, err := user.Requests(t.Context(), "")
 	require.NoError(t, err)
 	require.Len(t, requests, 2)
 
@@ -162,7 +166,7 @@ func TestApplyThenDelete(t *testing.T) {
 	// delete -f takes only the names, so the same file removes what it created.
 	require.NoError(t, (&DeleteCmd{Files: []string{path}, ClientFlags: flags}).Run(t.Context()))
 
-	requests, err = user.Requests(t.Context())
+	requests, err = user.Requests(t.Context(), "")
 	require.NoError(t, err)
 	assert.Empty(t, requests)
 
@@ -180,14 +184,18 @@ func TestApplyDryRunWritesNothing(t *testing.T) {
 	cmd := &ApplyCmd{Files: []string{manifestFile(t, twoRequests)}, DryRun: true, ClientFlags: flags}
 	require.NoError(t, cmd.Run(t.Context()))
 
-	requests, err := userClient(t, flags).Requests(t.Context())
+	requests, err := userClient(t, flags).Requests(t.Context(), "")
 	require.NoError(t, err)
 	assert.Empty(t, requests, "a dry run must create nothing")
 }
 
-// **Invariant 14.** --prune cancels live media, so it is impossible without a selector, and a dry
+// **Invariant 14.** --prune cancels live media, so it is impossible without a scope, and a dry
 // run cancels nothing.
-func TestPruneRequiresASelector(t *testing.T) {
+//
+// **A namespace is that scope**, not a label selector: it is a declared partition rather than an
+// ad-hoc tag, so `-n` is the primary spelling and `-l` narrows within it (§9.1). *This supersedes
+// "--prune requires --selector".*
+func TestPruneRequiresANamespace(t *testing.T) {
 	t.Parallel()
 
 	base := fleet(t)
@@ -196,11 +204,21 @@ func TestPruneRequiresASelector(t *testing.T) {
 
 	err := (&ApplyCmd{Files: []string{path}, Prune: true, ClientFlags: flags}).Run(t.Context())
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "--prune requires --selector")
+	assert.Contains(t, err.Error(), "--prune requires --namespace")
 
-	// And a selector without --prune is a mistake worth naming rather than ignoring: it reads as
-	// if it were scoping the apply, which it is not.
+	// A selector alone is not a scope, because it does not bound the fleet the way a partition
+	// does.
+	err = (&ApplyCmd{Files: []string{path}, Prune: true, Selector: []string{"show=nab"}, ClientFlags: flags}).Run(t.Context())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "--prune requires --namespace")
+
+	// And either flag without --prune is a mistake worth naming rather than ignoring: both read
+	// as if they were scoping the apply, which they are not.
 	err = (&ApplyCmd{Files: []string{path}, Selector: []string{"show=nab"}, ClientFlags: flags}).Run(t.Context())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "only meaningful with --prune")
+
+	err = (&ApplyCmd{Files: []string{path}, Namespace: "nab", ClientFlags: flags}).Run(t.Context())
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "only meaningful with --prune")
 }
@@ -220,8 +238,8 @@ func TestPruneCancelsOnlyUnnamedMatches(t *testing.T) {
 
 	other := manifestFile(t, `
 name: someone-elses
-source: {node: studio-a, domain: cameras, flow: flow-9}
-destinations: [{node: edge-01, domain: other}]
+source: {node: studio-a, domain: media/cameras, flow: flow-9}
+destinations: [{node: edge-01, domain: fast/other}]
 labels: {show: other-show}
 `)
 	require.NoError(t, (&ApplyCmd{Files: []string{other}, ClientFlags: flags}).Run(t.Context()))
@@ -229,29 +247,29 @@ labels: {show: other-show}
 	// Now apply a manifest naming only cam1, pruning show=nab.
 	narrowed := manifestFile(t, `
 name: cam1
-source: {node: studio-a, domain: cameras, flow: flow-1}
+source: {node: studio-a, domain: media/cameras, flow: flow-1}
 destinations:
-  - {node: edge-01, domain: ingest}
-  - {node: edge-02, domain: ingest}
+  - {node: edge-01, domain: fast/ingest}
+  - {node: edge-02, domain: fast/ingest}
 labels: {show: nab}
 `)
 
 	// A dry run first: it must report the prune and cancel nothing.
 	require.NoError(t, (&ApplyCmd{
-		Files: []string{narrowed}, Prune: true, Selector: []string{"show=nab"},
-		DryRun: true, ClientFlags: flags,
+		Files: []string{narrowed}, Prune: true, Namespace: api.DefaultNamespace,
+		Selector: []string{"show=nab"}, DryRun: true, ClientFlags: flags,
 	}).Run(t.Context()))
 
-	requests, err := user.Requests(t.Context())
+	requests, err := user.Requests(t.Context(), "")
 	require.NoError(t, err)
 	assert.Len(t, requests, 3, "a dry run must cancel nothing")
 
 	require.NoError(t, (&ApplyCmd{
-		Files: []string{narrowed}, Prune: true, Selector: []string{"show=nab"},
-		ClientFlags: flags,
+		Files: []string{narrowed}, Prune: true, Namespace: api.DefaultNamespace,
+		Selector: []string{"show=nab"}, ClientFlags: flags,
 	}).Run(t.Context()))
 
-	requests, err = user.Requests(t.Context())
+	requests, err = user.Requests(t.Context(), "")
 	require.NoError(t, err)
 
 	names := map[string]bool{}
@@ -264,17 +282,29 @@ labels: {show: nab}
 
 // A mistyped verb must be an unknown command, not `run` with a stray argument — which is what
 // kong's default:"withargs" would otherwise make of it.
+//
+// The verb list comes from the real parser rather than a literal, so this also catches the failure
+// that shipped: a verb present on [CLI] and absent from the guard's list is not rejected as
+// unknown — it falls through to `run` and is diagnosed in terms of flags nobody typed.
 func TestAMistypedVerbIsNotSwallowedByTheDefaultCommand(t *testing.T) {
 	t.Parallel()
 
-	err := guardDefaultCommand([]string{"aply", "-f", "x.yaml"})
+	commands := commandNames(kong.Must(&CLI{}, kong.Vars{"version": "test"}).Model)
+
+	err := guardDefaultCommand(commands, []string{"aply", "-f", "x.yaml"})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), `unknown command "aply"`)
 
-	// The forms that must keep working: every real verb, the bare default, and a flag going
-	// straight to the default command.
-	for _, args := range [][]string{{}, {"run", "--agent"}, {"--agent"}, {"apply", "-f", "x.yaml"}, {"status"}, {"delete", "cam1"}} {
-		assert.NoError(t, guardDefaultCommand(args), "args %v", args)
+	// Every verb the binary actually has, so adding one to [CLI] cannot leave it unreachable.
+	assert.ElementsMatch(t,
+		[]string{"run", "apply", "delete", "label", "status", "get", "describe"}, commands)
+	for _, verb := range commands {
+		assert.NoError(t, guardDefaultCommand(commands, []string{verb}), "verb %q", verb)
+	}
+
+	// The forms that must keep working besides: the bare default, and a flag going straight to it.
+	for _, args := range [][]string{{}, {"run", "--agent"}, {"--agent"}, {"apply", "-f", "x.yaml"}} {
+		assert.NoError(t, guardDefaultCommand(commands, args), "args %v", args)
 	}
 }
 
@@ -292,9 +322,10 @@ func TestSelectorParsing(t *testing.T) {
 	assert.False(t, matchesSelector(map[string]string{"show": "other"}, selector0("show", "nab")))
 	assert.False(t, matchesSelector(nil, selector0("show", "nab")))
 
-	// An empty selector matches *nothing*, against the usual convention. The only caller is
-	// prune, where "matches everything" is precisely the blast radius that must be impossible.
-	assert.False(t, matchesSelector(map[string]string{"show": "nab"}, nil))
+	// An empty selector matches everything, which is the usual convention and is now correct
+	// here: prune's blast radius is bounded by its required --namespace, so -l narrows within a
+	// scope rather than being the scope. *Under the superseded rule this was false.*
+	assert.True(t, matchesSelector(map[string]string{"show": "nab"}, nil))
 }
 
 func selector0(key, value string) map[string]string { return map[string]string{key: value} }
@@ -373,7 +404,7 @@ func TestDescribeFlowListsEveryLocation(t *testing.T) {
 	// source agent reports the original.
 	post(t, base, api.InventoryPath("edge-01"), api.InventorySnapshot{
 		Node: "edge-01", Instance: "i-edge-01",
-		Domains: []api.DomainInventory{{Name: "ingest", Flows: []api.FlowInventory{{
+		Domains: []api.DomainInventory{{Domain: api.Domain{Area: "fast", Elements: []string{"ingest"}}, Flows: []api.FlowInventory{{
 			ID:         "flow-1",
 			Definition: json.RawMessage(`{"id":"flow-1"}`),
 			Producing:  true,
@@ -387,7 +418,7 @@ func TestDescribeFlowListsEveryLocation(t *testing.T) {
 	for _, entry := range entries {
 		places = append(places, entry.Node+"/"+entry.Domain)
 	}
-	assert.ElementsMatch(t, []string{"studio-a/cameras", "edge-01/ingest"}, places)
+	assert.ElementsMatch(t, []string{"studio-a/media/cameras", "edge-01/fast/ingest"}, places)
 
 	require.NoError(t, (&DescribeCmd{Kind: "flow", Name: "flow-1", ClientFlags: flags}).Run(t.Context()))
 }
@@ -492,7 +523,7 @@ func TestStatusSummarises(t *testing.T) {
 	// ESTABLISHING — also not ACTIVE, also named. That is the point: the summary is the two lines
 	// worth reading, not the whole fleet.
 	user := userClient(t, flags)
-	requests, err := user.Requests(t.Context())
+	requests, err := user.Requests(t.Context(), "")
 	require.NoError(t, err)
 
 	var waiting int
@@ -502,4 +533,174 @@ func TestStatusSummarises(t *testing.T) {
 		}
 	}
 	assert.Equal(t, 1, waiting, "cam2's selector matches no flow")
+}
+
+// named builds a `name` domain selector from the `<area>/<elements>` spelling, splitting it the
+// way a manifest does. Tests are allowed the convenience the rest of the tree is not (§10.6).
+func named(domain string) api.DomainSelector {
+	segments := strings.Split(domain, "/")
+	return api.SelectDomain(api.Domain{Area: segments[0], Elements: segments[1:]})
+}
+
+// --- label (§9.1, §10.7) ------------------------------------------------------------------------
+
+// The argument form: `<node>:<area>/<elements>`, and the domain half is not re-split anywhere
+// else — it goes through the one parser in the tree (§10.6).
+func TestLabelTargetParsing(t *testing.T) {
+	t.Parallel()
+
+	node, domain, err := parseLabelTarget("studio-a:media/cameras")
+	require.NoError(t, err)
+	assert.Equal(t, "studio-a", node)
+	assert.Equal(t, api.Domain{Area: "media", Elements: []string{"cameras"}}, domain)
+
+	// A node name may itself contain a colon — it is operator-assigned free text — so the split is
+	// on the *last* one, which is the only reading that makes this unambiguous.
+	node, domain, err = parseLabelTarget("rack:1:media/cameras")
+	require.NoError(t, err)
+	assert.Equal(t, "rack:1", node)
+	assert.Equal(t, "media/cameras", domain.String())
+
+	for _, bad := range []string{
+		"studio-a",              // no domain
+		":media/cameras",        // no node
+		"studio-a:media",        // an area's own directory is not a domain
+		"studio-a:/dev/shm/mxl", // a path where a domain belongs
+		"studio-a:media/../etc", // traversal
+	} {
+		_, _, err := parseLabelTarget(bad)
+		assert.Error(t, err, "target %q", bad)
+	}
+}
+
+// `key=value` sets, `key-` removes — the convention operators already have (§9.1).
+func TestLabelEditParsing(t *testing.T) {
+	t.Parallel()
+
+	patch, err := parseLabelEdits([]string{"role=cameras", "name=cameras", "site-"})
+	require.NoError(t, err)
+	assert.Equal(t, map[string]string{"role": "cameras", "name": "cameras"}, patch.Set)
+	assert.Equal(t, []string{"site"}, patch.Remove)
+
+	// An empty value is a set, not a remove: `role=` says the key exists and is blank.
+	patch, err = parseLabelEdits([]string{"role="})
+	require.NoError(t, err)
+	assert.Equal(t, map[string]string{"role": ""}, patch.Set)
+	assert.Empty(t, patch.Remove)
+
+	for _, bad := range [][]string{
+		{}, // nothing to do
+		{"nonsense"},
+		{"=value"},
+		{"-"},
+	} {
+		_, err := parseLabelEdits(bad)
+		assert.Error(t, err, "%v", bad)
+	}
+}
+
+// **The verb sends a patch, and that is what makes an interactive edit durable**: the server
+// merges a patch against nothing, so a key set here survives a later apply that does not mention
+// it (§9.1).
+func TestLabelSendsAPatchThatSurvivesAnApply(t *testing.T) {
+	t.Parallel()
+
+	base := fleet(t)
+	flags := ClientFlags{Server: []string{base}}
+
+	require.NoError(t, (&LabelCmd{
+		Kind: "domain", Target: "studio-a:media/cameras",
+		Labels: []string{"tier=1"}, ClientFlags: flags,
+	}).Run(t.Context()))
+
+	// An apply from a file that knows nothing about `tier`.
+	path := manifestFile(t, `
+kind: domain
+node: studio-a
+domain: media/cameras
+labels: {role: cameras}
+`)
+	require.NoError(t, (&ApplyCmd{Files: []string{path}, ClientFlags: flags}).Run(t.Context()))
+
+	list, err := userClient(t, flags).NodeDomains(t.Context(), "studio-a")
+	require.NoError(t, err)
+
+	var labels map[string]string
+	for _, domain := range list.Domains {
+		if domain.Domain.String() == "media/cameras" {
+			labels = domain.Labels
+		}
+	}
+	assert.Equal(t, map[string]string{"tier": "1", "role": "cameras"}, labels,
+		"apply owns `role`; the interactive edit's `tier` is left alone")
+
+	// And a removal takes only what it names.
+	require.NoError(t, (&LabelCmd{
+		Kind: "domain", Target: "studio-a:media/cameras",
+		Labels: []string{"tier-"}, ClientFlags: flags,
+	}).Run(t.Context()))
+
+	list, err = userClient(t, flags).NodeDomains(t.Context(), "studio-a")
+	require.NoError(t, err)
+	for _, domain := range list.Domains {
+		if domain.Domain.String() == "media/cameras" {
+			assert.Equal(t, map[string]string{"role": "cameras"}, domain.Labels)
+		}
+	}
+}
+
+// A dry run writes nothing, on the same argument requests take: a label starts and stops media one
+// level of indirection away, which makes it easier to do by accident rather than harder (§9.1).
+func TestLabelDryRunWritesNothing(t *testing.T) {
+	t.Parallel()
+
+	base := fleet(t)
+	flags := ClientFlags{Server: []string{base}}
+
+	require.NoError(t, (&LabelCmd{
+		Kind: "domain", Target: "studio-a:media/cameras",
+		Labels: []string{"role=cameras"}, DryRun: true, ClientFlags: flags,
+	}).Run(t.Context()))
+
+	list, err := userClient(t, flags).NodeDomains(t.Context(), "studio-a")
+	require.NoError(t, err)
+	for _, domain := range list.Domains {
+		assert.Empty(t, domain.Labels, "a dry run must write nothing")
+	}
+}
+
+// **`--prune` never removes a domain label**, even when the file contains `kind: domain`
+// documents: a file naming three domains would otherwise prune the other forty on the fleet, and a
+// label is a fact about a host rather than intent (§9.1).
+func TestPruneNeverTouchesLabels(t *testing.T) {
+	t.Parallel()
+
+	base := fleet(t)
+	flags := ClientFlags{Server: []string{base}}
+
+	labelled := manifestFile(t, `
+kind: domain
+node: studio-a
+domain: media/cameras
+labels: {role: cameras}
+`)
+	require.NoError(t, (&ApplyCmd{Files: []string{labelled}, ClientFlags: flags}).Run(t.Context()))
+
+	// A second apply that names no domain at all, pruning the default namespace.
+	other := manifestFile(t, `
+name: cam1
+source: {node: studio-a, domain: media/cameras, flow: flow-1}
+destinations: [{node: edge-01, domain: fast/ingest}]
+`)
+	require.NoError(t, (&ApplyCmd{
+		Files: []string{other}, Prune: true, Namespace: api.DefaultNamespace, ClientFlags: flags,
+	}).Run(t.Context()))
+
+	list, err := userClient(t, flags).NodeDomains(t.Context(), "studio-a")
+	require.NoError(t, err)
+	for _, domain := range list.Domains {
+		if domain.Domain.String() == "media/cameras" {
+			assert.Equal(t, map[string]string{"role": "cameras"}, domain.Labels)
+		}
+	}
 }

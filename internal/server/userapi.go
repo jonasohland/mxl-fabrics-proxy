@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"net/http"
 	"slices"
 	"sort"
@@ -46,25 +47,35 @@ func (s *Server) loadView(w http.ResponseWriter, r *http.Request) (*view, bool) 
 	return v, true
 }
 
-// handleCreateRequest is POST /v1/requests (§9.1).
+// handleCreateRequest is POST /v1/namespaces/{ns}/requests (§9.1).
 //
-// Create **or update**, keyed on the client-supplied name. The name is required precisely so
-// that every create is idempotent rather than only the ones that remembered to opt in: the
-// Kubernetes adapter on the roadmap re-reconciles on every resync, and anything hand-rolling a
-// POST has the same problem on retry. It is also what makes `mxl-replicator apply` an apply
-// rather than a bespoke protocol: a file naming a set of requests is already one.
+// Create **or update**, keyed on `(namespace, name)` — the request's ID and its idempotency key
+// (§9.3). The name is required precisely so that every create is idempotent rather than only the
+// ones that remembered to opt in: the Kubernetes adapter on the roadmap re-reconciles on every
+// resync, and anything hand-rolling a POST has the same problem on retry. It is also what makes
+// `mxl-replicator apply` an apply rather than a bespoke protocol: a file naming a set of requests
+// is already one.
 //
-// Validation happens here rather than by leaving something stuck in WAITING (§7.2). The split
-// matters: a request that is *valid but not yet satisfiable* — the flow is not being produced,
-// the agent is down — is accepted and reports WAITING, while one that can never work is refused
-// now, with a reason naming what to change.
+// # What it refuses
+//
+// **Only what is structurally invalid** (§7.2) — a malformed selector, an area no destination
+// node advertises, a spec that cannot expand at all. Validation is otherwise *per path*: a
+// request whose selector expands onto twenty paths, one of which conflicts, is accepted and
+// reports nineteen paths and one invalid one. That is what makes selectors usable, since an
+// expansion is not something its author can enumerate before submitting it — refusing the whole
+// request for one bad pairing puts the author at the mercy of fleet state they did not write.
+//
+// *This supersedes refusing the POST whenever `Compute` returned INVALID for any reason at all,
+// which is the position §7.2 argued down.* The distinction is carried by
+// [reconcile.Result.Structural] rather than re-derived here, so request-time rejection and
+// steady-state classification still run one `Compute` and cannot disagree.
 //
 // # ?dry_run=true
 //
-// Everything above happens and nothing is written. This is nearly free because the accept path
-// already builds a candidate fleet and reconciles it — that is how it rejects INVALID — so the
-// only difference is skipping the store write. It is what lets `apply --dry-run` report the
-// outcome including cross-request conflicts, rather than diffing specs and guessing.
+// Everything above happens and nothing is written — including the namespace auto-create below.
+// This is nearly free because the accept path already builds a candidate fleet and reconciles it,
+// so the only difference is skipping the store writes. It is what lets `apply --dry-run` report
+// the outcome including cross-request conflicts, rather than diffing specs and guessing.
 //
 // Its one limitation, which the CLI has to state rather than hide: the candidate fleet contains
 // this request plus *stored* state, so two new requests in one file that conflict with **each
@@ -77,10 +88,30 @@ func (s *Server) handleCreateRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	ns := r.PathValue("ns")
+	if err := api.ValidNamespace(ns); err != nil {
+		writeError(w, http.StatusBadRequest, api.CodeInvalidRequest, err.Error())
+		return
+	}
+
 	spec, ok := decodeBody[api.RequestSpec](w, r)
 	if !ok {
 		return
 	}
+
+	// The URL is authoritative and the body may agree with it or say nothing. Disagreement is
+	// refused rather than resolved: there is no defensible winner, and silently preferring either
+	// would put the request in a namespace the caller appears to contradict.
+	if spec.Namespace != "" && spec.Namespace != ns {
+		writeError(w, http.StatusBadRequest, api.CodeInvalidRequest,
+			fmt.Sprintf("body names namespace %q but the URL names %q", spec.Namespace, ns))
+		return
+	}
+	// Before the unchanged comparison below, deliberately: normalising after deciding whether the
+	// spec differs would make every apply of a namespace-less body look like a change and write on
+	// every pass (invariant 13).
+	spec.Namespace = ns
+
 	if err := spec.Validate(); err != nil {
 		writeError(w, http.StatusBadRequest, api.CodeInvalidRequest, err.Error())
 		return
@@ -94,21 +125,16 @@ func (s *Server) handleCreateRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// A request that named no namespace is written into the default one explicitly rather than
-	// left implying it. Before the unchanged comparison below, deliberately — see
-	// [api.RequestSpec.EnsureNamespace]. The one-off consequence is that the first apply of a
-	// manifest predating this writes once to add the label, and is unchanged from then on.
-	spec.EnsureNamespace()
-
 	ctx := r.Context()
 	v, ok := s.loadView(w, r)
 	if !ok {
 		return
 	}
 
-	existing := v.fleet.Requests[spec.Name]
+	id := spec.RequestID()
+	existing := v.fleet.Requests[id]
 	record := state.RequestRecord{
-		ID:        spec.Name,
+		ID:        id,
 		Spec:      spec,
 		CreatedAt: s.now(),
 		UpdatedAt: s.now(),
@@ -120,14 +146,16 @@ func (s *Server) handleCreateRequest(w http.ResponseWriter, r *http.Request) {
 	// Decide against the fleet *as it would be* with this request in it, using the reconciler
 	// itself. That is what makes the rejection here and the classification a second later the
 	// same rule — including the conflicts that are only visible across requests, like two
-	// sources replicating into one destination flow, or a loop.
+	// sources replicating into one destination flow, or a loop, which are reported rather than
+	// refused.
 	candidate := fleetWithRequest(v.fleet, record)
-	status := reconcile.Compute(candidate, s.readCfg).Requests[record.ID]
-	if status.State == api.StateInvalid {
-		writeError(w, http.StatusBadRequest, api.CodeInvalidRequest, status.Reason,
-			"reason_code", string(status.ReasonCode))
+	computed := reconcile.Compute(candidate, s.readCfg)
+	if bad, structural := computed.Structural[id]; structural {
+		writeError(w, http.StatusBadRequest, api.CodeInvalidRequest, bad.Message,
+			"reason_code", string(bad.Code))
 		return
 	}
+	status := computed.Requests[id]
 
 	// **Re-applying an unchanged request writes nothing** (invariant 13). §8.3's write-volume
 	// sizing holds only because desired state is low-churn, and a controller re-reconciling on
@@ -149,9 +177,21 @@ func (s *Server) handleCreateRequest(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case dryRun, unchanged:
 		// Nothing to write. A dry run is told what would happen; an unchanged apply is told the
-		// same thing, which is also the truth.
+		// same thing, which is also the truth. An unchanged request also skips the namespace
+		// create, which is correct: a namespace referenced by a request that already exists
+		// already got one when that request was written.
 	default:
-		if _, _, err := state.PutJSON(ctx, s.store, store.RequestKey(record.ID), record, existing.Prior(), state.WriteOptions{CAS: true}); err != nil {
+		// **The namespace first, then the request** (§9.3). Reversed, a failure in between leaves
+		// a request referencing a namespace with no record — the exact state that makes
+		// `GET /v1/namespaces` non-authoritative. This order leaves an inert empty namespace
+		// instead, which is indistinguishable from a deliberately empty one and costs nothing. No
+		// transaction is needed, because the two failure modes are not equally bad.
+		if err := s.ensureNamespace(ctx, v.fleet, ns); err != nil {
+			storeError(w, s.logger, "create namespace", err)
+			return
+		}
+
+		if _, _, err := state.PutJSON(ctx, s.store, store.RequestKey(id.Namespace, id.Name), record, existing.Prior(), state.WriteOptions{CAS: true}); err != nil {
 			if errors.Is(err, store.ErrCompareFailed) {
 				writeError(w, http.StatusConflict, api.CodeInvalidRequest, "the request was modified concurrently")
 				return
@@ -161,8 +201,8 @@ func (s *Server) handleCreateRequest(w http.ResponseWriter, r *http.Request) {
 		}
 
 		s.logger.Info("replication request accepted",
-			"request", record.ID,
-			"source", record.Spec.Source.Node+"/"+record.Spec.Source.Domain,
+			"request", id.String(),
+			"source", record.Spec.Source.Node+"/"+record.Spec.Source.Domain.String(),
 			"destinations", destinationList(record.Spec.Destinations),
 			"updated", existing.Found)
 	}
@@ -177,11 +217,39 @@ func (s *Server) handleCreateRequest(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set(api.HeaderOutcome, outcome)
 	writeJSON(w, code, api.Request{
-		ID:          record.ID,
+		ID:          id.String(),
 		RequestSpec: record.Spec,
 		CreatedAt:   record.CreatedAt,
+		UpdatedAt:   record.UpdatedAt,
 		Status:      status,
 	})
+}
+
+// ensureNamespace creates a namespace record with defaults if there is none (§9.3).
+//
+// **Create-if-absent, never write-if-present.** An unconditional write would bump the namespace
+// key's revision on every request write and wake every watcher in the fleet, which is the churn
+// §8.3 is sized against — the same no-write-if-unchanged discipline the request itself follows,
+// applied one key over.
+//
+// A concurrent creator losing the CAS is not an error: the record it lost to is the one this would
+// have written, defaults and all.
+func (s *Server) ensureNamespace(ctx context.Context, fleet *state.Fleet, ns string) error {
+	if _, exists := fleet.Namespaces[ns]; exists {
+		return nil
+	}
+
+	record := state.NamespaceRecord{
+		Name:      ns,
+		Spec:      api.Namespace{Name: ns}.Normalise(),
+		CreatedAt: s.now(),
+		UpdatedAt: s.now(),
+	}
+	_, _, err := state.PutJSON(ctx, s.store, store.NamespaceKey(ns), record, state.Prior{}, state.WriteOptions{CAS: true})
+	if errors.Is(err, store.ErrCompareFailed) {
+		return nil
+	}
+	return err
 }
 
 // boolParam reads an optional boolean query parameter. An unparseable value is an error rather
@@ -198,59 +266,81 @@ func boolParam(r *http.Request, name string) (bool, error) {
 	return value, nil
 }
 
+// handleListRequests is GET /v1/requests: the fleet-wide list across every partition (§9.1).
+//
+// `?namespace=` narrows it, which is the same set GET /v1/namespaces/{ns}/requests returns. Two
+// spellings, deliberately: the namespaced collection is where a request is *created* and
+// addressed, and a list has to be readable without knowing which partitions exist.
 func (s *Server) handleListRequests(w http.ResponseWriter, r *http.Request) {
+	s.listRequests(w, r, r.URL.Query().Get(api.QueryNamespace))
+}
+
+// handleListNamespaceRequests is GET /v1/namespaces/{ns}/requests.
+func (s *Server) handleListNamespaceRequests(w http.ResponseWriter, r *http.Request) {
+	s.listRequests(w, r, r.PathValue("ns"))
+}
+
+func (s *Server) listRequests(w http.ResponseWriter, r *http.Request, ns string) {
 	v, ok := s.loadView(w, r)
 	if !ok {
 		return
 	}
 
 	list := api.RequestList{Requests: []api.Request{}}
-	for _, id := range sortedKeys(v.fleet.Requests) {
+	for _, id := range v.fleet.SortedRequestIDs() {
+		if ns != "" && id.Namespace != ns {
+			continue
+		}
 		list.Requests = append(list.Requests, v.request(id))
 	}
 	writeJSON(w, http.StatusOK, list)
 }
 
 func (s *Server) handleGetRequest(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
+	id := api.RequestID{Namespace: r.PathValue("ns"), Name: r.PathValue("name")}
 
 	v, ok := s.loadView(w, r)
 	if !ok {
 		return
 	}
 	if _, found := v.fleet.Requests[id]; !found {
-		writeError(w, http.StatusNotFound, api.CodeNotFound, "no request "+id)
+		writeError(w, http.StatusNotFound, api.CodeNotFound, "no request "+id.String())
 		return
 	}
 	writeJSON(w, http.StatusOK, v.request(id))
 }
 
-// handleDeleteRequest is DELETE /v1/requests/{id}: cancel the intent.
+// handleDeleteRequest is DELETE /v1/namespaces/{ns}/requests/{name}: cancel the intent.
 //
 // Cancelling a request is the only thing that removes one — the system never cancels one on the
 // user's behalf because a session is failing (§11). The path underneath survives until the last
 // request referencing it is gone, which is what refcounting is for, and the reconciler does that
 // on its next pass rather than here.
+//
+// The namespace record is left behind. Never auto-delete (§9.3): an empty namespace is inert, and
+// removing one on the way past would make deleting the last request in a partition silently
+// discard the operator's `paths: exclusive` declaration.
 func (s *Server) handleDeleteRequest(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
+	id := api.RequestID{Namespace: r.PathValue("ns"), Name: r.PathValue("name")}
 	ctx := r.Context()
+	key := store.RequestKey(id.Namespace, id.Name)
 
-	existing, err := state.Get[state.RequestRecord](ctx, s.store, store.RequestKey(id))
+	existing, err := state.Get[state.RequestRecord](ctx, s.store, key)
 	if err != nil {
 		storeError(w, s.logger, "read request", err)
 		return
 	}
 	if !existing.Found {
-		writeError(w, http.StatusNotFound, api.CodeNotFound, "no request "+id)
+		writeError(w, http.StatusNotFound, api.CodeNotFound, "no request "+id.String())
 		return
 	}
 
-	if _, err := s.store.Delete(ctx, store.RequestKey(id), store.IfRevision(existing.Rev)); err != nil {
+	if _, err := s.store.Delete(ctx, key, store.IfRevision(existing.Rev)); err != nil {
 		storeError(w, s.logger, "delete request", err)
 		return
 	}
 
-	s.logger.Info("replication request cancelled", "request", id)
+	s.logger.Info("replication request cancelled", "request", id.String())
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -265,26 +355,6 @@ func (s *Server) handleListNodes(w http.ResponseWriter, r *http.Request) {
 		list.Nodes = append(list.Nodes, v.node(name))
 	}
 	writeJSON(w, http.StatusOK, list)
-}
-
-func (s *Server) handleNodeDomains(w http.ResponseWriter, r *http.Request) {
-	name := r.PathValue("node")
-
-	v, ok := s.loadView(w, r)
-	if !ok {
-		return
-	}
-	entry, found := v.fleet.Nodes[name]
-	if !found {
-		writeError(w, http.StatusNotFound, api.CodeNotFound, "no node "+name)
-		return
-	}
-
-	domains := entry.Value.Domains
-	if domains == nil {
-		domains = []api.DomainMapping{}
-	}
-	writeJSON(w, http.StatusOK, api.DomainList{Node: name, Domains: domains})
 }
 
 // handleFlows is GET /v1/flows: the fleet-wide inventory, filterable.
@@ -312,7 +382,7 @@ func (s *Server) handleFlows(w http.ResponseWriter, r *http.Request) {
 		}
 		snapshot := v.fleet.Inventory[node].Value
 		for _, domain := range snapshot.Domains {
-			if wantDomain != "" && domain.Name != wantDomain {
+			if wantDomain != "" && domain.Domain.String() != wantDomain {
 				continue
 			}
 			for _, flow := range domain.Flows {
@@ -324,7 +394,7 @@ func (s *Server) handleFlows(w http.ResponseWriter, r *http.Request) {
 				case wantType != "" && (flow.GroupHint == nil || flow.GroupHint.Type != wantType):
 					continue
 				}
-				list.Flows = append(list.Flows, api.FlowEntry{Node: node, Domain: domain.Name, FlowInventory: flow})
+				list.Flows = append(list.Flows, api.FlowEntry{Node: node, Domain: domain.Domain.String(), FlowInventory: flow})
 			}
 		}
 	}
@@ -367,7 +437,7 @@ func (s *Server) handlePaths(w http.ResponseWriter, r *http.Request) {
 
 // --- rendering ---------------------------------------------------------------------------
 
-func (v *view) request(id string) api.Request {
+func (v *view) request(id api.RequestID) api.Request {
 	record := v.fleet.Requests[id].Value
 
 	status, ok := v.result.Requests[id]
@@ -379,9 +449,10 @@ func (v *view) request(id string) api.Request {
 	}
 
 	return api.Request{
-		ID:          record.ID,
+		ID:          record.ID.String(),
 		RequestSpec: record.Spec,
 		CreatedAt:   record.CreatedAt,
+		UpdatedAt:   record.UpdatedAt,
 		Status:      status,
 	}
 }
@@ -393,10 +464,6 @@ func (v *view) node(name string) api.Node {
 		Name:         name,
 		RegisteredAt: record.RegisteredAt,
 		Capabilities: record.Capabilities,
-		Domains:      record.Domains,
-	}
-	if node.Domains == nil {
-		node.Domains = []api.DomainMapping{}
 	}
 
 	// Live is the lease and nothing else. There is deliberately no "last seen": a heartbeat does
@@ -414,10 +481,8 @@ func (v *view) node(name string) api.Node {
 // deciding a POST against the state that would result from it.
 func fleetWithRequest(fleet *state.Fleet, record state.RequestRecord) *state.Fleet {
 	copied := *fleet
-	copied.Requests = make(map[string]state.Entry[state.RequestRecord], len(fleet.Requests)+1)
-	for id, entry := range fleet.Requests {
-		copied.Requests[id] = entry
-	}
+	copied.Requests = make(map[api.RequestID]state.Entry[state.RequestRecord], len(fleet.Requests)+1)
+	maps.Copy(copied.Requests, fleet.Requests)
 	copied.Requests[record.ID] = state.Entry[state.RequestRecord]{Found: true, Value: record}
 	return &copied
 }
@@ -464,8 +529,14 @@ const (
 //     metric — it invalidates it at collection time and takes its whole family down — so the
 //     scrape path defends itself by dropping it. That defence is right, but a label silently
 //     discarded is a label the operator believes is there.
-//   - They scope `apply --prune` (M8e). A dropped label therefore silently changes what can
-//     cancel the request, which is a much worse failure than a missing series.
+//   - Together with the namespace they scope `apply --prune` (M8e). A dropped label therefore
+//     silently changes what can cancel the request, which is a much worse failure than a missing
+//     series.
+//
+// `namespace` is in the reserved set for the second reason rather than the first: it is a real
+// property now (§9.3) and an ordinary user label as far as *this* map is concerned, but it is
+// emitted as a metric dimension of its own (§12), so a user label of that name would collide with
+// one this project sets itself.
 //
 // Stricter than [api.RequestSpec.Validate], on the same reasoning as [validateRequestName]: the
 // wire type is the contract and stays permissive, while this is the server deciding what it is
@@ -483,17 +554,6 @@ func validateLabels(labels map[string]string) error {
 			return fmt.Errorf("label %q is longer than %d characters", key, maxLabelKeyLength)
 		case len(labels[key]) > maxLabelValueLength:
 			return fmt.Errorf("label %q has a value longer than %d characters", key, maxLabelValueLength)
-		}
-	}
-
-	// The namespace is the one label the server itself acts on, so its *value* is constrained
-	// where other label values are free text. It names a partition an operator selects, prunes
-	// and files manifests by, and it ends up in `--prune -l namespace=…` on a command line.
-	// Empty is refused rather than quietly meaning [api.DefaultNamespace]: `namespace: ""` reads
-	// as a deliberate choice and would silently land the request somewhere else.
-	if ns, ok := labels[api.LabelNamespace]; ok {
-		if err := api.ValidNamespace(ns); err != nil {
-			return fmt.Errorf("label %q: %w", api.LabelNamespace, err)
 		}
 	}
 	return nil

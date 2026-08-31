@@ -112,7 +112,7 @@ func runLoopback(t *testing.T, provider api.Provider, attachment probe.Attachmen
 
 	f.eventually("the source flow to be observed and producing", func() bool {
 		for _, flow := range f.flows().Flows {
-			if flow.ID == definition.id && flow.Domain == "src" {
+			if flow.ID == definition.id && flow.Domain == node.sourceName("src") {
 				return flow.Producing
 			}
 		}
@@ -124,8 +124,8 @@ func runLoopback(t *testing.T, provider api.Provider, attachment probe.Attachmen
 	// quietly landed on shm would report a pass for something it did not test.
 	request := f.request(api.RequestSpec{
 		Name:         "loopback-" + string(provider),
-		Source:       api.Source{Node: "loopback", Domain: "src", Select: api.Selector{Flow: definition.id}},
-		Destinations: []api.Destination{{Node: "loopback", Domain: []string{"dst"}}},
+		Source:       api.Source{Node: "loopback", Domain: node.source("src"), Select: api.Selector{Flow: definition.id}},
+		Destinations: []api.Destination{{Node: "loopback", Domain: api.Domain{Area: "fast", Elements: []string{"dst"}}}},
 		Provider:     api.ProviderPin{provider},
 		Labels:       map[string]string{"suite": "e2e"},
 	})
@@ -183,7 +183,7 @@ func runLoopback(t *testing.T, provider api.Provider, attachment probe.Attachmen
 
 	// Cancelling the request stops both workers. Real processes this time, so the assertion is
 	// that they are gone rather than that a struct was marked dead.
-	f.cancel(request.ID)
+	f.cancel(request.RequestID())
 	f.eventually("the path to be withdrawn", func() bool {
 		return len(f.paths().Paths) == 0
 	})

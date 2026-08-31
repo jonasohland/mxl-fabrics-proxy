@@ -1,6 +1,7 @@
 package validate
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -12,18 +13,20 @@ import (
 	"github.com/jonasohland/mxl-replicator/internal/server/state"
 )
 
-func node(name string, domains []api.DomainMapping, opts ...func(*state.NodeRecord)) state.Entry[state.NodeRecord] {
+func node(name string, opts ...func(*state.NodeRecord)) state.Entry[state.NodeRecord] {
 	record := state.NodeRecord{
-		Node:    name,
-		Domains: domains,
+		Node: name,
 		Capabilities: api.Capabilities{
 			Fabrics: []api.FabricAttachment{{
 				Provider: api.ProviderTCP, Fabric: "dc1", Address: "10.1.1.1",
 				CapFlags: []api.CapFlag{api.CapRemoteWrite, api.CapSendReceive},
 			}},
-			// One output root, which is what makes a node a replication destination at all and
-			// lets a request name a destination without spelling the root (§10.6).
-			OutputRoots: []api.OutputRoot{{Name: "fast", Path: "/dev/shm/mxl"}},
+			// One writable area and one read-only one. A destination always names its area now
+			// (§10.6), so both halves of resolveArea are reachable from this fixture.
+			Areas: []api.Area{
+				{Name: "fast", Path: "/dev/shm/mxl", Read: true, Write: true},
+				{Name: "media", Path: "/dev/shm/mxl-in", Read: true},
+			},
 		},
 	}
 	for _, opt := range opts {
@@ -35,11 +38,8 @@ func node(name string, domains []api.DomainMapping, opts ...func(*state.NodeReco
 func fleet() *state.Fleet {
 	return &state.Fleet{
 		Nodes: map[string]state.Entry[state.NodeRecord]{
-			"studio-a": node("studio-a", []api.DomainMapping{{Name: "cameras", Configured: true}}),
-			"edge-01": node("edge-01", []api.DomainMapping{
-				{Name: "archive", Configured: true},
-				{Name: "found", Configured: false},
-			}),
+			"studio-a": node("studio-a"),
+			"edge-01":  node("edge-01"),
 		},
 	}
 }
@@ -47,8 +47,8 @@ func fleet() *state.Fleet {
 func spec() api.RequestSpec {
 	return api.RequestSpec{
 		Name:         "studio-a-cam1-to-edge",
-		Source:       api.Source{Node: "studio-a", Domain: "cameras", Select: api.Selector{Flow: "flow-1"}},
-		Destinations: []api.Destination{{Node: "edge-01", Domain: []string{"ingest"}}},
+		Source:       api.Source{Node: "studio-a", Domain: named("media/cameras"), Select: api.Selector{Flow: "flow-1"}},
+		Destinations: []api.Destination{{Node: "edge-01", Domain: api.Domain{Area: "fast", Elements: []string{"ingest"}}}},
 	}
 }
 
@@ -56,14 +56,14 @@ func TestSpecAccepts(t *testing.T) {
 	t.Parallel()
 
 	s := spec()
-	result, root, bad := Destination(s, s.Destinations[0], fleet(), negotiate.Config{})
+	result, bad := Destination(s, s.Destinations[0], fleet(), negotiate.Config{})
 	require.Nil(t, bad)
 	assert.Equal(t, api.ProviderTCP, result.Provider())
 	assert.Equal(t, "dc1", result.Fabric)
 
-	// A request naming no root resolves to the node's only one, and the *resolved* name is what
-	// comes back — it is what the path identity and the assignment carry (§10.6).
-	assert.Equal(t, "fast", root)
+	// *There used to be a resolved output root returned alongside the verdict.* A destination's
+	// identity is complete the moment the request is read now — the area is the first segment of
+	// the domain's name (§10.6) — so there is nothing left to resolve into it.
 }
 
 func TestSpecRejections(t *testing.T) {
@@ -79,17 +79,22 @@ func TestSpecRejections(t *testing.T) {
 		{
 			name: "same node and domain",
 			mutate: func(s *api.RequestSpec) {
-				s.Destinations[0] = api.Destination{Node: "studio-a", Domain: []string{"cameras"}}
+				s.Source.Domain = named("fast/cameras")
+				s.Destinations[0] = api.Destination{
+					Node: "studio-a", Domain: api.Domain{Area: "fast", Elements: []string{"cameras"}},
+				}
 			},
 			want: api.ReasonSameEndpoint,
 		},
 		{
-			// Same node, different domain is legitimate — it is exactly what the legacy loopback
-			// configuration does, and it is how shm ever gets used. The destination is an output
-			// domain under that node's own root; the source stays an input mapping (§10.6).
+			// Same node, different domain is legitimate — it is exactly what the loopback
+			// configuration does, and it is how shm ever gets used. One kind of domain now, so
+			// the two sides differ only in which one they name (§10.6).
 			name: "same node different domain is fine",
 			mutate: func(s *api.RequestSpec) {
-				s.Destinations[0] = api.Destination{Node: "studio-a", Domain: []string{"local"}}
+				s.Destinations[0] = api.Destination{
+					Node: "studio-a", Domain: api.Domain{Area: "fast", Elements: []string{"local"}},
+				}
 			},
 		},
 		{
@@ -106,53 +111,53 @@ func TestSpecRejections(t *testing.T) {
 			// Normally refused at POST by api.RequestSpec.Validate; reachable here for a request
 			// written straight into the store, which must still fail rather than reach an agent.
 			name:   "destination domain is a path",
-			mutate: func(s *api.RequestSpec) { s.Destinations[0].Domain = []string{"/dev/shm/anything"} },
+			mutate: func(s *api.RequestSpec) { s.Destinations[0].Domain.Elements = []string{"/dev/shm/anything"} },
 			want:   api.ReasonMalformedDomainName,
 		},
 		{
-			// Names are flat per node: one name cannot mean two directories. A *discovered*
-			// domain needs no case of its own — it is named by its path, and a path is refused
-			// above (§10.6).
-			name:   "destination collides with an input mapping",
-			mutate: func(s *api.RequestSpec) { s.Destinations[0].Domain = []string{"archive"} },
-			want:   api.ReasonDomainNameInUse,
-		},
-		{
-			name: "destination node advertises no output root",
+			name: "destination node advertises no area at all",
 			prepare: func(f *state.Fleet) {
 				entry := f.Nodes["edge-01"]
-				entry.Value.Capabilities.OutputRoots = nil
+				entry.Value.Capabilities.Areas = nil
 				f.Nodes["edge-01"] = entry
 			},
-			want:    api.ReasonNoOutputRoot,
-			message: "advertises no output root",
+			want:    api.ReasonUnknownArea,
+			message: "advertises no area",
 		},
 		{
-			name:    "unknown output root",
-			mutate:  func(s *api.RequestSpec) { s.Destinations[0].Root = "bulk" },
-			want:    api.ReasonUnknownOutputRoot,
-			message: `"fast"`,
+			name:    "unknown area",
+			mutate:  func(s *api.RequestSpec) { s.Destinations[0].Domain.Area = "bulk" },
+			want:    api.ReasonUnknownArea,
+			message: `"fast" (writable)`,
 		},
 		{
-			// Never a guess. The friendly single-root case is the common one, and this error
-			// carries its own fix (§10.6).
-			name: "two roots and none named",
+			// An area that exists and is read-only. A different operator problem from a typo,
+			// which is why it is a code of its own (§7.2).
+			name:    "area not writable",
+			mutate:  func(s *api.RequestSpec) { s.Destinations[0].Domain.Area = "media" },
+			want:    api.ReasonAreaNotWritable,
+			message: "does not grant writing",
+		},
+		{
+			// *There used to be an `ambiguous_output_root` case here — a node advertising several
+			// roots and a request naming none.* It is structurally unreachable: a destination
+			// always names its area, because the area is the first segment of the domain's name
+			// (§7.2, §10.6). A second area changes nothing.
+			name: "a second area is not an ambiguity",
 			prepare: func(f *state.Fleet) {
 				entry := f.Nodes["edge-01"]
-				entry.Value.Capabilities.OutputRoots = append(entry.Value.Capabilities.OutputRoots,
-					api.OutputRoot{Name: "bulk", Path: "/mnt/nvme/mxl"})
+				entry.Value.Capabilities.Areas = append(entry.Value.Capabilities.Areas,
+					api.Area{Name: "bulk", Path: "/mnt/nvme/mxl", Read: true, Write: true})
 				f.Nodes["edge-01"] = entry
 			},
-			want:    api.ReasonAmbiguousOutputRoot,
-			message: `"bulk", "fast"`,
 		},
 		{
-			name:   "two roots and one named",
-			mutate: func(s *api.RequestSpec) { s.Destinations[0].Root = "bulk" },
+			name:   "a destination in the second area",
+			mutate: func(s *api.RequestSpec) { s.Destinations[0].Domain.Area = "bulk" },
 			prepare: func(f *state.Fleet) {
 				entry := f.Nodes["edge-01"]
-				entry.Value.Capabilities.OutputRoots = append(entry.Value.Capabilities.OutputRoots,
-					api.OutputRoot{Name: "bulk", Path: "/mnt/nvme/mxl"})
+				entry.Value.Capabilities.Areas = append(entry.Value.Capabilities.Areas,
+					api.Area{Name: "bulk", Path: "/mnt/nvme/mxl", Read: true, Write: true})
 				f.Nodes["edge-01"] = entry
 			},
 		},
@@ -174,7 +179,7 @@ func TestSpecRejections(t *testing.T) {
 		{
 			name: "no shared fabric",
 			prepare: func(f *state.Fleet) {
-				f.Nodes["edge-01"] = node("edge-01", []api.DomainMapping{{Name: "archive", Configured: true}},
+				f.Nodes["edge-01"] = node("edge-01",
 					func(r *state.NodeRecord) {
 						r.Capabilities.Fabrics[0].Fabric = "dc2"
 					})
@@ -201,7 +206,7 @@ func TestSpecRejections(t *testing.T) {
 				tc.mutate(&s)
 			}
 
-			_, _, bad := Destination(s, s.Destinations[0], f, negotiate.Config{})
+			_, bad := Destination(s, s.Destinations[0], f, negotiate.Config{})
 			if tc.want == "" {
 				assert.Nil(t, bad)
 				return
@@ -219,53 +224,77 @@ func TestSpecRejections(t *testing.T) {
 
 func ptr[T any](v T) *T { return &v }
 
+// ref builds one expanded path. The destination domain is written the way a manifest spells it,
+// `<area>/<elements>`, and split here because a test is allowed the convenience the rest of the
+// tree is not.
 func ref(id string, srcNode, srcDomain, flow, dstNode, dstDomain string, since time.Time) PathRef {
+	segments := strings.Split(dstDomain, "/")
 	return PathRef{
 		ID: id,
 		Path: state.PathIdentity{
 			Source:      api.FlowAddress{Node: srcNode, Domain: srcDomain, Flow: flow},
-			Destination: api.Destination{Node: dstNode, Domain: []string{dstDomain}},
+			Destination: api.Destination{Node: dstNode, Domain: api.Domain{Area: segments[0], Elements: segments[1:]}},
 		},
 		Since: since,
 	}
 }
 
-// rooted is ref with an explicit output root, for the flat-namespace cases.
-func rooted(id string, srcNode, srcDomain, flow, dstNode, dstDomain, root string, since time.Time) PathRef {
-	r := ref(id, srcNode, srcDomain, flow, dstNode, dstDomain, since)
-	r.Path.Destination.Root = root
-	return r
-}
-
-// One domain name cannot mean two directories on one node (§10.6). Checked across paths rather
-// than per request because the colliding pair need share no source, no flow and no request —
-// which is exactly the case here.
-func TestConflictsRejectsOneNameUnderTwoRoots(t *testing.T) {
+// **One name under two areas is two destinations, not a collision.** *This inverts
+// TestConflictsRejectsOneNameUnderTwoRoots*, which tested the flat-namespace rule §10.6
+// supersedes: with the area in the domain's name, `fast/ingest` and `bulk/ingest` are two strings
+// and the collision is unconstructible.
+func TestOneNameInTwoAreasIsTwoDestinations(t *testing.T) {
 	t.Parallel()
 
 	first := time.Unix(1000, 0)
 	out := Conflicts([]PathRef{
-		rooted("p2", "studio-b", "cameras", "flow-2", "edge-01", "ingest", "bulk", first.Add(time.Hour)),
-		rooted("p1", "studio-a", "cameras", "flow-1", "edge-01", "ingest", "fast", first),
+		ref("p2", "studio-b", "cameras", "flow-2", "edge-01", "bulk/ingest", first.Add(time.Hour)),
+		ref("p1", "studio-a", "cameras", "flow-1", "edge-01", "fast/ingest", first),
+	})
+	assert.Empty(t, out)
+}
+
+// **One materialised domain may not contain another** (§10.6): the outer one's flows and the
+// inner one's would share a tree, and removing either is a question with no answer.
+func TestConflictsRejectsNestedDomains(t *testing.T) {
+	t.Parallel()
+
+	first := time.Unix(1000, 0)
+	out := Conflicts([]PathRef{
+		ref("p2", "studio-b", "cameras", "flow-2", "edge-01", "fast/studio-a/cam1", first.Add(time.Hour)),
+		ref("p1", "studio-a", "cameras", "flow-1", "edge-01", "fast/studio-a", first),
 	})
 
 	// Oldest-first, like the other conflicts: a new request never invalidates a path that is
 	// probably already carrying media.
 	require.Contains(t, out, "p2")
 	assert.Equal(t, api.ReasonDomainNameInUse, out["p2"].Code)
-	assert.Contains(t, out["p2"].Message, `"fast"`)
+	assert.Contains(t, out["p2"].Message, "fast/studio-a")
 	assert.NotContains(t, out, "p1")
+
+	// Across areas there is nothing to nest: two areas are two directory trees.
+	assert.Empty(t, Conflicts([]PathRef{
+		ref("p1", "studio-a", "cameras", "flow-1", "edge-01", "fast/studio-a", first),
+		ref("p2", "studio-b", "cameras", "flow-2", "edge-01", "bulk/studio-a/cam1", first.Add(time.Hour)),
+	}))
+
+	// And a sibling whose name is a string prefix is not nested — the trap the element form
+	// exists to remove.
+	assert.Empty(t, Conflicts([]PathRef{
+		ref("p1", "studio-a", "cameras", "flow-1", "edge-01", "fast/studio-a", first),
+		ref("p2", "studio-b", "cameras", "flow-2", "edge-01", "fast/studio-ab", first.Add(time.Hour)),
+	}))
 }
 
-// Two sources into one output domain is ordinary and must stay so: it is how a destination
-// collects several flows, and it is what the refcount on a materialised domain is for.
-func TestConflictsAcceptsTwoFlowsIntoOneOutputDomain(t *testing.T) {
+// Two sources into one domain is ordinary and must stay so: it is how a destination collects
+// several flows, and it is what the refcount on a materialised domain is for.
+func TestConflictsAcceptsTwoFlowsIntoOneDomain(t *testing.T) {
 	t.Parallel()
 
 	now := time.Unix(1000, 0)
 	out := Conflicts([]PathRef{
-		rooted("p1", "studio-a", "cameras", "flow-1", "edge-01", "ingest", "fast", now),
-		rooted("p2", "studio-b", "cameras", "flow-2", "edge-01", "ingest", "fast", now.Add(time.Hour)),
+		ref("p1", "studio-a", "cameras", "flow-1", "edge-01", "fast/ingest", now),
+		ref("p2", "studio-b", "cameras", "flow-2", "edge-01", "fast/ingest", now.Add(time.Hour)),
 	})
 	assert.Empty(t, out)
 }
@@ -275,9 +304,9 @@ func TestConflictsAcceptsIndependentPaths(t *testing.T) {
 
 	now := time.Unix(1000, 0)
 	out := Conflicts([]PathRef{
-		ref("p1", "studio-a", "cameras", "flow-1", "edge-01", "ingest", now),
-		ref("p2", "studio-a", "cameras", "flow-2", "edge-01", "ingest", now),
-		ref("p3", "studio-a", "cameras", "flow-1", "edge-02", "ingest", now),
+		ref("p1", "studio-a", "cameras", "flow-1", "edge-01", "fast/ingest", now),
+		ref("p2", "studio-a", "cameras", "flow-2", "edge-01", "fast/ingest", now),
+		ref("p3", "studio-a", "cameras", "flow-1", "edge-02", "fast/ingest", now),
 	})
 	assert.Empty(t, out)
 }
@@ -289,8 +318,8 @@ func TestConflictsRejectsTwoSourcesIntoOneDestinationFlow(t *testing.T) {
 
 	first := time.Unix(1000, 0)
 	out := Conflicts([]PathRef{
-		ref("p2", "studio-b", "cameras", "flow-1", "edge-01", "ingest", first.Add(time.Hour)),
-		ref("p1", "studio-a", "cameras", "flow-1", "edge-01", "ingest", first),
+		ref("p2", "studio-b", "cameras", "flow-1", "edge-01", "fast/ingest", first.Add(time.Hour)),
+		ref("p1", "studio-a", "cameras", "flow-1", "edge-01", "fast/ingest", first),
 	})
 
 	// The older path wins: it is the one probably already carrying media, so the newcomer is
@@ -308,45 +337,49 @@ func TestConflictsIgnoresADuplicatedEdge(t *testing.T) {
 
 	now := time.Unix(1000, 0)
 	out := Conflicts([]PathRef{
-		ref("p1", "studio-a", "cameras", "flow-1", "edge-01", "ingest", now),
-		ref("p1", "studio-a", "cameras", "flow-1", "edge-01", "ingest", now),
+		ref("p1", "studio-a", "cameras", "flow-1", "edge-01", "fast/ingest", now),
+		ref("p1", "studio-a", "cameras", "flow-1", "edge-01", "fast/ingest", now),
 	})
 	assert.Empty(t, out)
 }
 
 // A→B→C is fine and useful. A→B plus B→A for one flow feeds a flow back into itself, and so
 // does the same mistake spelled longer (§7.2).
+//
+// The source domains are written `fast/d` here, the same grammar the destinations use, because
+// that is the point of one identity grammar: the middle hop of a chain is the *same* domain seen
+// from both ends, and the cycle detector compares those two strings (§10.6).
 func TestConflictsRejectsCyclesButNotChains(t *testing.T) {
 	t.Parallel()
 
 	now := time.Unix(1000, 0)
 
 	chain := Conflicts([]PathRef{
-		ref("p1", "a", "d", "flow-1", "b", "d", now),
-		ref("p2", "b", "d", "flow-1", "c", "d", now.Add(time.Second)),
+		ref("p1", "a", "fast/d", "flow-1", "b", "fast/d", now),
+		ref("p2", "b", "fast/d", "flow-1", "c", "fast/d", now.Add(time.Second)),
 	})
 	assert.Empty(t, chain)
 
 	loop := Conflicts([]PathRef{
-		ref("p1", "a", "d", "flow-1", "b", "d", now),
-		ref("p2", "b", "d", "flow-1", "a", "d", now.Add(time.Second)),
+		ref("p1", "a", "fast/d", "flow-1", "b", "fast/d", now),
+		ref("p2", "b", "fast/d", "flow-1", "a", "fast/d", now.Add(time.Second)),
 	})
 	require.Contains(t, loop, "p2")
 	assert.Equal(t, api.ReasonLoop, loop["p2"].Code)
 	assert.NotContains(t, loop, "p1")
 
 	longer := Conflicts([]PathRef{
-		ref("p1", "a", "d", "flow-1", "b", "d", now),
-		ref("p2", "b", "d", "flow-1", "c", "d", now.Add(time.Second)),
-		ref("p3", "c", "d", "flow-1", "a", "d", now.Add(2*time.Second)),
+		ref("p1", "a", "fast/d", "flow-1", "b", "fast/d", now),
+		ref("p2", "b", "fast/d", "flow-1", "c", "fast/d", now.Add(time.Second)),
+		ref("p3", "c", "fast/d", "flow-1", "a", "fast/d", now.Add(2*time.Second)),
 	})
 	require.Contains(t, longer, "p3")
 	assert.Equal(t, api.ReasonLoop, longer["p3"].Code)
 
 	// A cycle in *another* flow's graph is not this flow's problem: the graphs are per flow ID.
 	unrelated := Conflicts([]PathRef{
-		ref("p1", "a", "d", "flow-1", "b", "d", now),
-		ref("p2", "b", "d", "flow-2", "a", "d", now.Add(time.Second)),
+		ref("p1", "a", "fast/d", "flow-1", "b", "fast/d", now),
+		ref("p2", "b", "d", "flow-2", "a", "fast/d", now.Add(time.Second)),
 	})
 	assert.Empty(t, unrelated)
 }
@@ -358,9 +391,9 @@ func TestConflictsAreOrderIndependent(t *testing.T) {
 
 	now := time.Unix(1000, 0)
 	paths := []PathRef{
-		ref("p3", "studio-c", "cameras", "flow-1", "edge-01", "ingest", now.Add(2*time.Second)),
-		ref("p1", "studio-a", "cameras", "flow-1", "edge-01", "ingest", now),
-		ref("p2", "studio-b", "cameras", "flow-1", "edge-01", "ingest", now.Add(time.Second)),
+		ref("p3", "studio-c", "cameras", "flow-1", "edge-01", "fast/ingest", now.Add(2*time.Second)),
+		ref("p1", "studio-a", "cameras", "flow-1", "edge-01", "fast/ingest", now),
+		ref("p2", "studio-b", "cameras", "flow-1", "edge-01", "fast/ingest", now.Add(time.Second)),
 	}
 
 	want := Conflicts(paths)
@@ -376,62 +409,11 @@ func TestConflictsAreOrderIndependent(t *testing.T) {
 
 	// Simultaneous creation is broken by ID, so even a tie is deterministic.
 	tied := Conflicts([]PathRef{
-		ref("zzz", "studio-b", "cameras", "flow-9", "edge-01", "ingest", now),
-		ref("aaa", "studio-a", "cameras", "flow-9", "edge-01", "ingest", now),
+		ref("zzz", "studio-b", "cameras", "flow-9", "edge-01", "fast/ingest", now),
+		ref("aaa", "studio-a", "cameras", "flow-9", "edge-01", "fast/ingest", now),
 	})
 	require.Contains(t, tied, "zzz")
 	assert.NotContains(t, tied, "aaa")
-}
-
-// An output root is permitted to be an ancestor of an input mapping (§10.6), and this is the case
-// that permission leaves open: the *name* is free but the resolved directory is one the node
-// already reads from. The agent refuses it independently and is the authority; this is what turns
-// it into a rejection at POST with a reason naming what to change.
-func TestADestinationMayNotLandOnAnInputDomainsDirectory(t *testing.T) {
-	t.Parallel()
-
-	// The mapping's name deliberately differs from its directory's basename, so the name check
-	// cannot see the collision and only the path check can.
-	f := fleet()
-	f.Nodes["edge-01"] = node("edge-01", []api.DomainMapping{
-		{Name: "cams", Path: "/dev/shm/mxl/cameras", Configured: true},
-	})
-
-	s := spec()
-	s.Destinations[0].Domain = []string{"cameras"}
-
-	_, root, bad := Destination(s, s.Destinations[0], f, negotiate.Config{})
-	require.NotNil(t, bad)
-	assert.Equal(t, api.ReasonDomainPathInUse, bad.Code)
-	assert.Contains(t, bad.Message, "/dev/shm/mxl/cameras")
-	assert.Contains(t, bad.Message, `input domain "cams"`)
-
-	// The resolved root still comes back, so a shadow path keeps the identity the real path would
-	// have had and a session already running on it stays reported (§10.6).
-	assert.Equal(t, "fast", root)
-
-	// A sibling under the same root is unaffected.
-	s.Destinations[0].Domain = []string{"ingest"}
-	_, _, bad = Destination(s, s.Destinations[0], f, negotiate.Config{})
-	assert.Nil(t, bad)
-}
-
-// A node that withholds its root's path — advertised for diagnostics only (§10.2) — cannot be
-// checked here, and must not be refused on that account. The agent's own check still holds.
-func TestAWithheldRootPathSkipsTheCheckRatherThanFailing(t *testing.T) {
-	t.Parallel()
-
-	f := fleet()
-	f.Nodes["edge-01"] = node("edge-01", nil, func(r *state.NodeRecord) {
-		r.Capabilities.OutputRoots = []api.OutputRoot{{Name: "fast"}}
-		r.Domains = []api.DomainMapping{{Name: "cams", Path: "/dev/shm/mxl/cameras", Configured: true}}
-	})
-
-	s := spec()
-	s.Destinations[0].Domain = []string{"cameras"}
-
-	_, _, bad := Destination(s, s.Destinations[0], f, negotiate.Config{})
-	assert.Nil(t, bad)
 }
 
 // **No output domain inside another output domain.** `studio-a` and `studio-a/cam1` would make one
@@ -449,7 +431,7 @@ func TestOutputDomainsMayNotNest(t *testing.T) {
 			ID: id,
 			Path: state.PathIdentity{
 				Source:      api.FlowAddress{Node: "studio-a", Domain: "cameras", Flow: "flow-" + id},
-				Destination: api.Destination{Node: "edge-01", Domain: domain, Root: "fast"},
+				Destination: api.Destination{Node: "edge-01", Domain: api.Domain{Area: "fast", Elements: domain}},
 			},
 			Since: since,
 		}
@@ -485,4 +467,11 @@ func TestOutputDomainsMayNotNest(t *testing.T) {
 		nested("b", []string{"studio-a", "cam2"}, at.Add(time.Minute)),
 	})
 	assert.Empty(t, out)
+}
+
+// named builds a `name` domain selector from the `<area>/<elements>` spelling, splitting it the
+// way a manifest does. Tests are allowed the convenience the rest of the tree is not (§10.6).
+func named(domain string) api.DomainSelector {
+	segments := strings.Split(domain, "/")
+	return api.SelectDomain(api.Domain{Area: segments[0], Elements: segments[1:]})
 }

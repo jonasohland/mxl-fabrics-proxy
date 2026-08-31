@@ -254,8 +254,7 @@ type Node struct {
 	RegisteredAt time.Time `json:"registered_at,omitzero"`
 	LastSeen     time.Time `json:"last_seen,omitzero"`
 
-	Capabilities Capabilities    `json:"capabilities"`
-	Domains      []DomainMapping `json:"domains"`
+	Capabilities Capabilities `json:"capabilities"`
 }
 
 // NodeList is GET /v1/nodes.
@@ -263,8 +262,21 @@ type NodeList struct {
 	Nodes []Node `json:"nodes"`
 }
 
-// DomainList is GET /v1/nodes/{node}/domains.
+// DomainList is GET /v1/nodes/{node}/domains: the domains this node is currently **observing**
+// (§9.1).
+//
+// *This used to report registration data — the node's configured mappings.* There is no configured
+// mapping to report any more (§6), so it reports what the agent sees, which is where a node's
+// domains have always actually lived.
 type DomainList struct {
-	Node    string          `json:"node"`
-	Domains []DomainMapping `json:"domains"`
+	Node string `json:"node"`
+
+	// Settling reports that the server has not run its first reconcile (§7.3). This answer is
+	// inventory-dependent, so during the window it would otherwise render every label with nothing
+	// observed beside it, which looks exactly like the labels having been lost (§9.1).
+	Settling bool `json:"settling,omitempty"`
+
+	// Domains is the join: observed domains left-joined with their label records, plus label
+	// records with no observed domain (§9.1, §10.7).
+	Domains []DomainInfo `json:"domains"`
 }

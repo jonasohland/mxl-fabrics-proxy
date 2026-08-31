@@ -15,6 +15,8 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	"github.com/jonasohland/mxl-utils/pkg/testutil"
+
 	"github.com/jonasohland/mxl-replicator/internal/agent/inventory"
 	"github.com/jonasohland/mxl-replicator/internal/agent/ports"
 	"github.com/jonasohland/mxl-replicator/internal/api"
@@ -258,10 +260,12 @@ type harness struct {
 	server   *server
 	launcher *fake.Launcher
 
-	// domain is the configured *input* domain: a source. outputDomain is where a target
-	// assignment from targetAssignment materialises, which is a directory that does not exist
-	// until one is accepted (§10.6).
+	// domain is the *discovered* source domain — a directory under the harness's search path,
+	// holding one flow so the discoverer reports it. outputDomain is where a target assignment
+	// from targetAssignment materialises, which is a directory that does not exist until one is
+	// accepted (§10.6).
 	domain       string
+	name         api.Domain
 	root         string
 	outputDomain string
 	stopped      chan struct{}
@@ -277,12 +281,12 @@ type harnessOptions struct {
 	// probeErr makes the capability probe fail.
 	probeErr error
 
-	// searchPaths adds a discovered-domain root alongside the configured domain.
-	searchPaths []string
+	// areas replaces the harness's own two. Empty takes the default: one readable area holding the
+	// source domain, and one writable area destinations are materialised in (§10.6).
+	areas []api.Area
 
-	// outputRoots are the directories replication may create domains under (§10.6). Empty, as in
-	// most of these tests, means a node that is not a replication destination.
-	outputRoots []inventory.Root
+	// extraAreas are added alongside the harness's own, for tests that want a third.
+	extraAreas []api.Area
 
 	// tweak adjusts the agent config before it is built.
 	tweak func(*Config)
@@ -292,23 +296,36 @@ func newHarness(t *testing.T, opts harnessOptions) *harness {
 	t.Helper()
 
 	srv := newServer(t)
-	domain := t.TempDir()
+
+	// **The source domain is discovered, not configured** (§6). There is no name→path mapping any
+	// more, so the harness gives the inventory a readable area and puts a flow in the domain — a
+	// directory with no flow in it is not reported by the discoverer at all, which is a real
+	// property of the design and not a fixture detail (§10.7).
+	areaRoot := t.TempDir()
+	domain := filepath.Join(areaRoot, "cameras")
+	require.NoError(t, os.MkdirAll(domain, 0o755))
+	sourceFlow, err := testutil.RandomVideoFlow(domain)
+	require.NoError(t, err)
+	require.NoError(t, sourceFlow.Create())
+
 	root := t.TempDir()
 
-	if opts.outputRoots == nil {
-		// Most of these tests assign a target, and after §10.6 a target's domain is a name
-		// materialised under a root. One root means a destination can be spelled without naming
-		// it, which is the common deployment as well as the short spelling.
-		opts.outputRoots = []inventory.Root{{Name: "fast", Path: root}}
+	areas := opts.areas
+	if areas == nil {
+		// Most of these tests assign a target, and a target's domain is a name inside an area the
+		// operator granted `write` on (§10.6). Two areas: one this node reads, one it writes.
+		areas = []api.Area{
+			{Name: "media", Path: areaRoot, Read: true},
+			{Name: "fast", Path: root, Read: true, Write: true},
+		}
 	}
+	areas = append(areas, opts.extraAreas...)
 
 	inv, err := inventory.New(inventory.Options{
-		Domains:     []inventory.Domain{{Name: "cameras", Path: domain}},
-		SearchPaths: opts.searchPaths,
-		OutputRoots: opts.outputRoots,
-		Interval:    5 * time.Millisecond,
-		IdleAfter:   50 * time.Millisecond,
-		Logger:      discard(),
+		Areas:     areas,
+		Interval:  5 * time.Millisecond,
+		IdleAfter: 50 * time.Millisecond,
+		Logger:    discard(),
 	})
 	require.NoError(t, err)
 
@@ -367,6 +384,7 @@ func newHarness(t *testing.T, opts harnessOptions) *harness {
 		server:       srv,
 		launcher:     launcher,
 		domain:       domain,
+		name:         api.Domain{Area: "media", Elements: []string{"cameras"}},
 		root:         root,
 		outputDomain: filepath.Join(root, "ingest"),
 		stopped:      make(chan struct{}),
@@ -429,22 +447,20 @@ func (h *harness) consistently(what string, d time.Duration, cond func() bool) {
 	}
 }
 
-// targetAssignment is the destination end of a session (§5.3 step 2).
-// targetAssignment is the destination end. Its domain is an *output* one — a name the agent
-// creates inside the "fast" root — which is what makes it a destination at all (§10.6).
+// targetAssignment is the destination end of a session (§5.3 step 2). Its domain names the
+// harness's writable area, which is what makes it a destination at all (§10.6).
 func targetAssignment(sessionID string) api.Assignment {
 	return api.Assignment{
 		SessionID: sessionID,
 		Role:      api.RoleTarget,
-		Domain:    "ingest",
-		// The elements the agent resolves from. Domain is the rendered name — what it logs and
-		// labels metrics with — and OutputDomain is what the resolver takes, so that nothing
-		// outside the CLI's manifest parser turns a domain string back into path elements (§10.6).
-		OutputDomain: []string{"ingest"},
-		Root:         "fast",
-		FlowID:       "5592a23b-0974-45bb-9388-89ea81c42537",
-		FlowDef:      json.RawMessage(`{"id":"5592a23b-0974-45bb-9388-89ea81c42537","format":"urn:x-nmos:format:video"}`),
-		Fabric:       "dc1",
+		// **One structured domain for both roles.** The resolver takes the area name and the
+		// elements, so nothing outside the CLI's manifest parser turns a domain string back into
+		// path elements (§10.6).
+		Domain:    api.Domain{Area: "fast", Elements: []string{"ingest"}},
+		Namespace: api.DefaultNamespace,
+		FlowID:    "5592a23b-0974-45bb-9388-89ea81c42537",
+		FlowDef:   json.RawMessage(`{"id":"5592a23b-0974-45bb-9388-89ea81c42537","format":"urn:x-nmos:format:video"}`),
+		Fabric:    "dc1",
 		Interface: api.InterfaceConfig{
 			Provider:       api.ProviderTCP,
 			CapFlags:       []api.CapFlag{api.CapRemoteWrite},
@@ -455,11 +471,13 @@ func targetAssignment(sessionID string) api.Assignment {
 
 // initiatorAssignment is the source end, which needs an epoch and the blob it was computed from
 // (§5.3 step 5).
-func initiatorAssignment(sessionID, epochValue, blob string) api.Assignment {
+// The domain is the harness's own discovered source domain, `media/cameras` (§6, §10.6). Passed
+// in rather than hardcoded so that a test can point it somewhere else.
+func initiatorAssignment(domain api.Domain, sessionID, epochValue, blob string) api.Assignment {
 	return api.Assignment{
 		SessionID:  sessionID,
 		Role:       api.RoleInitiator,
-		Domain:     "cameras",
+		Domain:     domain,
 		FlowID:     "5592a23b-0974-45bb-9388-89ea81c42537",
 		Epoch:      epochValue,
 		TargetInfo: blob,

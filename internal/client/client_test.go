@@ -243,12 +243,12 @@ func TestBodyIsResentOnFailover(t *testing.T) {
 
 	err := newClient(t, deadURL, ok.URL).ReportInventory(t.Context(), api.InventorySnapshot{
 		Node:    "edge-01",
-		Domains: []api.DomainInventory{{Name: "cameras", Configured: true}},
+		Domains: []api.DomainInventory{{Domain: api.Domain{Area: "media", Elements: []string{"cameras"}}}},
 	})
 	require.NoError(t, err)
 	assert.Equal(t, "edge-01", got.Node)
 	require.Len(t, got.Domains, 1)
-	assert.Equal(t, "cameras", got.Domains[0].Name)
+	assert.Equal(t, "media/cameras", got.Domains[0].Domain.String())
 }
 
 // The long poll is held open on purpose, so the transport deadline has to be derived from the

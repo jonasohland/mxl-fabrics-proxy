@@ -12,7 +12,7 @@ import (
 func TestKeysLandInTheRightLayer(t *testing.T) {
 	t.Parallel()
 
-	desired := []string{NodeKey("edge-01"), RequestKey("r-1"), KeyPolicy}
+	desired := []string{NodeKey("edge-01"), NamespaceKey("nab"), RequestKey("nab", "r-1"), KeyPolicy}
 	observed := []string{LeaseKey("edge-01"), InventoryKey("edge-01"), StatusKey("edge-01")}
 	derived := []string{SessionKey("s-1"), AssignmentsKey("edge-01")}
 
@@ -32,7 +32,8 @@ func TestKeysAreUnderTheirListPrefix(t *testing.T) {
 
 	for _, tc := range []struct{ key, prefix string }{
 		{NodeKey("edge-01"), PrefixNodes},
-		{RequestKey("r-1"), PrefixRequests},
+		{NamespaceKey("nab"), PrefixNamespaces},
+		{RequestKey("nab", "r-1"), PrefixRequests},
 		{LeaseKey("edge-01"), PrefixLeases},
 		{InventoryKey("edge-01"), PrefixInventory},
 		{StatusKey("edge-01"), PrefixStatus},
@@ -88,4 +89,30 @@ func TestSiblingPrefixesDoNotOverlap(t *testing.T) {
 			}
 		}
 	}
+}
+
+// **A domain name contains `/`**, and the key layout depends on [escape] percent-encoding it so
+// that the record stays one key segment (§8).
+//
+// The property belongs to url.PathEscape's escaping mode rather than to anything in this tree,
+// which is why it is pinned here rather than left to a comment: if the standard library ever
+// stopped encoding `/` in that mode, `/desired/domains/edge-01/fast/ingest` would be three
+// segments and the per-node prefix scan would split in the wrong place.
+func TestADomainNameWithASeparatorStaysOneKeySegment(t *testing.T) {
+	t.Parallel()
+
+	key := DomainLabelsKey("edge-01", "fast/ingest")
+	prefix := DomainLabelsPrefix("edge-01")
+
+	assert.True(t, strings.HasPrefix(key, prefix), "%s is not under %s", key, prefix)
+	assert.Equal(t, "/desired/domains/edge-01/fast%2Fingest", key)
+
+	// One segment past the prefix, which is what makes the two-level scan split where it is meant
+	// to. Three would put `ingest` under a node called `fast`.
+	assert.NotContains(t, strings.TrimPrefix(key, prefix), "/")
+
+	// And a node name with a separator in it is escaped for the same reason (§7.1).
+	nested := DomainLabelsKey("rack/edge-01", "fast/ingest")
+	assert.Equal(t, "/desired/domains/rack%2Fedge-01/fast%2Fingest", nested)
+	assert.NotEqual(t, DomainLabelsPrefix("rack"), DomainLabelsPrefix("rack/edge-01"))
 }
