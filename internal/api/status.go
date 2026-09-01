@@ -84,6 +84,35 @@ const (
 	// a path really is in, so a second set-shaped meaning would make
 	// `mxl_repl_requests{state="DEGRADED"}` a sum of two populations needing different responses.
 	StatePartial State = "PARTIAL"
+
+	// StateDisabled means every destination of this request is parked, so it is asking for nothing
+	// (§9.1, §11).
+	//
+	// **Aggregates only**, like [StatePartial], and for a sharper reason: a parked destination
+	// produces no pairing and therefore no path, so there is nothing underneath for the word to be
+	// about. A renderer may show it on a request row and must never expect it on a path row.
+	//
+	// **And it is *derived*, never stored.** [Destination.Disabled] is the only place off is
+	// written down; this state is a fold over those entries. A request-level flag beside the list
+	// could drift from it, and the drifted state is the bad one — the API calling a request off
+	// while its legs are running.
+	//
+	// Neither existing state can carry it. WAITING promises the condition resolves by itself when a
+	// flow appears, and this one never will; INVALID promises user action is needed and something
+	// is wrong, and nothing is. Reusing either is the mistake §11's table exists to prevent: a state
+	// earns a word by being something an operator decides differently on, and "I turned this off" is
+	// decided differently from both. Rendered as a fault, a board with twenty parked legs reads as
+	// twenty problems.
+	//
+	// It is only for a request that expands to nothing *because* everything is off. One enabled
+	// destination beside a parked one folds over the paths the enabled one produced, exactly as
+	// though the parked entry had never been written — and a request whose selectors merely match
+	// nothing is WAITING, which does resolve by itself and must stay distinguishable from this.
+	//
+	// It ranks **below** ACTIVE rather than above INVALID: worst-first ordering is a queue of things
+	// to look at and this is not one of them. `status` counts it and keeps it out of the list of
+	// what is wrong — parked intent has to stay visible without being loud.
+	StateDisabled State = "DISABLED"
 )
 
 // WorkerState is what an agent reports about one worker it is running (§5.3, §9.2).
@@ -115,9 +144,10 @@ const (
 // in must export as 0 rather than vanish, or a graph shows a gap where it should show a floor
 // (§12).
 //
-// [StatePartial] is deliberately absent — it aggregates, so `mxl_repl_paths{state="PARTIAL"}` would
-// be a series that is structurally always zero, which reads as a condition being monitored rather
-// than as one that cannot occur. Use [RequestStates] for the request gauge.
+// [StatePartial] and [StateDisabled] are deliberately absent — both aggregate, so
+// `mxl_repl_paths{state="PARTIAL"}` would be a series that is structurally always zero, which reads
+// as a condition being monitored rather than as one that cannot occur. Use [RequestStates] for the
+// request gauge.
 func States() []State {
 	return []State{
 		StateWaiting, StateInvalid, StateEstablishing,
@@ -125,9 +155,13 @@ func States() []State {
 	}
 }
 
-// RequestStates is the vocabulary a **request** can be in: [States] plus [StatePartial].
+// RequestStates is the vocabulary a **request** can be in: [States] plus the two aggregate-only
+// words, [StatePartial] and [StateDisabled].
+//
+// Both additions are structurally the same move — a value a request can report and a path cannot —
+// which is why this list exists rather than every caller appending its own.
 func RequestStates() []State {
-	return append(States(), StatePartial)
+	return append(States(), StatePartial, StateDisabled)
 }
 
 // WorkerStates is the whole agent-facing vocabulary. Same reason as [States].

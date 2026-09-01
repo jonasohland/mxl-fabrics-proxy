@@ -236,6 +236,18 @@ const (
 	// fine, nobody is writing (§11, §11.1).
 	ReasonSourceIdle ReasonCode = "source_idle"
 
+	// --- Switched off, which is neither (§9.1, §11) ---
+
+	// ReasonAllDestinationsDisabled accompanies [StateDisabled]: every destination of this request
+	// carries [Destination.Disabled], so it is asking for nothing.
+	//
+	// It sits in neither group above and that is the point. It never resolves by itself, which the
+	// WAITING codes promise, and it needs no user action to *fix*, which the INVALID codes mean —
+	// somebody already decided this. The code says *why* rather than restating the state, which is
+	// what a code is for: it is emitted only when nothing is left enabled, so a partly parked
+	// request never carries it.
+	ReasonAllDestinationsDisabled ReasonCode = "all_destinations_disabled"
+
 	// --- Established, but not moving media (§11) ---
 
 	// ReasonWorkerRestarts is a session flapping: restart count over the threshold in the

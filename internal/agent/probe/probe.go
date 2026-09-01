@@ -6,7 +6,7 @@
 // is left here is the join, which is a pure function over the probe's output and the `fabrics:`
 // block, and which is where M5b's actual work always was.
 //
-// # Why there are four selectors and why "none" is the common one
+// # Why there are five selectors and why "none" is the common one
 //
 // §10.1 advises preferring `interface:` over `address:`, justifying it with EFA — link-local,
 // hardware-derived addresses that nobody should have to write down. The M0 plan decision
@@ -16,31 +16,61 @@
 // `interface: efa0` cannot be resolved, and the advice is inverted precisely where it argued
 // hardest for itself.
 //
-// What replaces it:
+// What replaces it, in two classes:
 //
-//	configured     matched against                                          works for
-//	address:       the probe's node, exactly                                all providers
-//	interface:     the netdev's own addresses, resolved here, vs the node   tcp, verbs
-//	device:        the probe's attr.device_name, exactly                    where reported
-//	nothing        the provider alone, which must match exactly one entry   the common case
+//	naming        matched against                                          works for
+//	address:      the probe's node, exactly                                all providers
+//	interface:    the netdev's own addresses, resolved here, vs the node   tcp, verbs
+//	device:       the probe's attr.device_name, exactly                    where reported
+//	nothing       the provider alone, which must match exactly one entry   the common case
 //
-// The last row is what actually resolves efa and shm, and it is better than the name matching it
-// replaces rather than a fallback from it: a node has one EFA device and one shm, so
+//	narrowing     matched against                                          works for
+//	network:      the probe's node parsed and tested against a prefix      IP addresses
+//	ip_version:   the probe's node parsed, 4 or 6                         IP addresses
+//
+// The fourth row is what actually resolves efa and shm, and it is better than the name matching
+// it replaces rather than a fallback from it: a node has one EFA device and one shm, so
 // `{provider: efa, fabric: vpc1-subnet-a}` is unambiguous and puts no hardware-derived string in
 // the config file at all.
+//
+// # Why the narrowing class exists, and why it composes
+//
+// At most one *naming* selector, still, for the reason it always was: two names would need a rule
+// for combining them and every such rule is a worse answer than making the operator say which one
+// they meant. But naming a thing and narrowing what counts as that thing are different acts, so
+// the narrowing selectors compose — with a naming selector and with each other — and the
+// "exactly one survivor" rule applies to the conjunction.
+//
+// The case that forces it is a DaemonSet, where every selector is a fleet-wide value and
+// `address:` is therefore unavailable. `device: mlx5_0` is the fleet-wide string an operator has,
+// and it is *ambiguous by construction*: an HCA with both an IPv4 address and a link-local IPv6
+// one reports two probe entries under one device name, and the attachment is dropped. Before
+// this, the only fix was a per-node `address:` — an overlay per node to disambiguate a fact
+// ("we use v4") that is true of the whole fleet. `device: mlx5_0` + `ip_version: 4` says it once.
+//
+// `network:` is the same argument one step further, and it is the one that needs no per-node
+// value *and* no hardware-derived string: `{provider: tcp, fabric: dc1-data, network: 10.1.0.0/16}`
+// picks each node's address on the storage network without naming a device, an interface or an
+// address. On a fleet whose nodes are alike but not identically named — `eth1` here, `ens5f0`
+// there — it is the only selector that is simultaneously exact and uniform.
+//
+// Neither says anything about reachability, and neither is allowed to: §10.1's whole argument is
+// that two nodes on one prefix may still have no route between them. `network:` picks an address
+// out of a list; the fabric label is what asserts the two ends can talk.
 //
 // # Failing legibly
 //
 // Two failures, both loud, both dropping the attachment rather than guessing: no match at all,
-// and an ambiguous selectorless match. The second logs every candidate, which hands the operator
-// the exact strings they could have written — a better answer than "no match" to the question
-// §10.5 poses, which is whether this node has no verbs or whether someone typo'd `ib0`.
+// and an ambiguous match. The second logs every candidate, which hands the operator the exact
+// strings they could have written — a better answer than "no match" to the question §10.5 poses,
+// which is whether this node has no verbs or whether someone typo'd `ib0`.
 package probe
 
 import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/netip"
 	"slices"
 	"strings"
 
@@ -48,8 +78,8 @@ import (
 	"github.com/jonasohland/mxl-replicator/internal/worker/exec"
 )
 
-// Attachment is one entry of the operator's `fabrics:` block: a (provider, fabric) pair plus at
-// most one selector saying which of the node's fabric interfaces it means (§10.1).
+// Attachment is one entry of the operator's `fabrics:` block: a (provider, fabric) pair plus the
+// selectors saying which of the node's fabric interfaces it means (§10.1).
 type Attachment struct {
 	Provider api.Provider `yaml:"provider" json:"provider"`
 
@@ -74,12 +104,27 @@ type Attachment struct {
 	// Device selects by the probe's attr.device_name. Note this is *not* a netdev name in
 	// general: it is one for tcp, and the libfabric device name for verbs and efa.
 	Device string `yaml:"device" json:"device"`
+
+	// Network narrows to entries whose reported address falls inside a CIDR prefix — the one
+	// selector that is exact without being per-node, and therefore the one a DaemonSet wants.
+	// Combines with a naming selector and with IPVersion.
+	//
+	// An entry whose address is not an IP at all — shm reports a hostname — never matches.
+	Network string `yaml:"network" json:"network"`
+
+	// IPVersion narrows to entries whose reported address is IPv4 (4) or IPv6 (6). Zero is unset.
+	//
+	// This exists for the ambiguity `device:` cannot resolve on its own: one HCA with a v4 address
+	// and a link-local v6 one is two probe entries under one device name, and which of them the
+	// operator means is a fleet-wide fact rather than a per-node one.
+	IPVersion int `yaml:"ip_version" json:"ip_version"`
 }
 
 // Validate checks one configured attachment in isolation.
 //
-// At most one selector, because two would need a rule for combining them and every such rule is a
-// worse answer than making the operator say which one they meant.
+// At most one *naming* selector, because two names would need a rule for combining them and every
+// such rule is a worse answer than making the operator say which one they meant. The narrowing
+// selectors compose freely; see the package comment.
 func (a Attachment) Validate() error {
 	if a.Provider == "" {
 		return fmt.Errorf("provider is required")
@@ -108,29 +153,59 @@ func (a Attachment) Validate() error {
 		// attachment at startup with a confusing "no match" rather than here with the reason.
 		return fmt.Errorf("interface: an efa attachment is selected by device, not by netdev name")
 	}
+
+	if a.IPVersion != 0 && a.IPVersion != 4 && a.IPVersion != 6 {
+		return fmt.Errorf("ip_version: want 4 or 6, got %d", a.IPVersion)
+	}
+	if a.Network != "" {
+		prefix, err := netip.ParsePrefix(strings.TrimSpace(a.Network))
+		if err != nil {
+			return fmt.Errorf("network %q: not a CIDR prefix (want e.g. 10.1.0.0/16 or fd00:1::/64)", a.Network)
+		}
+		// A prefix already names a family, so the only thing `ip_version` can add here is a
+		// contradiction — and a contradiction matches nothing on any node, which would present as
+		// a drop on every node in the fleet rather than as the configuration error it is.
+		if version := networkVersion(prefix); a.IPVersion != 0 && a.IPVersion != version {
+			return fmt.Errorf("network %s is IPv%d and contradicts ip_version: %d", a.Network, version, a.IPVersion)
+		}
+	}
 	return nil
 }
 
-// selector returns the configured selector as a (kind, value) pair, or ("", "") for none.
-func (a Attachment) selector() (string, string) {
-	switch {
-	case a.Address != "":
-		return "address", a.Address
-	case a.Interface != "":
-		return "interface", a.Interface
-	case a.Device != "":
-		return "device", a.Device
-	default:
-		return "", ""
+func networkVersion(prefix netip.Prefix) int {
+	if prefix.Addr().Unmap().Is4() {
+		return 4
 	}
+	return 6
 }
 
 func (a Attachment) String() string {
-	kind, value := a.selector()
-	if kind == "" {
+	labels := a.selectorLabels()
+	if len(labels) == 0 {
 		return fmt.Sprintf("%s on fabric %q", a.Provider, a.Fabric)
 	}
-	return fmt.Sprintf("%s on fabric %q (%s: %s)", a.Provider, a.Fabric, kind, value)
+	return fmt.Sprintf("%s on fabric %q (%s)", a.Provider, a.Fabric, strings.Join(labels, ", "))
+}
+
+// selectorLabels renders the configured selectors, in a fixed order, for a log line or a drop
+// reason. Naming selector first, because it is the one the operator thinks of as *the* selector.
+func (a Attachment) selectorLabels() []string {
+	var labels []string
+	switch {
+	case a.Address != "":
+		labels = append(labels, fmt.Sprintf("address: %s", a.Address))
+	case a.Interface != "":
+		labels = append(labels, fmt.Sprintf("interface: %s", a.Interface))
+	case a.Device != "":
+		labels = append(labels, fmt.Sprintf("device: %s", a.Device))
+	}
+	if a.Network != "" {
+		labels = append(labels, fmt.Sprintf("network: %s", a.Network))
+	}
+	if a.IPVersion != 0 {
+		labels = append(labels, fmt.Sprintf("ip_version: %d", a.IPVersion))
+	}
+	return labels
 }
 
 // Options configures [Join].
@@ -226,61 +301,143 @@ func Join(configured []Attachment, probed []exec.Interface, opts Options) Result
 	return result
 }
 
-// match applies the attachment's selector to the probe entries for its provider.
+// match applies the attachment's selectors to the probe entries for its provider.
+//
+// Every configured selector is a predicate and they are conjoined: an entry survives only if it
+// satisfies all of them, and exactly one entry must survive. That is the same rule the single
+// selector always had, applied to a set — so `device: mlx5_0` on a device with two addresses is
+// still ambiguous, and `device: mlx5_0, ip_version: 4` is not.
 func match(attachment Attachment, candidates []exec.Interface, resolve func(string) ([]string, error)) (*exec.Interface, string) {
 	if len(candidates) == 0 {
 		return nil, fmt.Sprintf("libfabric reports no %s interface on this node at all", attachment.Provider)
 	}
 
-	kind, value := attachment.selector()
+	predicates, reason := attachment.selectors(resolve)
+	if reason != "" {
+		return nil, reason
+	}
 
-	var matches []exec.Interface
-	switch kind {
-	case "":
-		// The selectorless case is not a wildcard: it means "this node has exactly one of these,
-		// and I am not going to write down a hardware-derived string to say which". Ambiguity is
-		// therefore a real error rather than a reason to pick the first.
-		matches = candidates
-	case "address":
-		matches = filter(candidates, func(entry exec.Interface) bool {
-			return sameAddress(entry.Address, value)
-		})
-	case "device":
-		matches = filter(candidates, func(entry exec.Interface) bool {
-			return entry.Device() == value
-		})
-	case "interface":
-		addresses, err := resolve(value)
-		if err != nil {
-			return nil, fmt.Sprintf("interface %q: %s", value, err)
-		}
-		if len(addresses) == 0 {
-			return nil, fmt.Sprintf("interface %q has no addresses", value)
-		}
-		matches = filter(candidates, func(entry exec.Interface) bool {
-			return slices.ContainsFunc(addresses, func(address string) bool {
-				return sameAddress(entry.Address, address)
-			})
-		})
+	// No predicates is not a wildcard: it means "this node has exactly one of these, and I am not
+	// going to write down a hardware-derived string to say which". Ambiguity is therefore a real
+	// error rather than a reason to pick the first.
+	matches := candidates
+	for _, predicate := range predicates {
+		matches = filter(matches, predicate.keep)
 	}
 
 	switch len(matches) {
 	case 1:
 		return &matches[0], ""
 	case 0:
-		if kind == "" {
-			// Unreachable — candidates is non-empty and the selectorless case takes all of them —
-			// but spelled out rather than left to fall through to a confusing message.
+		if len(predicates) == 0 {
+			// Unreachable — candidates is non-empty and no predicate takes all of them — but
+			// spelled out rather than left to fall through to a confusing message.
 			return nil, "no candidates"
 		}
-		return nil, fmt.Sprintf("no %s interface matches %s %q", attachment.Provider, kind, value)
+		return nil, fmt.Sprintf("no %s interface matches %s", attachment.Provider, describe(predicates))
 	default:
-		if kind == "" {
-			return nil, fmt.Sprintf("this node has %d %s interfaces and the attachment has no address:, interface: or device: selector",
+		if len(predicates) == 0 {
+			return nil, fmt.Sprintf("this node has %d %s interfaces and the attachment has no address:, interface:, device:, network: or ip_version: selector",
 				len(matches), attachment.Provider)
 		}
-		return nil, fmt.Sprintf("%s %q matches %d %s interfaces", kind, value, len(matches), attachment.Provider)
+		return nil, fmt.Sprintf("%s matches %d %s interfaces", describe(predicates), len(matches), attachment.Provider)
 	}
+}
+
+// selector is one configured selector compiled into a predicate over probe entries.
+type selector struct {
+	// label is how the selector is named in a message — `device: mlx5_0` — so a drop reason
+	// quotes the operator's own configuration back at them.
+	label string
+	keep  func(exec.Interface) bool
+}
+
+// selectors compiles the attachment's selectors, or returns the reason one could not be compiled.
+//
+// The `interface:` resolution is the only one that can fail, and it fails here rather than
+// producing a predicate that matches nothing: "no such network interface" and "no verbs interface
+// matches interface: ib0" are different problems and an operator needs to be told which one.
+func (a Attachment) selectors(resolve func(string) ([]string, error)) ([]selector, string) {
+	labels := a.selectorLabels()
+	if len(labels) == 0 {
+		return nil, ""
+	}
+
+	// The pushes below run in the same order selectorLabels emits, which is what lets each take
+	// the next label rather than re-deriving its own.
+	out := make([]selector, 0, len(labels))
+	push := func(keep func(exec.Interface) bool) {
+		out = append(out, selector{label: labels[len(out)], keep: keep})
+	}
+
+	switch {
+	case a.Address != "":
+		push(func(entry exec.Interface) bool { return sameAddress(entry.Address, a.Address) })
+	case a.Interface != "":
+		addresses, err := resolve(a.Interface)
+		if err != nil {
+			return nil, fmt.Sprintf("interface %q: %s", a.Interface, err)
+		}
+		if len(addresses) == 0 {
+			return nil, fmt.Sprintf("interface %q has no addresses", a.Interface)
+		}
+		push(func(entry exec.Interface) bool {
+			return slices.ContainsFunc(addresses, func(address string) bool {
+				return sameAddress(entry.Address, address)
+			})
+		})
+	case a.Device != "":
+		push(func(entry exec.Interface) bool { return entry.Device() == a.Device })
+	}
+
+	if a.Network != "" {
+		// Validate rejects a prefix that does not parse, so this cannot fail for an attachment
+		// that went through it; a zero Prefix contains nothing, which is the safe answer for one
+		// that did not.
+		prefix, _ := netip.ParsePrefix(strings.TrimSpace(a.Network))
+		prefix = prefix.Masked()
+		push(func(entry exec.Interface) bool {
+			address, ok := entryAddress(entry)
+			return ok && prefix.Contains(address)
+		})
+	}
+	if a.IPVersion != 0 {
+		push(func(entry exec.Interface) bool {
+			address, ok := entryAddress(entry)
+			if !ok {
+				return false
+			}
+			if a.IPVersion == 4 {
+				return address.Is4()
+			}
+			return address.Is6()
+		})
+	}
+
+	return out, ""
+}
+
+func describe(selectors []selector) string {
+	labels := make([]string, 0, len(selectors))
+	for _, s := range selectors {
+		labels = append(labels, s.label)
+	}
+	return strings.Join(labels, " and ")
+}
+
+// entryAddress parses a probe entry's reported address as an IP, if it is one.
+//
+// It need not be: shm reports the hostname, and a provider is free to report a device address in
+// any shape it likes. Not being one is not an error — it simply cannot be inside a prefix or be
+// version 4 or 6, so the narrowing selectors exclude it. Unmapped, so that a v4-mapped v6 address
+// answers `ip_version: 4` and falls inside a v4 prefix, which is what an operator looking at
+// `::ffff:10.1.0.7` means by both.
+func entryAddress(entry exec.Interface) (netip.Addr, bool) {
+	address, err := netip.ParseAddr(zoneless(strings.TrimSpace(entry.Address)))
+	if err != nil {
+		return netip.Addr{}, false
+	}
+	return address.Unmap(), true
 }
 
 func providerEntries(probed []exec.Interface, provider api.Provider) []exec.Interface {
@@ -299,12 +456,18 @@ func filter(entries []exec.Interface, keep func(exec.Interface) bool) []exec.Int
 
 // render describes probe entries for an operator, so that a drop message carries the strings that
 // would have worked.
+//
+// One entry holds no comma and no space outside its parentheses, because this is logged as a
+// string slice and a structured logger separates the elements with a space: `10.0.0.1 (device
+// eth0)` survives that, where an earlier `address: 10.0.0.1, device: eth0` ran two candidates
+// together into something an operator had to parse by eye — on exactly the ambiguous-device
+// message that is the most common reason to be reading this list at all.
 func render(entries []exec.Interface) []string {
 	out := make([]string, 0, len(entries))
 	for _, entry := range entries {
-		text := fmt.Sprintf("address: %s", entry.Address)
+		text := entry.Address
 		if device := entry.Device(); device != "" {
-			text += fmt.Sprintf(", device: %s", device)
+			text += fmt.Sprintf(" (device %s)", device)
 		}
 		out = append(out, text)
 	}

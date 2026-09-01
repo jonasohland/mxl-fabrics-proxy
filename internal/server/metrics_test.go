@@ -105,6 +105,13 @@ func TestTheLeaderReportsTheFleet(t *testing.T) {
 	assert.Contains(t, body, `mxl_repl_requests{state="PARTIAL"}`)
 	assert.NotContains(t, body, `mxl_repl_paths{state="PARTIAL"}`)
 
+	// DISABLED is the same split for the same structural reason: a parked destination produces no
+	// path, so there is nothing for a path gauge to count (§9.1, §11). It is worth graphing and is
+	// the one state nobody should page on — parked legs accumulate, and a count that only ever rises
+	// is somebody turning things off and nobody deleting them.
+	assert.Contains(t, body, `mxl_repl_requests{state="DISABLED"}`)
+	assert.NotContains(t, body, `mxl_repl_paths{state="DISABLED"}`)
+
 	// The fleet's version spread, which only the server can see (§13.1).
 	assert.Contains(t, body, `mxl_repl_agent_versions{protocol="`+
 		strconv.Itoa(api.ProtocolVersion)+`",replicator="test"} 2`)

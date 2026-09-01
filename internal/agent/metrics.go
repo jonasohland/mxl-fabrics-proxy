@@ -532,7 +532,7 @@ func workerHelp(name string) string {
 	// A metric a newer worker emits and this build has never heard of. Exported anyway — an
 	// unknown counter is more useful than a missing one, and the alternative is that a worker
 	// upgrade silently drops data until the supervisor catches up.
-	return "Reported by the mxl-fabrics-proxy-worker binary."
+	return "Reported by the mxl-replicator-worker binary."
 }
 
 var workerMetricHelp = map[string]string{

@@ -1,0 +1,21 @@
+# The Dockerfile copies exactly what it builds — CMakeLists.txt, src, go.mod, go.sum, cmd,
+# internal — so everything else is context the daemon transfers and never reads.
+#
+# `build/` and `ui/node_modules/` are the two that matter: together they are an order of magnitude
+# larger than the source, and `build/` also carries a host-toolchain CMake cache that would be
+# actively wrong inside the image if anything ever copied it.
+.git
+.cache
+build
+ui
+docs
+legacy
+testing
+scripts
+deployment
+*.md
+*.db
+compile_commands.json
+Dockerfile*
+Makefile
+LICENSE

@@ -188,6 +188,43 @@ type Destination struct {
 	// It overrides rather than intersects. Intersecting would make "verbs here, tcp there" a
 	// pin conflict instead of the perfectly ordinary request it is.
 	Provider ProviderPin `json:"provider,omitempty"`
+
+	// Disabled parks this leg: the entry stays in the spec and expands to nothing (§9.1).
+	//
+	// **This is the only place a request spells *off*.** Without it the desired set has no value
+	// for "not running" — a route that is off is a route that does not exist — so taking a leg out
+	// of service means deleting it and typing it back, and the spec somebody wrote and reviewed is
+	// gone in between. A manifest has the same hole: a file edited down to park a route for a night
+	// stops describing intent, and `--prune` cancels whatever the edited-down file no longer names.
+	//
+	// The effective spec is every source against every *enabled* destination. A disabled entry
+	// produces no pairing, so no path, no session and no assignment — nothing below the request
+	// changes, which is what makes this arithmetic on the cross product rather than a new noun.
+	//
+	// **It is here rather than on the request because dropping a destination is already the
+	// operation that stops one leg**, clearing that column across every one of the request's
+	// sources; this is that operation made non-destructive. The relationship only runs one way,
+	// which settles it: a request whose every destination is disabled asks for nothing, so a
+	// request-level flag is derivable from these and these are not derivable from it. That is also
+	// why [RequestStatus.State] reports [StateDisabled] by folding rather than by reading a stored
+	// flag — there is nothing here for a stored one to drift from.
+	//
+	// **Spelled `disabled`, never `enabled`.** A default-true boolean is a trap on a wire format
+	// where `omitempty` drops the zero value: an inverted flag that goes missing stops every leg in
+	// the fleet, where a missing one here keeps media running.
+	//
+	// The asymmetry with [RequestSpec.Sources], which has no such flag, is deliberate and is the
+	// one [Destination.Provider] already has: what varies is whichever end the operator listed
+	// several of, and disabling either end of a pairing kills it, so one flag on one end says
+	// everything about one. A flag on a *(source, destination)* pairing is refused outright — it
+	// would make a request an arbitrary bitmap over the grid rather than sources × destinations,
+	// which the expansion cannot describe and a manifest cannot spell (§9.1).
+	//
+	// Disabling **stops media**: it is a cancellation of these legs with the text kept, so it
+	// carries a cancellation's blast radius and wants the same `?dry_run=true` preview. It is not a
+	// soft delete — the request still exists, still holds its name, and is still pruned by a file
+	// that stops naming it.
+	Disabled bool `json:"disabled,omitempty"`
 }
 
 // DomainName renders the destination domain as the single string everything downstream carries —
@@ -202,6 +239,21 @@ func (d Destination) DomainName() string { return d.Domain.String() }
 // name now, so `fast/ingest` and `bulk/ingest` are already two endpoints and there is nothing to
 // exclude.
 func (d Destination) Endpoint() string { return d.Node + DomainSeparator + d.DomainName() }
+
+// AnyEnabled reports whether any of these destinations is not parked (§9.1).
+//
+// The question every consumer of [Destination.Disabled] actually asks, written once so that "this
+// request is asking for nothing" and "this request reports [StateDisabled]" cannot come to disagree.
+// An empty list is false, which is the honest answer and is unreachable through [RequestSpec.Validate]
+// anyway.
+func AnyEnabled(destinations []Destination) bool {
+	for _, dst := range destinations {
+		if !dst.Disabled {
+			return true
+		}
+	}
+	return false
+}
 
 // RequestID is a request's identity: its namespace and its name (§9.1, §9.3).
 //
@@ -430,6 +482,11 @@ func (s RequestSpec) Validate() error {
 		sourceSeen[string(key)] = i
 	}
 
+	// **Entries, not enabled entries** (§9.1). A request whose only destination is parked is legal
+	// and is the whole point of [Destination.Disabled]: requiring an enabled one would forbid
+	// precisely the state the flag exists to represent, and would make un-parking the last leg the
+	// only way to keep a route on file. What such a request reports is [StateDisabled], decided by
+	// the reconciler, not a validation error decided here.
 	if len(s.Destinations) == 0 {
 		return fmt.Errorf("at least one destination is required")
 	}
@@ -437,6 +494,11 @@ func (s RequestSpec) Validate() error {
 	// Two entries naming one (node, domain) are the same path written twice. Deduplicating
 	// silently would hide a copy-paste error in a manifest, and the two entries can disagree
 	// about the root or the provider, at which point there is no answer to pick.
+	//
+	// **A parked entry is not exempt**, and the temptation to exempt it is worth naming: parking a
+	// `tcp` variant of a destination beside the live `verbs` one reads like a useful thing to keep
+	// on file, and it has no answer for which pin applies the moment both are enabled — which is
+	// the same reason the rule exists at all.
 	seen := make(map[string]int, len(s.Destinations))
 	for i, dst := range s.Destinations {
 		where := fmt.Sprintf("destinations[%d]", i)

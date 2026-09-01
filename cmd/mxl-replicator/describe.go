@@ -544,14 +544,21 @@ func printRequest(request api.Request) {
 			src.Describe(), selectorText(src.Select), row.State, len(row.Paths), row.Reason)
 	}
 
+	// A parked destination gets a row like any other, and the column is why: this is the view an
+	// operator opens to decide whether to switch one back on, so what is off has to be as legible
+	// here as what is on (§9.1).
 	heading(out, "  Destinations")
-	fmt.Fprintln(out, "  NODE/DOMAIN\tPROVIDER")
+	fmt.Fprintln(out, "  NODE/DOMAIN\tPROVIDER\tDISABLED")
 	for _, dst := range request.Destinations {
 		pin := "inherited"
 		if !dst.Provider.IsEmpty() {
 			pin = providerText(dst.Provider)
 		}
-		fmt.Fprintf(out, "  %s\t%s\n", dst.Endpoint(), pin)
+		parked := ""
+		if dst.Disabled {
+			parked = "yes"
+		}
+		fmt.Fprintf(out, "  %s\t%s\t%s\n", dst.Endpoint(), pin, parked)
 	}
 
 	fmt.Fprintln(out)

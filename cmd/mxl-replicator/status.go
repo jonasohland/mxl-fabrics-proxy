@@ -101,9 +101,13 @@ func (c *StatusCmd) Run(ctx context.Context) error {
 		}
 	}
 
+	// DISABLED is counted and deliberately not listed (§11). This table is the answer to "is
+	// anything wrong", and a request somebody switched off on purpose is not — a fleet with fifteen
+	// parked legs would otherwise report fifteen problems every time. It stays visible in the count
+	// beside every other state, which is where parked intent belongs: findable, not loud.
 	for _, request := range requests {
 		summary.Requests[request.Status.State]++
-		if request.Status.State != api.StateActive {
+		if request.Status.State != api.StateActive && request.Status.State != api.StateDisabled {
 			summary.Unhealthy = append(summary.Unhealthy, Unhealthy{
 				Kind: "request", Name: request.Name,
 				State: request.Status.State, Reason: request.Status.Reason,
@@ -148,6 +152,15 @@ func printSummary(summary Summary) {
 		// nothing-is-wrong states this is.
 		fmt.Fprintln(out, "\nno replication requests")
 		return
+	case summary.Requests[api.StateDisabled] == total(summary.Requests):
+		fmt.Fprintln(out, "\nevery request is disabled")
+		return
+	case summary.Requests[api.StateDisabled] > 0:
+		// A third nothing-is-wrong state, and it needs its own sentence: "everything is active" is
+		// false while some requests are parked, and an operator who reads it that way will not go
+		// looking for the leg they turned off in June.
+		fmt.Fprintf(out, "\neverything else is active (%d disabled)\n", summary.Requests[api.StateDisabled])
+		return
 	default:
 		fmt.Fprintln(out, "\neverything is active")
 		return
@@ -170,9 +183,12 @@ func total(counts map[api.State]int) int {
 
 // states renders a count breakdown worst-first, so the thing to worry about is leftmost.
 func states(counts map[api.State]int) string {
+	// DISABLED comes after ACTIVE: worst-first is a reading order, and a parked request is the last
+	// thing in the line rather than something to worry about (§11).
 	order := []api.State{
 		api.StateInvalid, api.StateFailed, api.StateDegraded,
 		api.StateWaiting, api.StateEstablishing, api.StatePaused, api.StateActive,
+		api.StateDisabled,
 	}
 
 	var parts []string
@@ -252,10 +268,19 @@ func printRequestTable(requests []api.Request) {
 
 	// The reason is what says which end is wrong, so it must not be lost to a column width. Printed
 	// under the table rather than in it.
+	//
+	// DISABLED is skipped for the opposite reason to ACTIVE's: not because there is nothing to say
+	// but because the row already said it, and the destination column marks which legs are off. A
+	// paragraph per parked request under a list is exactly the loudness §11 asks this state not to
+	// have.
 	for _, request := range requests {
-		if request.Status.Reason != "" && request.Status.State != api.StateActive {
-			fmt.Printf("\n%s: %s\n", request.ID, request.Status.Reason)
+		if request.Status.Reason == "" {
+			continue
 		}
+		if request.Status.State == api.StateActive || request.Status.State == api.StateDisabled {
+			continue
+		}
+		fmt.Printf("\n%s: %s\n", request.ID, request.Status.Reason)
 	}
 }
 
@@ -289,10 +314,19 @@ func sources(list []api.Source) string {
 	return strings.Join(names, ",")
 }
 
+// destinations renders the column of `get requests`, marking the parked ones (§9.1).
+//
+// Marked rather than hidden: a destination that is on file and switched off is the request's own
+// text, and a list that showed only the live ones would make a request read as smaller than it is —
+// which is exactly the reading that makes somebody write the leg a second time.
 func destinations(list []api.Destination) string {
 	names := make([]string, 0, len(list))
 	for _, dst := range list {
-		names = append(names, dst.Endpoint())
+		name := dst.Endpoint()
+		if dst.Disabled {
+			name += " (off)"
+		}
+		names = append(names, name)
 	}
 	return strings.Join(names, ",")
 }

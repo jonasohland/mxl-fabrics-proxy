@@ -38,7 +38,7 @@ func TestProbeVersions(t *testing.T) {
 }
 
 func TestProbeVersionsFailsOnAMissingBinary(t *testing.T) {
-	_, err := ProbeVersions(t.Context(), "mxl-fabrics-proxy-worker-that-does-not-exist")
+	_, err := ProbeVersions(t.Context(), "mxl-replicator-worker-that-does-not-exist")
 	assert.Error(t, err)
 }
 

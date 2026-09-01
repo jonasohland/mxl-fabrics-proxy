@@ -125,7 +125,7 @@ func TestAgentDefaults(t *testing.T) {
 	assert.Equal(t, "edge-01", agent.Node)
 	assert.Equal(t, []string{"http://ctrl:2283"}, agent.Server)
 	assert.Equal(t, "24000-24999", agent.PortRange.String())
-	assert.Equal(t, "mxl-fabrics-proxy-worker", agent.WorkerBinary, "the worker binary keeps its name (§2.2)")
+	assert.Equal(t, "mxl-replicator-worker", agent.WorkerBinary, "the worker binary is named for this project (§2.2)")
 }
 
 func TestServerIdleDefaults(t *testing.T) {

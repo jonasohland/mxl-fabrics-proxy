@@ -22,9 +22,8 @@
 // Replication is requested by applying a manifest, not by editing a config file on every node:
 // the intent is fleet-scoped and lives in the API (§2).
 //
-// The data plane is a separate binary, mxl-fabrics-proxy-worker, which keeps its name: one
-// process = one flow, one direction, one peer, one role. This process never touches grain
-// data.
+// The data plane is a separate binary, mxl-replicator-worker: one process = one flow, one
+// direction, one peer, one role. This process never touches grain data.
 package main
 
 import (

@@ -68,7 +68,7 @@ int printInterfaces() {
     // the caller to name a real domain just to ask what the hardware can do.
     auto const domainPath =
         std::filesystem::temp_directory_path() /
-        std::format("mxl-fabrics-proxy-worker.interfaces.{}", ::getpid());
+        std::format("mxl-replicator-worker.interfaces.{}", ::getpid());
 
     auto ec = std::error_code{};
     std::filesystem::create_directories(domainPath, ec);

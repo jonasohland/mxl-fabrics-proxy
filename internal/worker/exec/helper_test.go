@@ -15,7 +15,7 @@ import (
 // The tests in this package run the launcher against a real process, because a launcher tested
 // only against itself is exactly the gap this rewrite is closing. The process is this test
 // binary, re-executed: TestMain notices the marker in its environment and behaves like
-// mxl-fabrics-proxy-worker instead of running tests.
+// mxl-replicator-worker instead of running tests.
 //
 // The marker is passed through [Options.Env] rather than set on the test process, so nothing
 // here depends on ambient environment — and it exercises that option at the same time.

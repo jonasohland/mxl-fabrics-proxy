@@ -1,0 +1,35 @@
+# The smallest complete deployment: one node, both roles, replicating between two domains on that
+# node over shm. No RDMA hardware, no second host, nothing to reach.
+#
+#   helm install mxl -n mxl --create-namespace \
+#       ./deployment/mxl-replicator -f examples/single-node.yaml
+#
+# `shm` is structurally same-node-only and its fabric label is derived from the node name, so it
+# pairs with this node and nothing else. That is the correct posture for a single-host install and
+# it is what the agent assumes when nothing is configured.
+
+image:
+  tag: latest
+
+server:
+  persistence:
+    type: hostPath
+    # The one node.
+    node: node-0
+
+agent:
+  # Run the agent on the same node rather than requiring a label.
+  nodeSelector:
+    kubernetes.io/hostname: node-0
+
+  areas:
+    - {name: media, path: /dev/shm/mxl0, read: true}
+    - {name: fast, path: /dev/shm/mxl, read: true, write: true}
+
+  # Nothing declared: the agent assumes shm and says so at startup.
+  fabrics: []
+
+  # Nothing to reach over RDMA, so no character devices to mount.
+  devices:
+    infiniband:
+      enabled: false

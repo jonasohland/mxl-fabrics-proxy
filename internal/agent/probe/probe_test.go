@@ -50,6 +50,23 @@ func TestValidate(t *testing.T) {
 			Attachment{Provider: api.ProviderEFA, Fabric: "vpc1", Interface: "efa0"},
 			"efa attachment is selected by device",
 		},
+		{
+			// The narrowing selectors are not naming selectors, and combining them with one — and
+			// with each other — is the case they exist for.
+			"ok, a name narrowed twice",
+			Attachment{Provider: api.ProviderVerbs, Fabric: "ib-a", Device: "mlx5_0", Network: "10.1.0.0/16", IPVersion: 4},
+			"",
+		},
+		{"ok, network alone", Attachment{Provider: api.ProviderTCP, Fabric: "dc1", Network: "fd00:1::/64"}, ""},
+		{"bad ip_version", Attachment{Provider: api.ProviderTCP, Fabric: "dc1", IPVersion: 5}, "want 4 or 6"},
+		{"bad network", Attachment{Provider: api.ProviderTCP, Fabric: "dc1", Network: "10.1.0.0"}, "not a CIDR prefix"},
+		{
+			// Matches nothing on any node, so left to the join it would present as a drop on the
+			// whole fleet rather than as the configuration error it is.
+			"contradictory network and ip_version",
+			Attachment{Provider: api.ProviderTCP, Fabric: "dc1", Network: "10.1.0.0/16", IPVersion: 6},
+			"is IPv4 and contradicts ip_version: 6",
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			err := tc.attachment.Validate()
@@ -103,7 +120,7 @@ func TestAmbiguousSelectorlessMatchListsCandidates(t *testing.T) {
 	require.Len(t, result.Dropped, 1)
 	assert.Contains(t, result.Dropped[0].Reason, "2 tcp interfaces")
 	assert.ElementsMatch(t,
-		[]string{"address: 10.0.0.1, device: eth0", "address: 127.0.0.1, device: lo"},
+		[]string{"10.0.0.1 (device eth0)", "127.0.0.1 (device lo)"},
 		result.Dropped[0].Candidates)
 }
 
@@ -246,4 +263,104 @@ func TestCapabilitiesTravelVerbatim(t *testing.T) {
 func TestNetdevAddressesReportsAnUnknownInterface(t *testing.T) {
 	_, err := NetdevAddresses("definitely-not-an-interface")
 	assert.ErrorContains(t, err, "no such network interface")
+}
+
+// The DaemonSet case §10.1 grew these for: one HCA reporting a v4 address and a link-local v6 one
+// is two probe entries under one device name, and `device:` alone cannot say which. Neither can
+// `address:`, without a per-node overlay to state a fact that is true of the whole fleet.
+func TestIPVersionDisambiguatesADevice(t *testing.T) {
+	probed := []exec.Interface{
+		iface(api.ProviderVerbs, "10.1.0.7", "mlx5_0", api.CapRemoteWrite),
+		iface(api.ProviderVerbs, "fe80::1%ib0", "mlx5_0", api.CapRemoteWrite),
+	}
+
+	ambiguous := Join(
+		[]Attachment{{Provider: api.ProviderVerbs, Fabric: "ib-a", Device: "mlx5_0"}},
+		probed, Options{Node: "edge-01", Interfaces: noInterfaces})
+	require.Len(t, ambiguous.Dropped, 1)
+	assert.Contains(t, ambiguous.Dropped[0].Reason, "matches 2 verbs interfaces")
+
+	for _, tc := range []struct {
+		version int
+		wants   string
+	}{{4, "10.1.0.7"}, {6, "fe80::1%ib0"}} {
+		result := Join(
+			[]Attachment{{Provider: api.ProviderVerbs, Fabric: "ib-a", Device: "mlx5_0", IPVersion: tc.version}},
+			probed, Options{Node: "edge-01", Interfaces: noInterfaces})
+
+		require.Empty(t, result.Dropped)
+		require.Len(t, result.Attachments, 1)
+		assert.Equal(t, tc.wants, result.Attachments[0].Address)
+	}
+}
+
+// `network:` is the selector that is exact without being per-node: the same fleet-wide value picks
+// each node's own address on the storage network, naming no device and no interface.
+func TestNetworkSelectsWithoutAPerNodeValue(t *testing.T) {
+	result := Join(
+		[]Attachment{{Provider: api.ProviderTCP, Fabric: "dc1-data", Network: "10.1.0.0/16"}},
+		[]exec.Interface{
+			iface(api.ProviderTCP, "127.0.0.1", "lo", api.CapSendReceive),
+			iface(api.ProviderTCP, "10.9.0.4", "eth0", api.CapSendReceive),
+			iface(api.ProviderTCP, "10.1.0.7", "ens5f0", api.CapSendReceive),
+		},
+		Options{Node: "edge-01", Interfaces: noInterfaces},
+	)
+
+	require.Empty(t, result.Dropped)
+	require.Len(t, result.Attachments, 1)
+	assert.Equal(t, "10.1.0.7", result.Attachments[0].Address)
+}
+
+// A prefix written with host bits set is what an operator copies off an `ip addr` line, and it
+// means the network it names rather than nothing.
+func TestNetworkAcceptsHostBits(t *testing.T) {
+	result := Join(
+		[]Attachment{{Provider: api.ProviderTCP, Fabric: "dc1-data", Network: "10.1.0.5/16"}},
+		[]exec.Interface{
+			iface(api.ProviderTCP, "10.9.0.4", "eth0", api.CapSendReceive),
+			iface(api.ProviderTCP, "10.1.0.7", "ens5f0", api.CapSendReceive),
+		},
+		Options{Node: "edge-01", Interfaces: noInterfaces},
+	)
+
+	require.Empty(t, result.Dropped)
+	require.Len(t, result.Attachments, 1)
+	assert.Equal(t, "10.1.0.7", result.Attachments[0].Address)
+}
+
+// The narrowing selectors conjoin — with a naming selector and with each other — and the drop
+// reason names every one of them, so the operator sees the conjunction they actually wrote.
+func TestSelectorsConjoinAndTheReasonNamesThem(t *testing.T) {
+	result := Join(
+		[]Attachment{{
+			Provider: api.ProviderVerbs, Fabric: "ib-a",
+			Device: "mlx5_0", Network: "10.1.0.0/16", IPVersion: 4,
+		}},
+		[]exec.Interface{
+			iface(api.ProviderVerbs, "10.1.0.7", "mlx5_1", api.CapRemoteWrite),
+			iface(api.ProviderVerbs, "10.2.0.7", "mlx5_0", api.CapRemoteWrite),
+		},
+		Options{Node: "edge-01", Interfaces: noInterfaces},
+	)
+
+	assert.Empty(t, result.Attachments)
+	require.Len(t, result.Dropped, 1)
+	assert.Equal(t,
+		"no verbs interface matches device: mlx5_0 and network: 10.1.0.0/16 and ip_version: 4",
+		result.Dropped[0].Reason)
+}
+
+// An address that is not an IP at all — shm reports the hostname — cannot be inside a prefix or be
+// version 4 or 6. Excluded rather than treated as a parse error, because it is not one.
+func TestNarrowingExcludesNonIPAddresses(t *testing.T) {
+	result := Join(
+		[]Attachment{{Provider: api.ProviderSHM, IPVersion: 4}},
+		[]exec.Interface{iface(api.ProviderSHM, "edge-01.local", "", api.CapSendReceive)},
+		Options{Node: "edge-01", Interfaces: noInterfaces},
+	)
+
+	assert.Empty(t, result.Attachments)
+	require.Len(t, result.Dropped, 1)
+	assert.Contains(t, result.Dropped[0].Reason, "no shm interface matches ip_version: 4")
 }

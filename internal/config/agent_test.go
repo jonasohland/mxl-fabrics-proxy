@@ -195,8 +195,29 @@ func TestParseFabric(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, probe.Attachment{Provider: api.ProviderEFA, Fabric: "vpc1"}, attachment)
 
+	// The narrowing selectors, which are what makes a fleet-wide flag value usable on a DaemonSet.
+	attachment, err = ParseFabric("provider=verbs,fabric=ib-a,device=mlx5_0,ip_version=4")
+	require.NoError(t, err)
+	assert.Equal(t, probe.Attachment{
+		Provider:  api.ProviderVerbs,
+		Fabric:    "ib-a",
+		Device:    "mlx5_0",
+		IPVersion: 4,
+	}, attachment)
+
+	attachment, err = ParseFabric("provider=tcp,fabric=dc1-data,network=10.1.0.0/16")
+	require.NoError(t, err)
+	assert.Equal(t, probe.Attachment{
+		Provider: api.ProviderTCP,
+		Fabric:   "dc1-data",
+		Network:  "10.1.0.0/16",
+	}, attachment)
+
 	for _, tc := range []struct{ value, wants string }{
 		{"provider=tcp,fabric=dc1,eth1", "is not key=value"},
+		{"provider=tcp,fabric=dc1,ip_version=v4", "is not a number"},
+		{"provider=tcp,fabric=dc1,ip_version=5", "want 4 or 6"},
+		{"provider=tcp,fabric=dc1,network=10.1.0.0", "not a CIDR prefix"},
 		{"provider=tcp,fabric=dc1,nic=eth1", "unknown key"},
 		{"fabric=dc1", "provider is required"},
 		{"provider=sockets,fabric=dc1", "not one this project can negotiate"},

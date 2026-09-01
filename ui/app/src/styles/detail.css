@@ -1,0 +1,132 @@
+/* The detail views' shared idiom — `ui.md` §7's `describe`.
+ *
+ * Global on purpose and prefixed `dt-` for exactly that reason, as `editor.css` is for the two
+ * editors: six views share one shape and a `<style scoped>` cannot be shared. The prefix is what
+ * keeps that from being a hazard — a scoped stylesheet scopes a *component*, not the classes inside
+ * it, and a bare `.head` in one of these would collide with the page header of whichever view
+ * imported it. That collision cost a ragged column edge in the matrix once already (`ui-plan.md`
+ * §4); a name no container wants is the cheap way not to pay it twice.
+ *
+ * The shape is the CLI's, because the CLI's is right: a title naming the kind and the thing, a block
+ * of label/value fields, then sections. What a UI adds is that every identifier in it is a link. */
+
+.dt-page {
+  padding: 14px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  overflow: auto;
+}
+
+.dt-title {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  flex-wrap: wrap;
+  font-size: 15px;
+  font-weight: 600;
+  margin: 0;
+}
+
+/* The noun, so `describe path` and `describe session` are visibly two answers rather than one view
+   with a different heading — they are separate layers and the design turns on their staying so. */
+.dt-kind {
+  color: var(--fg-dim);
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.dt-section h2 {
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--fg-dim);
+  margin: 0 0 6px;
+}
+
+/* A fixed label track, because a value is what the eye scans down and a content-sized label column
+   moves every value to the right of the longest one. Only the value track depends on content. */
+.dt-fields {
+  display: grid;
+  grid-template-columns: 16ch 1fr;
+  column-gap: 14px;
+  row-gap: 2px;
+  margin: 0;
+  align-items: baseline;
+}
+
+.dt-fields dt {
+  color: var(--fg-dim);
+  white-space: nowrap;
+}
+
+.dt-fields dd {
+  margin: 0;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.dt-table {
+  border-collapse: collapse;
+  width: 100%;
+}
+
+.dt-table th {
+  text-align: left;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--fg-dim);
+  padding: 0 14px 3px 0;
+  border-bottom: 1px solid var(--line);
+  white-space: nowrap;
+}
+
+.dt-table td {
+  padding: 3px 14px 3px 0;
+  vertical-align: top;
+  border-bottom: 1px solid var(--line-soft);
+}
+
+/* Every column shrinks to its content except the last, which absorbs the slack. Without it the auto
+   layout hands the spare width to whichever column it likes and puts a hand's width of nothing
+   between a state and the sentence explaining it. */
+.dt-table td, .dt-table th { width: 1%; white-space: nowrap; }
+.dt-table .dt-wide { width: 100%; white-space: normal; color: var(--fg-dim); }
+
+.dt-empty { color: var(--fg-dim); margin: 0; }
+
+/* Not an error surface: a detail view addressed by URL is routinely a thing that has gone away — a
+   path whose last request was cancelled, a session whose workers were torn down for being idle. The
+   view says which noun and which name, and leaves the alarm to the pages whose job that is. */
+.dt-missing {
+  color: var(--fg-dim);
+  margin: 0;
+}
+
+/* A read the fleet poll does not make, failing on its own. The rest of the page is still the poll's
+   and is still good, so this is a line rather than a state. */
+.dt-read-error { color: var(--s-degraded); margin: 0; font-size: 12px; }
+
+/* The verbatim flow definition. Displayed, never decoded and re-encoded into anything that goes
+   back over the wire — the session identity hashes those bytes. */
+.dt-raw {
+  background: var(--bg-sunken);
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  padding: 8px 10px;
+  margin: 0;
+  max-height: 22em;
+  overflow: auto;
+  font-size: 12px;
+  color: var(--fg-dim);
+}
+
+.dt-note { color: var(--fg-dim); font-size: 12px; margin: 0; }
+
+/* A parked destination, in the one place its own row is drawn. Authored, not broken. */
+.dt-parked { color: var(--s-disabled); }

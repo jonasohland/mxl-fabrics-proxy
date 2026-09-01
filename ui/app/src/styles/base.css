@@ -1,0 +1,108 @@
+/* Design tokens.
+ *
+ * Dark by default: this is a control surface that sits open all day.
+ *
+ * The state palette is ported from `ui/prototype/style.css` rather than re-picked, because the
+ * colour assignments carry design decisions rather than taste — see each note below. */
+
+:root {
+  --bg:        #14161a;
+  --bg-raised: #1b1e24;
+  --bg-sunken: #101216;
+  --line:      #2a2f38;
+  --line-soft: #21252c;
+  --fg:        #dfe3ea;
+  --fg-dim:    #8b93a1;
+  --fg-faint:  #5d6472;
+  --accent:    #6aa6ff;
+
+  /* PAUSED is deliberately calm and NOT red: it means the fabric is fine and nobody is producing,
+     which is a different owner from a broken path. Folding it into a red "not working" bucket
+     destroys the one signal this design added. */
+  --s-active:       #3fbf6f;
+  --s-paused:       #4aa8c8;
+  --s-establishing: #d8a33c;
+  --s-waiting:      #6b7382;
+  --s-degraded:     #e08040;
+  --s-failed:       #e05a5a;
+  --s-invalid:      #c264d0;
+  --s-new:          #6aa6ff;
+
+  /* PARTIAL is aggregate-only and never appears on a path. Green-leaning on purpose: it says some
+     of what was asked for is working, and it outranks INVALID and FAILED in the fold. */
+  --s-partial:      #8fbf5a;
+
+  /* DISABLED is the other aggregate-only one, and the only state that is a statement about the spec
+     rather than the fleet. Quieter than WAITING and completely off the warm end of the palette:
+     somebody switched this off on purpose, so it must not read as a fault — but it must still read
+     as *authored*, because an unlit cell and a parked one are different sentences. */
+  --s-disabled:     #566070;
+
+  /* Request accents. Only a request with more than one source gets one — a 1×N rectangle is a row
+     and needs no help being seen as one. */
+  --acc-0: #6aa6ff; --acc-1: #d08fd0; --acc-2: #5fc2b0;
+  --acc-3: #d8a33c; --acc-4: #9b8cf0; --acc-5: #e0895a;
+
+  --pending: #f0c14b;
+
+  font-synthesis: none;
+}
+
+* { box-sizing: border-box; }
+
+html, body, #app {
+  margin: 0;
+  height: 100%;
+}
+
+body {
+  background: var(--bg);
+  color: var(--fg);
+  font: 13px/1.45 ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
+}
+
+#app {
+  display: flex;
+  flex-direction: column;
+}
+
+.mono, code, pre {
+  font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, monospace;
+}
+
+.spacer { flex: 1; }
+
+/* An identifier that is also a link.
+ *
+ * Deliberately not the accent colour at rest. The detail views turn almost every identifier on
+ * screen into a link, and the ledger's rows carry a state colour that *is* the information — an
+ * anchor that repainted them would trade a reading for a hint that everything is clickable, which
+ * an operator learns once and then does not need. Colour on hover, where it answers the question
+ * being asked. */
+.link { color: inherit; text-decoration: none; }
+.link:hover { color: var(--accent); text-decoration: underline; }
+
+/* State colour by name, so a renderer can set one class rather than switch on the vocabulary.
+   Every state in `api.RequestStates()` has an entry — a missing one would render as inherited
+   foreground and read as a state nobody thought about. */
+.state-ACTIVE       { color: var(--s-active); }
+.state-PAUSED       { color: var(--s-paused); }
+.state-ESTABLISHING { color: var(--s-establishing); }
+.state-WAITING      { color: var(--s-waiting); }
+.state-DEGRADED     { color: var(--s-degraded); }
+.state-FAILED       { color: var(--s-failed); }
+.state-INVALID      { color: var(--s-invalid); }
+.state-PARTIAL      { color: var(--s-partial); }
+.state-DISABLED     { color: var(--s-disabled); }
+
+/* The same palette as a custom property, for marking a *container* with a state's colour without
+   setting `color` on it — which would repaint every piece of text inside. */
+.mark-ACTIVE       { --mark: var(--s-active); }
+.mark-PAUSED       { --mark: var(--s-paused); }
+.mark-ESTABLISHING { --mark: var(--s-establishing); }
+.mark-WAITING      { --mark: var(--s-waiting); }
+.mark-DEGRADED     { --mark: var(--s-degraded); }
+.mark-FAILED       { --mark: var(--s-failed); }
+.mark-INVALID      { --mark: var(--s-invalid); }
+.mark-PARTIAL      { --mark: var(--s-partial); }
+.mark-DISABLED     { --mark: var(--s-disabled); }

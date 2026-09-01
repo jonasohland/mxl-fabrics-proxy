@@ -72,7 +72,7 @@ func TestLoopbackOverTCP(t *testing.T) {
 const grainsToVerify = 20
 
 func runLoopback(t *testing.T, provider api.Provider, attachment probe.Attachment) {
-	workerBinary := locate(t, "mxl-fabrics-proxy-worker", "MXL_REPLICATOR_TEST_WORKER_BINARY")
+	workerBinary := locate(t, "mxl-replicator-worker", "MXL_REPLICATOR_TEST_WORKER_BINARY")
 	producer := locate(t, "mxl-mock-src", "MXL_REPLICATOR_TEST_MOCK_SRC")
 	consumer := locate(t, "mxl-mock-sink", "MXL_REPLICATOR_TEST_MOCK_SINK")
 
@@ -192,6 +192,102 @@ func runLoopback(t *testing.T, provider api.Provider, attachment probe.Attachmen
 	})
 
 	source.stop()
+}
+
+// M7.12: an initiator must not strand the flow it reads.
+//
+// A discrete initiator co-opens a *writer* on its source flow, purely to stamp a tx timestamp
+// into each grain header for precise latency measurement (§12). That writer takes a shared flock
+// on the flow's data and grain files, and MXL deletes a flow directory on writer release only if
+// it can upgrade to an exclusive lock — so for as long as the initiator holds it, the flow's real
+// owner cannot clean up after itself.
+//
+// The consequence is not a stray directory. In a chained topology the orphan is still discovered
+// by the destination node's inventory, so a second request selecting that domain keeps matching a
+// flow nobody is writing, its path sits in PAUSED, and the worker holding the lock is the very
+// one that path is running. It resolves only when something else stops that worker — long-idle
+// teardown, minutes later (§11.1).
+//
+// The fix is that the initiator gives the writer up a second after grains stop and takes it back
+// on the next one. This test makes the claim directly: with the producer stopped and the session
+// deliberately kept hot (the harness sets no IdleTeardown, so nothing withdraws it), the source
+// flow directory must disappear while the initiator is still running. Before the fix it survives
+// for as long as the process does.
+//
+// shm only. The defect is in how the initiator holds a local flow and has nothing to do with the
+// fabric, so running it over both providers would test the same thing twice.
+func TestInitiatorReleasesTheSourceFlowWhenItStopsProducing(t *testing.T) {
+	workerBinary := locate(t, "mxl-replicator-worker", "MXL_REPLICATOR_TEST_WORKER_BINARY")
+	producer := locate(t, "mxl-mock-src", "MXL_REPLICATOR_TEST_MOCK_SRC")
+
+	domainRoot := shmDir(t)
+	launcher, workRoot := realLauncher(t, workerBinary)
+
+	f := newFleet(t, fleetOptions{})
+	node := f.addNode("loopback", nodeOptions{
+		domains:    []string{"src"},
+		domainRoot: domainRoot,
+		launcher:   launcher,
+		probe:      realProbe(t, workerBinary, "loopback", probe.Attachment{Provider: api.ProviderSHM}),
+		tweak: func(cfg *agent.Config) {
+			cfg.TargetInfoTimeout = 30 * time.Second
+			cfg.BackoffMin = 200 * time.Millisecond
+			cfg.BackoffMax = 2 * time.Second
+			cfg.StopGrace = 10 * time.Second
+		},
+	})
+
+	definition := writeFlowDefinition(t, "E2E Camera 2")
+	source := start(t, producer,
+		"--domain", node.path("src"),
+		"--flow-def", definition.path,
+		"--seed", "7",
+		"--json")
+
+	f.eventually("the source flow to be observed and producing", func() bool {
+		for _, flow := range f.flows().Flows {
+			if flow.ID == definition.id && flow.Domain == node.sourceName("src") {
+				return flow.Producing
+			}
+		}
+		return false
+	})
+
+	f.request(api.RequestSpec{
+		Name:         "release-source",
+		Sources:      []api.Source{{Node: "loopback", Domain: node.source("src"), Select: api.Selector{Flow: definition.id}}},
+		Destinations: []api.Destination{{Node: "loopback", Domain: api.Domain{Area: "fast", Elements: []string{"dst"}}}},
+		Provider:     api.ProviderPin{api.ProviderSHM},
+	})
+
+	f.eventually("the path to go ACTIVE", func() bool {
+		paths := f.paths().Paths
+		if len(paths) != 1 {
+			return false
+		}
+		if state := paths[0].State; state == api.StateInvalid || state == api.StateFailed {
+			t.Fatalf("path %s: %s (%s)", state, paths[0].Reason, paths[0].ReasonCode)
+		}
+		return paths[0].State == api.StateActive
+	})
+
+	// The directory the producer created and the initiator is now co-writing.
+	sourceFlow := filepath.Join(node.path("src"), definition.id+".mxl-flow")
+	require.DirExists(t, sourceFlow, "the producer's flow directory")
+
+	// Releasing the producer's writer is what *should* delete it. It cannot while the initiator
+	// holds its shared lock, so this is the moment the flow is stranded.
+	source.stop()
+
+	f.eventually("the source flow directory to be removed", func() bool {
+		_, err := os.Stat(sourceFlow)
+		return errors.Is(err, os.ErrNotExist)
+	})
+
+	// And it was the initiator that let go, not the initiator that died: exiting would have
+	// released the lock too, and would say nothing about the grace period.
+	assert.Equal(t, 2, countWorkers(t, workerBinary, workRoot),
+		"both workers must still be running — the session is hot, only the writer was given up")
 }
 
 // --- the real launcher and probe -------------------------------------------------------------

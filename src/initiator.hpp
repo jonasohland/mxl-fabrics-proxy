@@ -28,8 +28,11 @@ class Initiator {
     void connect(::mxl::fabrics::ContinuousFlowInitiator&,
                  utils::ExitSignal sig);
 
+    // Owns the latency-measurement writer for the duration, opening it against
+    // the first grain and dropping it whenever the source stalls: it may not
+    // outlive the grains, or it strands the flow when the target that owns it
+    // is withdrawn.
     void transferGrains(::mxl::DiscreteFlowReader,
-                        std::optional<::mxl::DiscreteFlowWriter>,
                         ::mxl::fabrics::DiscreteFlowInitiator,
                         utils::ExitSignal sig);
     void transferSamples(::mxl::ContinuousFlowReader,

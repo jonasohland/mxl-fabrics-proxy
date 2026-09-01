@@ -28,7 +28,7 @@ one host share them with zero copies. **MXL Fabrics** extends that across hosts 
 (`tcp`, `verbs`, `efa`, `shm`), predominantly by RDMA Remote Write straight into the receiver's
 media buffer.
 
-`mxl-replicator` decides which flows go where, and supervises the `mxl-fabrics-proxy-worker`
+`mxl-replicator` decides which flows go where, and supervises the `mxl-replicator-worker`
 processes that move them. It never touches grain data.
 
 Two roles, one binary:
@@ -135,7 +135,7 @@ sources:
     domain: media/cameras                     # no selector: every flow in the domain
 destinations:
   - {node: edge-01,    domain: fast/ingest}
-  - {node: edge-02,    domain: fast/ingest}
+  - {node: edge-02,    domain: fast/ingest, disabled: true}   # on file, switched off
   - {node: archive-01, domain: bulk/capture, provider: tcp}
 provider: [verbs, tcp]
 labels:
@@ -171,6 +171,7 @@ itself.
 | `destinations[]` | Where it goes: `node` and `domain`. |
 | `destinations[].domain` | `<area>/<elements>`: `fast/ingest`, or `fast/studio-a/cam1` to nest. The first segment is the area — which the destination node must advertise **and grant `write` on** — and the rest are path elements, each a plain name, at most 8 of them. On the wire it is `{area, elements}`, and the manifest is the only place it is ever a string. |
 | `destinations[].provider` | Override the request-level pin for this destination alone. |
+| `destinations[].disabled` | Park this leg. The entry stays in the request and expands to nothing — no path, no session, no workers — so a route can be switched off without being deleted and retyped. **It stops media**, so preview it with `--dry-run` like any other change. A request with every destination parked reports `DISABLED`, which is not a fault and is kept out of `status`' list of what is wrong. Note that an apply which *omits* the flag enables the leg: the file is authoritative, so a leg parked through the API comes back the next time somebody applies the file that names its request. |
 | `provider` | `verbs`, or `[verbs, tcp]` for "prefer verbs, tcp acceptable". Omitted, the server negotiates in its configured order (EFA > Verbs > TCP > SHM). **Never silently substituted** — a pin is honoured or the request fails. |
 | `idle_teardown_ms` | Stop this request's workers when its source has been idle this long. `0` keeps them hot. |
 | `sched_prio` | Ask for `SCHED_FIFO`. Rejected at request time if a participating node lacks the capability. |
@@ -387,13 +388,19 @@ request  cam3      WAITING  the selector matches no flow in studio-b/media/camer
 ```
 
 States, worst-first: `INVALID`, `FAILED`, `DEGRADED`, `WAITING`, `ESTABLISHING`, `PAUSED`,
-`ACTIVE`. A request aggregates over its paths, and `get requests`' `PATHS` column carries the
-"1 of 3" that a one-flow-per-request model has no way to express.
+`ACTIVE`, `DISABLED`. A request aggregates over its paths, and `get requests`' `PATHS` column
+carries the "1 of 3" that a one-flow-per-request model has no way to express.
 
-`PARTIAL` is the one exception and **aggregates only**: a request whose paths disagree, with at
-least one `ACTIVE`, reports it instead of the worst one — because one bad path among twenty must
-not condemn the other nineteen at the line you read first. It never appears on a path, a session or
-a worker, and the detail lives in `describe request`'s per-source rows and in the per-path metrics.
+Two more **aggregate only** — they describe a set, so they never appear on a path, a session or a
+worker. `PARTIAL`: a request whose paths disagree, with at least one `ACTIVE`, reports it instead of
+the worst one, because one bad path among twenty must not condemn the other nineteen at the line you
+read first. The detail lives in `describe request`'s per-source rows and in the per-path metrics.
+
+`DISABLED`: every destination of the request is parked (`disabled: true`), so it is asking for
+nothing. It sorts after `ACTIVE` and is deliberately left out of `status`' list of what is wrong —
+somebody switched it off on purpose — but it is counted beside every other state, because a parked
+route nobody remembers is exactly what wants finding. One live destination beside a parked one is
+not `DISABLED`; it folds over the legs it still has.
 
 `PAUSED` is the one worth knowing: it separates *the plumbing is broken* from *the source is not
 producing*, which look identical from a "no media at the destination" alarm and have completely
@@ -447,7 +454,8 @@ flow is routed.
 | `--agent-node` | Fleet-wide unique node name. Defaults to the hostname. |
 | `--agent-server` | Control-plane URL. Repeatable for HA. |
 | `--agent-area name=/path:rw` | Declare an area, with its grants: `r` to discover and observe domains under it, `w` to create them. Repeatable. **A node with no readable area offers no sources; one with no writable area accepts no destinations.** |
-| `--agent-fabric provider=,fabric=,interface=` | Declare a fabric attachment. Repeatable. |
+| `--agent-fabric provider=,fabric=,device=` | Declare a fabric attachment. Repeatable. Naming selectors `address=`, `interface=`, `device=` or none; narrowed by `network=10.1.0.0/16` and `ip_version=4\|6`. |
+| `--agent-detect-default-fabric` | With no attachment configured, detect one from what libfabric reports — best provider first, and for `tcp` the first routable IPv4 address — and label it `default`. Nodes pair only with others carrying the same label, so this is for a flat network. |
 | `--agent-port-range` | Range the agent binds target workers in. Inbound to the *destination* node, so open it there. |
 | `--agent-config` | YAML file supplying any of the above. |
 
@@ -519,9 +527,9 @@ label**:
 
 ```yaml
 fabrics:
-  - {provider: verbs, fabric: ib-fabric-a, interface: ib0}
-  - {provider: tcp,   fabric: dc1-data,    interface: eth1}
-  - {provider: efa,   fabric: vpc1-subnet-a, interface: efa0}
+  - {provider: verbs, fabric: ib-fabric-a,   device: mlx5_0, ip_version: 4}
+  - {provider: tcp,   fabric: dc1-data,      network: 10.1.0.0/16}
+  - {provider: efa,   fabric: vpc1-subnet-a, device: rdmap0s6-rdm}
 ```
 
 Provider availability is not reachability. Two nodes both offering `verbs` may be on different
@@ -529,9 +537,25 @@ InfiniBand fabrics; two both offering `efa` may be in different VPCs. Intersecti
 would cheerfully assign a session that cannot connect, and it fails invisibly — the target comes up
 clean and the initiator's connect loop spins.
 
-Prefer naming an `interface` over an `address`: the agent resolves it at startup by running the
-worker's `--interfaces` probe and asking libfabric what the node actually has. A configured
-attachment with no matching probe result is a loud startup error, not a silent drop.
+Selectors come in two classes. A **naming** selector says which interface — `address`, `interface`,
+`device`, or none when the node has exactly one of that provider — and there is at most one per
+attachment. **Narrowing** selectors say which of its addresses counts — `network` and `ip_version`
+— and they compose, with a name and with each other. The agent resolves the lot at startup by
+running the worker's `--interfaces` probe and asking libfabric what the node actually has; exactly
+one probe entry must survive, and zero or several is a loud startup error rather than a guess.
+
+The naming selectors are not interchangeable. `device` is the **libfabric** device name — `mlx5_0`,
+`rdmap0s6-rdm` — and `interface` is the netdev, which exists for `tcp` and `verbs` and **not for
+`efa`**: an efa attachment naming an interface is refused at startup, because the probe has no
+netdev name to match it against.
+
+A name alone is often ambiguous: an HCA reporting both an IPv4 and a link-local IPv6 address is two
+entries under one device name. `address` is the exact-and-always-unique escape hatch, but it costs
+a per-node value — which a DaemonSet does not have — so `device: mlx5_0` plus `ip_version: 4` is
+usually the better answer, and `network: 10.1.0.0/16` is better still where it applies: it picks
+each node's own address inside a prefix while naming no hardware at all. Neither narrowing selector
+asserts anything about reachability; two nodes inside one prefix may still have no route between
+them, and that is what the fabric label decides.
 
 ## Docker images
 
@@ -543,11 +567,35 @@ docker pull jonasohland/mxl-replicator:latest
 docker pull jonasohland/mxl-replicator:latest-efa
 ```
 
-Both carry `mxl-replicator` and `mxl-fabrics-proxy-worker`. `make image` / `make image-efa` build
+Both carry `mxl-replicator` and `mxl-replicator-worker`. `make image` / `make image-efa` build
 them; `make image-test` adds `mxl-mock-src` and `mxl-mock-sink` for the end-to-end suite, and must
 not be published as `:latest`.
 
-[`deployment/`](deployment/) has a server Deployment and an agent DaemonSet.
+## Kubernetes
+
+[`deployment/mxl-replicator/`](deployment/mxl-replicator/) is a Helm chart: the server as a
+Deployment, the agent as a DaemonSet, and nothing else required.
+
+```bash
+helm install mxl-replicator ./deployment/mxl-replicator \
+    --namespace mxl --create-namespace \
+    --set image.tag=v0.3.0 \
+    --set server.persistence.node=<node> \
+    --set-json 'agent.fabrics=[{"provider":"tcp","fabric":"dc1-data","interface":"eth1"}]'
+
+kubectl label node <node> mxl.ebu.org/mxl-replicator=true
+```
+
+The chart provisions the fleet; it never decides what is replicated — that stays an `apply`
+against the API. Three things it will not guess at: which node holds the sqlite store
+(`server.persistence.node`, a directory on that node by default), what each node can be reached on
+(`agent.fabrics`), and what filesystem authority each node grants (`agent.areas`).
+
+`agent.efa.enabled` requests `vpc.amazonaws.com/efa` from the AWS device plugin and switches the
+agent onto the `-efa` image; `agent.pools` runs several agent DaemonSets over a fleet whose nodes
+are not alike. The [chart README](deployment/mxl-replicator/README.md) covers both, and
+[`examples/`](deployment/mxl-replicator/examples/) has complete values files for a single node, an
+EFA cluster and a mixed fleet.
 
 ## Building from source
 
@@ -574,8 +622,14 @@ Prefixes split by **what the metric describes**, not by which process emits it:
 
 Worker metrics are scraped on demand, inside the request, through a bounded pool with per-worker
 and overall deadlines. `/healthz` stays green when a transfer is failing — a peer being unreachable
-is no reason to restart and drop every other flow — so use `/readyz` for readiness and watch status
-and metrics for failure.
+is no reason to restart and drop every other flow — so watch status and metrics for failure rather
+than the probe.
+
+The server serves `/healthz` and `/readyz`, and they are not the same question: readiness reports
+whether the reconciler has settled, so it is the one a load balancer should use and the wrong one
+to restart on. **The agent serves `/healthz` only** — there is no definition yet of what an agent
+being *ready* would mean — so its readiness probe is the same endpoint, and proves the process is
+up rather than that it has registered.
 
 ## Migrating from mxl-fabrics-proxy
 

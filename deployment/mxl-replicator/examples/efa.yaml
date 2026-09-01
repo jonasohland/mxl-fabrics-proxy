@@ -1,0 +1,47 @@
+# AWS, EFA.
+#
+#   helm install mxl -n mxl --create-namespace \
+#       ./deployment/mxl-replicator -f examples/efa.yaml
+#
+# Prerequisites this chart does not install:
+#   - the `aws-efa-k8s-device-plugin` DaemonSet, which advertises vpc.amazonaws.com/efa;
+#   - EFA-capable instances, with the adapter attached and the security group allowing all
+#     traffic to and from itself (EFA traffic is not IP and does not match a port rule);
+#   - the `-efa` image, built on the EFA-enabled libfabric base — `make image-efa`.
+
+image:
+  # The agent gets v0.3.0-efa; the server keeps v0.3.0, because it never touches a fabric.
+  tag: v0.3.0
+
+server:
+  persistence:
+    type: local
+    node: ip-10-0-1-14.eu-central-1.compute.internal
+    # Must already exist on that node: the local volume plugin will not create it.
+    hostPath: /mnt/mxl-replicator
+
+agent:
+  # Only instances that have an adapter. Without this the DaemonSet schedules pods that sit
+  # Pending on a resource their node does not advertise.
+  nodeSelector:
+    node.kubernetes.io/instance-type: c5n.18xlarge
+
+  efa:
+    enabled: true
+    # Instances with several adapters want the real number.
+    count: 1
+
+  # **The label is the part with a consequence.** EFA does not route, so two nodes sharing this
+  # label is an assertion that they are in the same subnet and can reach each other. Nodes in
+  # different subnets must carry different labels, or the server will negotiate a session that
+  # cannot connect.
+  fabrics:
+    - {provider: efa, fabric: vpc1-subnet-a, device: rdmap0s6-rdm}
+
+  areas:
+    - {name: media, path: /dev/shm/mxl0, read: true}
+    - {name: fast, path: /dev/shm/mxl, read: true, write: true}
+
+  # EFA is connectionless (RDM endpoints), but the target still binds and the initiator still
+  # connects to it, so the range has to be open between instances.
+  portRange: 24000-24999

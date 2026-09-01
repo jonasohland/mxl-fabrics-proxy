@@ -1017,6 +1017,62 @@ func TestAnAgentLosingItsLeaseWithdrawsNothing(t *testing.T) {
 	assert.Len(t, result.Assignments["edge-01"].Assignments, 1)
 }
 
+// **The two ends of a path may be one node.** That is what shm is structurally for and what the
+// single-host quick start does, so it is an ordinary arrangement rather than a corner.
+//
+// Carrying a frozen session forward reads every assignment the node holds *for that session*
+// rather than the one belonging to the end being visited — so visiting one node once per end
+// copies both roles twice. And because each pass reads back what the last one wrote, that is not
+// an off-by-one but a doubling: 2^n after n passes. Observed in the field as a 258 MB assignment
+// document holding 262,144 copies of one assignment, which took the server out with it.
+//
+// Four passes rather than two: one pass would pass against an implementation that deduplicated
+// the *result* while still reading the node twice, and it is the compounding that does the damage.
+func TestALoopbackSessionCarriedForwardDoesNotDoubleItsAssignments(t *testing.T) {
+	t.Parallel()
+
+	sourceDomain := api.Domain{Area: "media", Elements: []string{"cameras"}}
+	destDomain := api.Domain{Area: "fast", Elements: []string{"ingest"}}
+
+	spec := api.RequestSpec{
+		Name:         "loopback",
+		Sources:      []api.Source{{Node: "n0", Domain: named("media/cameras"), Select: api.Selector{Flow: "flow-1"}}},
+		Destinations: []api.Destination{{Node: "n0", Domain: destDomain}},
+	}
+	path := state.PathIdentity{
+		Source:      api.FlowAddress{Node: "n0", Domain: "media/cameras", Flow: "flow-1"},
+		Destination: spec.Destinations[0],
+	}
+	sessionID := state.SessionID(path, state.FlowDefHash(flowDef))
+
+	// Both roles on the one node, which is what a running loopback session looks like.
+	carried := api.AssignmentSet{Node: "n0", Assignments: []api.Assignment{
+		{SessionID: sessionID, Role: api.RoleTarget, Domain: destDomain, FlowID: "flow-1", FlowDef: flowDef},
+		{SessionID: sessionID, Role: api.RoleInitiator, Domain: sourceDomain, FlowID: "flow-1",
+			Epoch: "epoch-a", TargetInfo: `{"id":"x"}`},
+	}}
+
+	// Unleased, so the session is frozen and carried forward rather than replanned — the path
+	// this bug lives on. Rebuilt from `carried` each pass, which is the store round-trip.
+	for pass := 1; pass <= 4; pass++ {
+		fleet := newFleet().
+			node("n0").
+			request("loopback", spec).
+			session(state.SessionRecord{
+				ID: sessionID, Path: path,
+				FlowDefHash: state.FlowDefHash(flowDef), Fabric: "dc1", Interface: tcpInterface,
+			}).
+			assignments("n0", carried).
+			unlease("n0").
+			build()
+
+		result := Compute(fleet, Config{})
+		carried = result.Assignments["n0"]
+		require.Len(t, carried.Assignments, 2, "pass %d: one target and one initiator, not %d",
+			pass, len(carried.Assignments))
+	}
+}
+
 // The same rule for a group-hint request: inventory went away with the lease, so the selector
 // expands to nothing — and "matched nothing" must not be read as "delete everything".
 func TestAGroupHintRequestDoesNotCollapseWhenItsSourceAgentIsGone(t *testing.T) {

@@ -823,3 +823,55 @@ name: nab
 	assert.Equal(t, []Kind{KindRequest, KindDomain, KindNamespace},
 		[]Kind{reversed[0].Kind, reversed[1].Kind, reversed[2].Kind})
 }
+
+// `disabled: true` parks a leg in the file, spelled exactly as it is on the wire — the one field of
+// a destination entry that needs no translation (§9.1).
+//
+// The entry stays in the spec, which is the whole point: a parked route is a reviewable line in a
+// diff rather than an absence indistinguishable from never having written it.
+func TestADestinationCanBeParkedInTheFile(t *testing.T) {
+	t.Parallel()
+
+	const file = `
+name: cam1
+sources:
+  - node: studio-a
+    domain: media/cameras
+    flow: 5592a23b-0974-45bb-9388-89ea81c42537
+destinations:
+  - {node: edge-01,    domain: fast/ingest}
+  - {node: archive-01, domain: bulk/capture, disabled: true}
+`
+
+	docs, err := Parse(strings.NewReader(file), "studio-a.yaml")
+	require.NoError(t, err)
+	specs, err := Specs(docs)
+	require.NoError(t, err)
+	require.Len(t, specs, 1)
+
+	require.Len(t, specs[0].Destinations, 2)
+	assert.False(t, specs[0].Destinations[0].Disabled)
+	assert.True(t, specs[0].Destinations[1].Disabled)
+	assert.Equal(t, "bulk/capture", specs[0].Destinations[1].DomainName(),
+		"a parked entry keeps its domain: it is the thing that comes back")
+	assert.True(t, api.AnyEnabled(specs[0].Destinations))
+}
+
+// A request whose only destination is parked is legal, and it has to be: requiring an enabled one
+// would forbid exactly the state the flag exists to represent (§9.1).
+func TestAFileMayParkEveryDestination(t *testing.T) {
+	t.Parallel()
+
+	const file = `
+name: cam1
+sources: [{node: studio-a, domain: media/cameras, flow: f}]
+destinations: [{node: edge-01, domain: fast/ingest, disabled: true}]
+`
+
+	docs, err := Parse(strings.NewReader(file), "studio-a.yaml")
+	require.NoError(t, err)
+	specs, err := Specs(docs)
+	require.NoError(t, err, "at least one destination means one entry, not one enabled entry")
+	require.Len(t, specs, 1)
+	assert.False(t, api.AnyEnabled(specs[0].Destinations))
+}

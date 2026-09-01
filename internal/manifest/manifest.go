@@ -375,6 +375,20 @@ type DestinationDoc struct {
 	// Provider overrides the document-level pin for this destination alone, because a provider is
 	// negotiated per (source, destination) pair (§10.3).
 	Provider ProviderDoc `yaml:"provider"`
+
+	// Disabled parks this leg: the entry stays and expands to nothing (§9.1).
+	//
+	// Spelled on the wire exactly as it is here — the one field of a source or destination entry
+	// that needs no translation between the file and [api.Destination], because there is nothing
+	// about a boolean the file could make friendlier.
+	//
+	// A file is the natural home for it: "this route exists and is off" is a reviewable line in a
+	// diff, where the same intent used to be an absence indistinguishable from never having written
+	// it. **And an apply that omits the flag enables the leg** — the file is authoritative over the
+	// requests it names, as it is over every other field of them, so a leg parked through the API
+	// comes back the next time somebody applies the file that names its request. `--dry-run` reports
+	// that as an updated request with the paths it would create, which is the warning.
+	Disabled bool `yaml:"disabled"`
 }
 
 // ProviderDoc accepts a bare string or a list, matching the wire type's two spellings.
@@ -444,6 +458,7 @@ func (d RequestDoc) Spec() (api.RequestSpec, error) {
 			Node:     dst.Node,
 			Domain:   domain,
 			Provider: dst.Provider.pin(),
+			Disabled: dst.Disabled,
 		})
 	}
 	if d.IdleTeardownMS != nil {

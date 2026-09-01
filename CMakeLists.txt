@@ -9,10 +9,10 @@ find_package(nlohmann_json CONFIG REQUIRED)
 pkg_check_modules(libfabric REQUIRED IMPORTED_TARGET libfabric)
 pkg_check_modules(libuuid REQUIRED IMPORTED_TARGET uuid)
 
-add_executable(mxl-fabrics-proxy-worker)
+add_executable(mxl-replicator-worker)
 
 target_link_libraries(
-	mxl-fabrics-proxy-worker PRIVATE 
+	mxl-replicator-worker PRIVATE 
 	mxl::mxl
 	mxl::mxl-fabrics
         spdlog::spdlog
@@ -21,7 +21,7 @@ target_link_libraries(
         PkgConfig::libuuid
 )
 
-target_sources(mxl-fabrics-proxy-worker
+target_sources(mxl-replicator-worker
 	PRIVATE
 		"src/main.cpp"
         "src/mxl.cpp"
@@ -35,7 +35,7 @@ target_sources(mxl-fabrics-proxy-worker
         "src/rt.cpp"
 )
 
-target_compile_features(mxl-fabrics-proxy-worker
+target_compile_features(mxl-replicator-worker
     PRIVATE
         cxx_std_20
 )
@@ -45,7 +45,7 @@ configure_file(
     "${CMAKE_CURRENT_BINARY_DIR}/version_header/version.h"
 )
 
-target_include_directories(mxl-fabrics-proxy-worker
+target_include_directories(mxl-replicator-worker
     PRIVATE
         "${CMAKE_CURRENT_BINARY_DIR}/version_header"
 )
@@ -91,7 +91,7 @@ endforeach()
 include(GNUInstallDirs)
 install(
     TARGETS
-        mxl-fabrics-proxy-worker
+        mxl-replicator-worker
         mxl-mock-src
         mxl-mock-sink
     DESTINATION "${CMAKE_INSTALL_BINDIR}"

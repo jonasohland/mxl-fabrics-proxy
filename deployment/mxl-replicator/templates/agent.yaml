@@ -1,0 +1,300 @@
+{{- if .Values.agent.enabled }}
+{{- $root := . }}
+{{- $base := omit .Values.agent "pools" }}
+
+{{- /*
+One agent per node.
+
+**No per-node ConfigMap of subscriptions, and no reloader.** What a node is replicating lives in
+the API and is applied with `mxl-replicator apply`, so the only thing here is provisioning — node
+name, areas, fabric attachments, server URL, port range — which changes when the host is built
+rather than when a flow is routed. That is what collapsed the agent's restart rate down to
+upgrades.
+
+**No node-address init container either.** The agent execs the worker's `--interfaces` probe and
+asks libfabric what this node actually has, instead of a script guessing from the environment.
+
+`agent.pools`, when non-empty, replaces the single DaemonSet with one per pool — a fleet whose
+nodes are not alike. Each pool is merged over everything in `agent`, and their node selectors must
+not overlap: two agents claiming one node name is a real failure mode, and the server rejects the
+second claimant.
+*/}}
+{{- if and (not .Values.server.enabled) (not .Values.agent.servers) }}
+{{- fail "server.enabled is false and agent.servers is empty: the agents would be pointed at a Service this release does not create. Set agent.servers to the control plane they should register with." }}
+{{- end }}
+
+{{- $pools := list (dict) }}
+{{- if .Values.agent.pools }}
+{{- $pools = .Values.agent.pools }}
+{{- end }}
+
+{{- range $pool := $pools }}
+{{- $name := default "" (get $pool "name") }}
+{{- if and $root.Values.agent.pools (not $name) }}
+{{- fail "every entry in agent.pools needs a name: it becomes the DaemonSet's suffix and its ConfigMap's" }}
+{{- end }}
+{{- $a := mergeOverwrite (deepCopy $base) (omit $pool "name") }}
+{{- $fullname := printf "%s-agent" (include "mxl-replicator.fullname" $root) }}
+{{- $component := "agent" }}
+{{- if $name }}
+{{- $fullname = printf "%s-agent-%s" (include "mxl-replicator.fullname" $root) $name }}
+{{- $component = printf "agent-%s" $name }}
+{{- end }}
+{{- $config := include "mxl-replicator.agentConfig" (dict "root" $root "agent" $a) }}
+{{- include "mxl-replicator.checkAreaMounts" (dict "root" $root "agent" $a "pool" (default "default" $name)) }}
+
+{{- /* EFA and hugepages are extended resources: requests and limits must be equal. */}}
+{{- $req := deepCopy (dig "resources" "requests" (dict) $a) }}
+{{- $lim := deepCopy (dig "resources" "limits" (dict) $a) }}
+{{- if $a.efa.enabled }}
+{{- $_efaReq := set $req $a.efa.resourceName $a.efa.count }}
+{{- $_efaLim := set $lim $a.efa.resourceName $a.efa.count }}
+{{- if $a.efa.hugepages.enabled }}
+{{- $hp := printf "hugepages-%s" (toString $a.efa.hugepages.size) }}
+{{- $_hpReq := set $req $hp $a.efa.hugepages.amount }}
+{{- $_hpLim := set $lim $hp $a.efa.hugepages.amount }}
+{{- end }}
+{{- end }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $fullname }}
+  namespace: {{ $root.Release.Namespace }}
+  labels:
+    {{- include "mxl-replicator.labels" $root | nindent 4 }}
+    app.kubernetes.io/component: {{ $component }}
+  {{- with $root.Values.commonAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+data:
+  # Areas and fabric attachments are lists of records, which is what does not fit on a command
+  # line. Everything else the agent takes is a flag. `node` is absent on purpose: it comes from
+  # MXL_REPLICATOR_NODE, which is the pod's own spec.nodeName.
+  agent.yaml: |
+    {{- $config | nindent 4 }}
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ $fullname }}
+  namespace: {{ $root.Release.Namespace }}
+  labels:
+    {{- include "mxl-replicator.labels" $root | nindent 4 }}
+    app.kubernetes.io/component: {{ $component }}
+  {{- with $root.Values.commonAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "mxl-replicator.selectorLabels" (dict "root" $root "component" $component) | nindent 6 }}
+  updateStrategy:
+    {{- toYaml $a.updateStrategy | nindent 4 }}
+  template:
+    metadata:
+      labels:
+        {{- include "mxl-replicator.labels" $root | nindent 8 }}
+        app.kubernetes.io/component: {{ $component }}
+        {{- with $a.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        # Roll the DaemonSet when the areas or the fabric attachments change. Both are read once,
+        # at startup: without this the ConfigMap would update and every agent would carry on with
+        # the configuration it started with.
+        checksum/config: {{ $config | sha256sum }}
+        {{- if $root.Values.metrics.annotations }}
+        prometheus.io/scrape: "true"
+        prometheus.io/port: {{ $a.listenPort | quote }}
+        prometheus.io/path: /metrics
+        {{- end }}
+        {{- with $root.Values.commonAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+        {{- with $a.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "mxl-replicator.serviceAccountName" $root }}
+      {{- include "mxl-replicator.imagePullSecrets" $root | nindent 6 }}
+      {{- with $a.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $a.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $a.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $a.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      # The fabric connection is inbound to the *destination* node on a port the agent allocates
+      # from --agent-port-range, so that range has to be reachable on the host.
+      hostNetwork: {{ $a.hostNetwork }}
+      {{- if $a.hostNetwork }}
+      dnsPolicy: {{ $a.dnsPolicy }}
+      {{- end }}
+      terminationGracePeriodSeconds: {{ $a.terminationGracePeriodSeconds }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ $fullname }}
+        - name: workdir
+          # Per-worker-instance working directories: a config.json, a metrics socket, and for a
+          # target a target-info.json. emptyDir on purpose — the agent holds no state that has to
+          # survive a restart, and a fresh directory per worker *start* is what keeps a leftover
+          # metrics socket from being a fatal EADDRINUSE.
+          emptyDir:
+            medium: Memory
+        {{- range $mount := $a.hostMounts }}
+        - name: {{ $mount.name }}
+          hostPath:
+            path: {{ $mount.hostPath }}
+            type: {{ default "Directory" $mount.type }}
+        {{- end }}
+        {{- if $a.devices.infiniband.enabled }}
+        - name: infiniband
+          hostPath:
+            path: {{ $a.devices.infiniband.path }}
+            type: {{ default "Directory" $a.devices.infiniband.type }}
+        {{- end }}
+        {{- if and $a.efa.enabled $a.efa.hugepages.enabled }}
+        - name: hugepages
+          emptyDir:
+            medium: HugePages
+        {{- end }}
+        {{- with $a.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      containers:
+        - name: agent
+          image: {{ include "mxl-replicator.agentImage" (dict "root" $root "agent" $a) }}
+          imagePullPolicy: {{ $root.Values.image.pullPolicy }}
+          args:
+            - run
+            - --agent
+            - --agent-config
+            - /etc/mxl-replicator/agent.yaml
+            - --agent-listen
+            - {{ printf "0.0.0.0:%v" $a.listenPort | quote }}
+            - --agent-work-dir
+            - {{ $a.workDir | quote }}
+            - --agent-port-range
+            - {{ $a.portRange | quote }}
+            - --agent-start-rate
+            - {{ $a.startRate | quote }}
+            - --agent-start-burst
+            - {{ $a.startBurst | quote }}
+            - --agent-flow-idle-after
+            - {{ $a.flowIdleAfter | quote }}
+            {{- if $a.detectDefaultFabric }}
+            - --agent-detect-default-fabric
+            {{- end }}
+            {{- with $a.workerLogLevel }}
+            - --agent-worker-log-level
+            - {{ . | quote }}
+            {{- end }}
+            {{- with $a.extraArgs }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          env:
+            # Fleet-wide unique, and the node's own name is the one identifier that already is.
+            - name: MXL_REPLICATOR_NODE
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: MXL_REPLICATOR_LOG_LEVEL
+              value: {{ $a.logLevel | quote }}
+            {{- include "mxl-replicator.authEnv" $root | nindent 12 }}
+            {{- with $a.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          ports:
+            - name: http
+              containerPort: {{ $a.listenPort }}
+              {{- if or $a.hostPort $a.hostNetwork }}
+              hostPort: {{ $a.listenPort }}
+              {{- end }}
+              protocol: TCP
+          readinessProbe:
+            # /healthz, because the agent serves no /readyz — its HTTP surface is health and this
+            # node's metrics, and nothing else. So this proves the process is up and serving and
+            # says nothing about whether it has registered.
+            #
+            # It is here rather than omitted because a DaemonSet's rolling update waits on
+            # readiness to move to the next node, and with no probe at all a pod counts as ready
+            # the instant the container starts — which would roll the whole fleet at the speed of
+            # `docker run` while every node's flows are still re-establishing.
+            httpGet:
+              path: /healthz
+              port: {{ $a.listenPort }}
+            initialDelaySeconds: 2
+            periodSeconds: 5
+            timeoutSeconds: 3
+          livenessProbe:
+            # /healthz stays green when a transfer is failing, deliberately: a peer being
+            # unreachable is no reason to restart this agent and drop every other flow on the
+            # node. Failure is made observable through status and metrics instead.
+            httpGet:
+              path: /healthz
+              port: {{ $a.listenPort }}
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          {{- if or $req $lim }}
+          resources:
+            {{- with $req }}
+            requests:
+              {{- toYaml . | nindent 14 }}
+            {{- end }}
+            {{- with $lim }}
+            limits:
+              {{- toYaml . | nindent 14 }}
+            {{- end }}
+          {{- end }}
+          securityContext:
+            {{- if $a.runAsRoot }}
+            # Not decoration: a container starting as a non-root uid holds no *effective*
+            # capabilities whatever `privileged` says, so CAP_IPC_LOCK would be in the bounding
+            # set and do nothing, and the worker would fail to register memory. See values.yaml.
+            runAsUser: 0
+            {{- end }}
+            privileged: {{ $a.privileged }}
+            {{- with $a.capabilities }}
+            capabilities:
+              add:
+                # Required by the RDMA providers. These gate whether the agent *advertises* an
+                # attachment at all; they never go over the wire.
+                {{- toYaml . | nindent 16 }}
+            {{- end }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/mxl-replicator
+              readOnly: true
+            - name: workdir
+              mountPath: {{ $a.workDir }}
+            {{- range $mount := $a.hostMounts }}
+            - name: {{ $mount.name }}
+              mountPath: {{ $mount.mountPath }}
+            {{- end }}
+            {{- if $a.devices.infiniband.enabled }}
+            - name: infiniband
+              mountPath: {{ $a.devices.infiniband.path }}
+            {{- end }}
+            {{- if and $a.efa.enabled $a.efa.hugepages.enabled }}
+            - name: hugepages
+              mountPath: /dev/hugepages
+            {{- end }}
+            {{- with $a.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+{{- end }}
+{{- end }}

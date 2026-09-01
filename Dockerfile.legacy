@@ -45,7 +45,7 @@ RUN apt-get update && \
         && rm -r /var/lib/apt/lists/* 
 
 COPY --from=builder /usr/bin/mxl-fabrics-proxy /usr/bin/mxl-fabrics-proxy
-COPY --from=builder /usr/bin/mxl-fabrics-proxy-worker /usr/bin/mxl-fabrics-proxy-worker
+COPY --from=builder /usr/bin/mxl-replicator-worker /usr/bin/mxl-replicator-worker
 COPY --from=builder /usr/bin/mxl-fabrics-proxy-reloader /usr/bin/mxl-fabrics-proxy-reloader
 
 COPY ./deployment/scripts/k8s-write-node-address-config-snippet.sh /usr/local/bin/k8s-write-node-address-config-snippet.sh 

@@ -156,6 +156,21 @@ func Pairing(spec api.RequestSpec, srcIndex, dstIndex int, fleet *state.Fleet, c
 // request still valid", and a rule that only ran at POST would let a request written straight into
 // the store reach an agent as an assignment.
 func Request(spec api.RequestSpec, fleet *state.Fleet) *Result {
+	// **A request with every destination parked is not validated against the fleet at all** (§7.2,
+	// §9.1). It is asking for nothing, so there is nothing to refuse: both rules below describe a
+	// pairing that would exist, and neither would. `duplicate_source_flow` in particular is only a
+	// corruption because two sources *share a destination*, and a request with no enabled one shares
+	// none.
+	//
+	// The cost is accepted and is worth knowing: a parked route can be broken without saying so, and
+	// finds out when it is enabled. Structural validation is the exception and runs unconditionally
+	// in [api.RequestSpec.Validate], so nothing unspellable can be parked in the store to fail later
+	// on the click that turns it on. The alternative — reporting it anyway — gives a request two
+	// states, INVALID and DISABLED, and one field to report them in.
+	if !api.AnyEnabled(spec.Destinations) {
+		return nil
+	}
+
 	if bad := duplicateSourceFlow(spec); bad != nil {
 		return bad
 	}
@@ -176,6 +191,11 @@ func schedPrio(spec api.RequestSpec, fleet *state.Fleet) *Result {
 		names = append(names, src.Node)
 	}
 	for _, dst := range spec.Destinations {
+		// A parked destination names a node this request is not currently asking anything of, so a
+		// missing capability there is not a reason to invalidate the legs that are running (§9.1).
+		if dst.Disabled {
+			continue
+		}
 		names = append(names, dst.Node)
 	}
 

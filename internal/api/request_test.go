@@ -222,3 +222,84 @@ func TestRequestFlattensItsSpec(t *testing.T) {
 	assert.Contains(t, raw, "destinations")
 	assert.NotContains(t, raw, "RequestSpec")
 }
+
+// --- parked destinations (§9.1) ----------------------------------------------------------------
+
+func parkable(destinations ...Destination) RequestSpec {
+	return RequestSpec{
+		Name:         "cam1",
+		Sources:      []Source{{Node: "studio-a", Domain: SelectDomain(Domain{Area: "media", Elements: []string{"cameras"}}), Select: Selector{All: true}}},
+		Destinations: destinations,
+	}
+}
+
+func ingest(node string) Destination {
+	return Destination{Node: node, Domain: Domain{Area: "fast", Elements: []string{"ingest"}}}
+}
+
+// **Validate counts entries, not enabled entries.** A request whose only destination is parked is
+// legal and is the whole point of the flag: requiring an enabled one would forbid precisely the
+// state it exists to represent, and would make un-parking the last leg the only way to keep a route
+// on file.
+func TestARequestMayHaveEveryDestinationParked(t *testing.T) {
+	t.Parallel()
+
+	parked := ingest("edge-01")
+	parked.Disabled = true
+
+	spec := parkable(parked)
+	assert.NoError(t, spec.Validate())
+	assert.False(t, AnyEnabled(spec.Destinations))
+
+	// The list itself still may not be empty: "off" is a value on an entry, not the absence of one.
+	assert.Error(t, parkable().Validate())
+}
+
+// **The duplicate-endpoint rule does not exempt a parked entry**, and the temptation to exempt it is
+// the thing being pinned: parking a `tcp` variant beside the live `verbs` one reads like a useful
+// thing to keep on file and has no answer for which pin applies once both are enabled.
+func TestTwoEntriesForOneEndpointAreRefusedEvenWhenOneIsParked(t *testing.T) {
+	t.Parallel()
+
+	live := ingest("edge-01")
+	live.Provider = ProviderPin{ProviderVerbs}
+
+	parked := ingest("edge-01")
+	parked.Provider = ProviderPin{ProviderTCP}
+	parked.Disabled = true
+
+	err := parkable(live, parked).Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "both name edge-01/fast/ingest")
+}
+
+func TestAnyEnabled(t *testing.T) {
+	t.Parallel()
+
+	parked := ingest("edge-01")
+	parked.Disabled = true
+
+	assert.False(t, AnyEnabled(nil), "an empty list asks for nothing")
+	assert.False(t, AnyEnabled([]Destination{parked}))
+	assert.True(t, AnyEnabled([]Destination{parked, ingest("edge-02")}))
+}
+
+// `disabled` is absent from the wire when false, so the zero value is the direction that keeps media
+// running — the reason it is never spelled `enabled` (§9.1).
+func TestParkedIsOmittedWhenFalse(t *testing.T) {
+	t.Parallel()
+
+	body, err := json.Marshal(ingest("edge-01"))
+	require.NoError(t, err)
+	assert.NotContains(t, string(body), "disabled")
+
+	parked := ingest("edge-01")
+	parked.Disabled = true
+	body, err = json.Marshal(parked)
+	require.NoError(t, err)
+	assert.Contains(t, string(body), `"disabled":true`)
+
+	var back Destination
+	require.NoError(t, json.Unmarshal(body, &back))
+	assert.True(t, back.Disabled)
+}

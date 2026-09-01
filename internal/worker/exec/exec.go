@@ -1,4 +1,4 @@
-// Package exec runs the real mxl-fabrics-proxy-worker.
+// Package exec runs the real mxl-replicator-worker.
 //
 // It is the only place in the project that starts a process (invariant 11): everything above
 // it talks to [worker.Launcher], which is what keeps the control plane testable without MXL,
@@ -30,7 +30,7 @@ const (
 	// DefaultBinary is the worker's name, unchanged from the legacy proxy on purpose: it makes
 	// it obvious at a glance which process belongs to which layer, and which one is covered by
 	// docs/worker-runtime-surface.md (§2.2).
-	DefaultBinary = "mxl-fabrics-proxy-worker"
+	DefaultBinary = "mxl-replicator-worker"
 
 	// DefaultWorkRoot is where per-start work directories live. A tmpfs under /run, because
 	// nothing here survives a reboot and nothing here should (§6.1).

@@ -636,7 +636,7 @@ func TestAQueuedStartDoesNotHoldUpAWithdrawal(t *testing.T) {
 // nothing: an attachment list is what negotiation runs on, and an empty one silently makes every
 // request through this node fail with no_shared_fabric.
 func TestAFailedProbeRetriesRatherThanRegisteringEmpty(t *testing.T) {
-	h := newHarness(t, harnessOptions{probeErr: errors.New("mxl-fabrics-proxy-worker: no such file")})
+	h := newHarness(t, harnessOptions{probeErr: errors.New("mxl-replicator-worker: no such file")})
 	h.run()
 
 	h.consistently("no registration", 200*time.Millisecond, func() bool {

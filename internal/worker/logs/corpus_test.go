@@ -11,7 +11,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// testdata/worker-output.txt is captured verbatim from a real mxl-fabrics-proxy-worker
+// testdata/worker-output.txt is captured verbatim from a real mxl-replicator-worker
 // (mxl 1.2.0-dev, libfabric 2.6) across a spread of failure modes: a target timing out on an
 // idle source, a bad domain path, a malformed flow definition, a missing config key, an
 // unparseable provider, and a run with FI_LOG_LEVEL=debug so that libfabric's own diagnostics
@@ -145,7 +145,7 @@ func TestFatalLinesAreErrors(t *testing.T) {
 func TestParseStripsColour(t *testing.T) {
 	t.Parallel()
 
-	// Captured from `script -qec 'mxl-fabrics-proxy-worker config.json' /dev/null`.
+	// Captured from `script -qec 'mxl-replicator-worker config.json' /dev/null`.
 	line := "[2026-08-27 22:47:02.694] [\x1b[31m\x1b[1merror\x1b[m] fatal: missing required field: metrics_socket\r"
 
 	record, ok := Parse(line)

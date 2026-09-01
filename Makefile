@@ -68,3 +68,23 @@ image-efa:
 .PHONY: image-test
 image-test:
 	docker build --target test --build-arg VERSION=$(VERSION) -t $(IMAGE):test .
+
+# The Helm chart. `chart-lint` renders every example as well as the defaults, because most of what
+# can break in this chart is a values combination rather than a template — the storage type, the
+# EFA switch and the pool merge each take a different path through the same files.
+CHART ?= deployment/mxl-replicator
+
+.PHONY: chart-lint
+chart-lint:
+	helm lint $(CHART) --set server.persistence.node=lint
+	for values in $(CHART)/examples/*.yaml; do \
+		helm lint $(CHART) -f $$values || exit 1; \
+	done
+
+.PHONY: chart-template
+chart-template:
+	helm template mxl-replicator $(CHART) --set server.persistence.node=example
+
+.PHONY: chart-package
+chart-package:
+	helm package $(CHART) -d build

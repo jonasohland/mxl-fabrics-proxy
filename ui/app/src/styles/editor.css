@@ -1,0 +1,317 @@
+/* The two editors' chrome, shared and deliberately global.
+ *
+ * `ui.md` §7a's source and destination editors are one idiom in two shapes — a panel over the grid,
+ * a stack of fields, a list of things to pick from, a preview of what the click will create — so the
+ * chrome lives once rather than twice. A component's `<style scoped>` cannot be shared, and copying
+ * it into both is how the two drift apart.
+ *
+ * **Every class here is prefixed `ed-`, and that is the point.** A scoped stylesheet scopes a
+ * *component*, not the class names inside it, and this app has already paid for that once: a line
+ * class named `head` inherited `flex-wrap: wrap` from the page header's own `.head` in the same
+ * file, and a hidden `×` wrapped onto a second row and made one column's header a line taller than
+ * its neighbours. A global sheet with a prefix nothing else uses is the honest version of what that
+ * bug was pretending to be.
+ *
+ * The geometry rules the grid lives by do **not** apply here: nothing in a panel shares a height
+ * with a cell, so a list that grows with its content is fine. What does carry over is that a control
+ * which does not apply is rendered and disabled with the reason rather than omitted. */
+
+.ed-scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 20;
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 6vh 16px 16px;
+  background: rgb(0 0 0 / 55%);
+  overflow: auto;
+}
+
+.ed-panel {
+  width: min(720px, 100%);
+  max-height: 88vh;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-raised);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  box-shadow: 0 12px 40px rgb(0 0 0 / 45%);
+}
+
+.ed-head {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 8px 14px;
+  border-bottom: 1px solid var(--line);
+}
+
+.ed-head h2 {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.ed-body {
+  padding: 10px 14px;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.ed-foot {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 14px;
+  border-top: 1px solid var(--line);
+}
+
+/* A label track wide enough for the longest of them, so the controls line up down the form rather
+   than stepping in and out with the length of the word beside them. */
+.ed-field {
+  display: grid;
+  grid-template-columns: 11ch 1fr;
+  align-items: center;
+  gap: 10px;
+}
+
+.ed-label { color: var(--fg-dim); font-size: 12px; }
+
+.ed-field select,
+.ed-field input {
+  background: var(--bg-sunken);
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  color: var(--fg);
+  font: inherit;
+  font-size: 12px;
+  padding: 3px 6px;
+  min-width: 0;
+}
+
+.ed-field select:disabled, .ed-field input:disabled { color: var(--fg-faint); }
+
+/* Faint enough to read as an example rather than as a value: a placeholder spelling a plausible
+   domain name at full contrast looks exactly like a field that has already been filled in. */
+.ed-field input::placeholder { color: var(--fg-faint); }
+.ed-field select:focus-visible, .ed-field input:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: -1px;
+}
+
+/* A step of the source editor: a heading, then the things to pick from. */
+.ed-step { display: flex; flex-direction: column; gap: 5px; }
+
+.ed-step-head {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--fg-dim);
+}
+
+/* The radio groups: which kind of domain selector, and how much of a group to take. Each one is a
+   tagged union on the wire, so it is a choice of exactly one and never two fields both submitted. */
+/* Undoing the heading's own casing: these sit inside `.ed-step-head` to save a line, but they are
+   values rather than a heading — `SELECT FLOWS` reads as another section. */
+.ed-modes {
+  display: flex;
+  gap: 14px;
+  align-items: baseline;
+  text-transform: none;
+  letter-spacing: normal;
+}
+
+.ed-mode {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 5px;
+  font-size: 12px;
+  color: var(--fg);
+  cursor: pointer;
+}
+
+/* Shown and declined rather than omitted, with the reason in the title: `all: true` has no
+   sub-modes, and a flow carrying no group hint has no name for a group selector to match. */
+.ed-mode.off { color: var(--fg-faint); cursor: not-allowed; }
+
+.ed-list {
+  border: 1px solid var(--line-soft);
+  border-radius: 3px;
+  background: var(--bg-sunken);
+  max-height: 26vh;
+  overflow: auto;
+}
+
+.ed-item {
+  display: grid;
+  grid-template-columns: 1.5ch 1fr auto auto;
+  gap: 10px;
+  align-items: baseline;
+  width: 100%;
+  background: none;
+  border: 0;
+  border-bottom: 1px solid var(--line-soft);
+  color: var(--fg);
+  cursor: pointer;
+  font: inherit;
+  font-size: 12px;
+  padding: 3px 8px;
+  text-align: left;
+}
+
+.ed-item:last-child { border-bottom: 0; }
+.ed-item:hover { background: var(--bg-raised); }
+.ed-item:focus-visible { outline: 1px solid var(--accent); outline-offset: -1px; }
+.ed-item.on { background: color-mix(in srgb, var(--accent) 12%, var(--bg-sunken)); }
+
+.ed-item .ed-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ed-item .ed-meta { color: var(--fg-dim); }
+.ed-item .ed-count { color: var(--fg-faint); font-variant-numeric: tabular-nums; }
+
+/* Producing, as observed. A flow nobody is producing is not an error — it is the PAUSED case
+   arriving before the path exists — so it is a dot rather than a warning. */
+.ed-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--fg-faint);
+  align-self: center;
+}
+
+.ed-dot.on { background: var(--s-active); }
+.ed-check { color: var(--accent); }
+
+/* A domain row: the pick, and the one mutation this panel offers on it.
+ *
+ * The label control is a **sibling** of the row's button and never a child — a `<button>` inside a
+ * `<button>` is invalid, and the inner click would pick the domain on its way to labelling it. The
+ * same trap the cell's `×` paid for, arriving in a list instead of a grid. */
+.ed-row {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  align-items: baseline;
+  border-bottom: 1px solid var(--line-soft);
+}
+
+.ed-row:last-child { border-bottom: 0; }
+.ed-row > .ed-item { border-bottom: 0; }
+
+.ed-tag {
+  background: none;
+  border: 0;
+  color: var(--fg-faint);
+  cursor: pointer;
+  font: inherit;
+  font-size: 11px;
+  padding: 3px 8px;
+}
+
+.ed-tag:hover { color: var(--accent); }
+
+/* The labels a domain already carries, on its row. Bounded rather than allowed to push the counts
+   out of line, with the whole set in the title — the row's geometry is what makes the list
+   readable, and a long label set is exactly what would break it. */
+.ed-labels {
+  color: var(--fg-dim);
+  max-width: 28ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* One label being edited. The value track is the wide one: keys are short by grammar, values are
+   what an operator actually types. */
+.ed-pair {
+  display: grid;
+  grid-template-columns: 18ch 1fr auto;
+  gap: 8px;
+  align-items: baseline;
+  padding: 3px 8px;
+  border-bottom: 1px solid var(--line-soft);
+}
+
+.ed-pair:last-child { border-bottom: 0; }
+
+.ed-pair input {
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  color: var(--fg);
+  font: inherit;
+  font-size: 12px;
+  padding: 2px 5px;
+  min-width: 0;
+}
+
+.ed-pair input::placeholder { color: var(--fg-faint); }
+.ed-pair input:disabled { color: var(--fg-faint); background: var(--bg-sunken); }
+.ed-pair input:focus-visible { outline: 1px solid var(--accent); outline-offset: -1px; }
+
+/* Struck through rather than removed from the list: what is going is a fact about the write, and a
+   row that vanished would take the way back with it. */
+.ed-pair.removed input { text-decoration: line-through; color: var(--s-failed); }
+.ed-pair.added input:first-child { border-color: var(--s-new); }
+
+.ed-more { display: flex; align-items: baseline; gap: 10px; }
+
+/* A path this write moves — read off the server's own `stopped[]` / `started[]`. */
+.ed-path {
+  display: grid;
+  grid-template-columns: 5ch 1fr auto auto;
+  gap: 10px;
+  align-items: baseline;
+  font-size: 12px;
+  padding: 3px 8px;
+  border-bottom: 1px solid var(--line-soft);
+}
+
+.ed-path:last-child { border-bottom: 0; }
+.ed-path .ed-verb { color: var(--s-new); }
+.ed-path.going .ed-verb { color: var(--s-failed); }
+.ed-path .ed-edge { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ed-path .ed-state { font-size: 11px; letter-spacing: 0.04em; }
+.ed-path .ed-holders { color: var(--fg-faint); }
+
+.ed-empty { color: var(--fg-dim); font-size: 12px; padding: 6px 8px; }
+
+.ed-note { color: var(--fg-dim); font-size: 12px; margin: 0; }
+.ed-note b { color: var(--fg); font-weight: 600; }
+.ed-fail { color: var(--s-invalid); font-size: 12px; margin: 0; }
+.ed-resolved { margin: 0; font-size: 12px; display: flex; gap: 10px; align-items: baseline; }
+
+.ed-act {
+  background: none;
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  color: var(--fg-dim);
+  cursor: pointer;
+  font: inherit;
+  font-size: 12px;
+  padding: 2px 12px;
+}
+
+.ed-act:hover:not(:disabled) { color: var(--fg); border-color: var(--fg-dim); }
+.ed-act:disabled { color: var(--fg-faint); border-color: var(--line-soft); cursor: not-allowed; }
+
+/* The commit button is the pending bar's colour, because that is where what it creates goes: it
+   stages, and nothing this panel does is written until Apply. */
+.ed-go { border-color: var(--pending); color: var(--pending); }
+.ed-go:hover:not(:disabled) { background: var(--pending); color: var(--bg); border-color: var(--pending); }
+
+.ed-x {
+  background: none;
+  border: 0;
+  color: var(--fg-faint);
+  cursor: pointer;
+  font: inherit;
+  line-height: 1;
+  padding: 0 3px;
+}
+
+.ed-x:hover { color: var(--fg); }

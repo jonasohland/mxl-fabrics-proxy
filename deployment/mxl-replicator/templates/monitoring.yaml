@@ -1,0 +1,74 @@
+{{- if and .Values.server.enabled .Values.metrics.serviceMonitor.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "mxl-replicator.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "mxl-replicator.labels" . | nindent 4 }}
+    app.kubernetes.io/component: server
+    {{- with .Values.metrics.serviceMonitor.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "mxl-replicator.selectorLabels" (dict "root" . "component" "server") | nindent 6 }}
+  namespaceSelector:
+    matchNames: [{{ .Release.Namespace }}]
+  endpoints:
+    - port: http
+      path: /metrics
+      scheme: {{ ternary "https" "http" .Values.server.tls.enabled }}
+      interval: {{ .Values.metrics.serviceMonitor.interval }}
+      scrapeTimeout: {{ .Values.metrics.serviceMonitor.scrapeTimeout }}
+      {{- with .Values.metrics.serviceMonitor.relabelings }}
+      relabelings:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.metrics.serviceMonitor.metricRelabelings }}
+      metricRelabelings:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}
+{{- if and .Values.agent.enabled .Values.metrics.podMonitor.enabled }}
+{{- /*
+The agents have no Service — hostNetwork with a hostPort is how a node's metrics are reachable —
+so they are scraped as pods. Worker metrics are gathered on demand inside the request, through a
+bounded pool with per-worker and overall deadlines, so a generous scrapeTimeout is not wasted.
+*/}}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: {{ printf "%s-agent" (include "mxl-replicator.fullname" .) }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "mxl-replicator.labels" . | nindent 4 }}
+    app.kubernetes.io/component: agent
+    {{- with .Values.metrics.podMonitor.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "mxl-replicator.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+    matchExpressions:
+      # Every agent pool by name, rather than "not the server": the release also holds a test pod,
+      # and a scrape job that picks it up reports a target down for as long as it exists.
+      - key: app.kubernetes.io/component
+        operator: In
+        {{- if .Values.agent.pools }}
+        values: [{{ range $i, $pool := .Values.agent.pools }}{{ if $i }}, {{ end }}agent-{{ $pool.name }}{{ end }}]
+        {{- else }}
+        values: [agent]
+        {{- end }}
+  namespaceSelector:
+    matchNames: [{{ .Release.Namespace }}]
+  podMetricsEndpoints:
+    - port: http
+      path: /metrics
+      interval: {{ .Values.metrics.podMonitor.interval }}
+      scrapeTimeout: {{ .Values.metrics.podMonitor.scrapeTimeout }}
+{{- end }}

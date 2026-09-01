@@ -70,7 +70,7 @@ type AgentOptions struct {
 	//
 	// sep:"none" because the value's own separator is a comma: kong would otherwise split
 	// `provider=verbs,fabric=ib-a` into two flag values, each of which is half an attachment.
-	Fabric []string `help:"Declare a fabric attachment, e.g. --agent-fabric provider=verbs,fabric=ib-a,interface=ib0. Repeatable. Selectors: address, interface, device, or none when the node has exactly one of that provider." sep:"none"`
+	Fabric []string `help:"Declare a fabric attachment, e.g. --agent-fabric provider=verbs,fabric=ib-a,interface=ib0. Repeatable. Naming selectors: address, interface, device, or none when the node has exactly one of that provider; narrowed by network=10.1.0.0/16 and ip_version=4|6, which combine with a name and with each other." sep:"none"`
 
 	// The other answer to "this node configured no attachments", and a better one than shm
 	// wherever a fleet is flat enough for the question not to have an operator (§10.1).
@@ -111,7 +111,7 @@ type AgentOptions struct {
 	StartRate  float64 `help:"Workers this node may start per second. 0 means no limit." default:"0.5"`
 	StartBurst int     `help:"How many workers may start at once before --agent-start-rate applies." default:"2"`
 
-	WorkerBinary string `help:"Path to the data-plane worker binary." default:"mxl-fabrics-proxy-worker" env:"MXL_REPLICATOR_WORKER_BINARY"`
+	WorkerBinary string `help:"Path to the data-plane worker binary." default:"mxl-replicator-worker" env:"MXL_REPLICATOR_WORKER_BINARY"`
 	// Fresh directory per worker *start* (not per logical worker): the worker does not
 	// unlink a pre-existing metrics socket before binding, so a leftover file from a
 	// SIGKILL is a fatal EADDRINUSE (WRS §6). Stale directories are swept at startup.

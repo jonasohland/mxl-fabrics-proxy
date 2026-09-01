@@ -36,6 +36,46 @@ void connectLoop(Initiator &initiator, utils::ExitSignal sig,
   }
 }
 
+/// How long the source flow may go without a grain before the initiator gives
+/// up the latency-measurement writer it co-holds on that flow.
+///
+/// The writer exists only to stamp a tx timestamp into each grain header
+/// (§12), and it takes a *shared* flock on the flow's data and grain files for
+/// as long as it is open. That lock is what stops the flow's real owner from
+/// cleaning up: `mxl::lib::Instance::releaseWriter` deletes the flow directory
+/// only if it can upgrade to an exclusive lock, so a target worker shutting
+/// down while some initiator still reads its flow leaves the directory behind.
+/// The orphan is still discovered by the destination node's inventory, so a
+/// request selecting that domain keeps matching it and its path sits in PAUSED
+/// forever — and the worker holding the lock is the very one that path is
+/// running, which is what makes it self-sustaining rather than transient.
+///
+/// Dropping the writer while nothing is flowing breaks that. Release is
+/// deliberately routed through the ordinary MXL path rather than any cleanup
+/// of our own: the release either finds another writer holding the flow — an
+/// ordinary pause, the owner is alive, nothing is deleted — or finds itself
+/// alone, which is MXL's own definition of an orphan and exactly the criterion
+/// `mxlGarbageCollectFlows` applies. This is not new authority in kind. The
+/// same destructor already deletes the orphan when the session is torn down
+/// for a long-idle source; this only stops that from being the *first*
+/// opportunity, which the server takes minutes to reach (§11.1).
+///
+/// It does widen the window, and the consequence is worth naming: a source
+/// flow whose producer exits while an initiator is attached is now removed a
+/// second later rather than at worker exit — including in an area granted
+/// `read` only (§10.6, §13). The grant is not the thing that permits it; the
+/// writer this initiator has held all along is, and that writer is the actual
+/// defect. Closing it properly means the initiator never co-writing a flow it
+/// does not own, which needs either a reader-side way to stamp the timestamp
+/// or the server declining precise latency measurement over a replicated
+/// source. Until one of those lands, this is the containment.
+///
+/// One second, because it needs to outlast a producer hiccup and nothing else.
+/// It is not a knob: the resume path reopens the writer on the next grain and
+/// stamps it in the same iteration, so no grain loses its timestamp and there
+/// is no behaviour here for an operator to tune (WRS §3).
+constexpr auto LATENCY_WRITER_GRACE = std::chrono::seconds{1};
+
 } // namespace
 void Initiator::run(Config config, utils::ExitSignal sig) {
   Initiator{std::move(config)}.run(sig);
@@ -53,17 +93,15 @@ void Initiator::run(utils::ExitSignal sig) {
   auto flowVariant = _mxl.openFlow(_config.flowId);
   if (std::holds_alternative<::mxl::DiscreteFlowReader>(flowVariant)) {
     auto reader = std::get<::mxl::DiscreteFlowReader>(std::move(flowVariant));
-    std::optional<::mxl::DiscreteFlowWriter> writer = std::nullopt;
-    if (measurePreciseNetworkLatency()) {
-      writer.emplace(openWriter(reader));
-    }
+    // The latency writer is opened by the transfer loop against the first
+    // grain it reads, not here: holding it across a pause is what strands the
+    // flow (see LATENCY_WRITER_GRACE).
     auto initiator = createInitiator(reader);
     auto targetInfo = ::mxl::fabrics::TargetInfo::parse(_config.targetInfo);
     initiator.addTarget(targetInfo);
     connect(initiator, sig);
     auto _ = ScopedRTScheduling{_config.schedPrio};
-    transferGrains(std::move(reader), std::move(writer), std::move(initiator),
-                   sig);
+    transferGrains(std::move(reader), std::move(initiator), sig);
   } else {
     auto reader = std::get<::mxl::ContinuousFlowReader>(std::move(flowVariant));
     auto initiator = createInitiator(reader);
@@ -117,11 +155,13 @@ void Initiator::connect(::mxl::fabrics::ContinuousFlowInitiator &initiator,
 }
 
 void Initiator::transferGrains(::mxl::DiscreteFlowReader reader,
-                               std::optional<::mxl::DiscreteFlowWriter> writer,
                                ::mxl::fabrics::DiscreteFlowInitiator initiator,
                                utils::ExitSignal sig) {
   std::uint64_t index = 0;
   auto lastSuccessfullGrainRead = std::chrono::steady_clock::now();
+  // Held only while grains are flowing, and reopened on the next one. See
+  // LATENCY_WRITER_GRACE for why it may not outlive the grains.
+  std::optional<::mxl::DiscreteFlowWriter> writer = std::nullopt;
   for (;;) {
     try {
       if (sig.shouldExit()) {
@@ -132,6 +172,12 @@ void Initiator::transferGrains(::mxl::DiscreteFlowReader reader,
       lastSuccessfullGrainRead = std::chrono::steady_clock::now();
       auto rxTime = ::mxlGetTime();
       if (measurePreciseNetworkLatency()) {
+        // Reopened before the stamp rather than after it, so the grain that
+        // ends a pause carries a timestamp like any other. `createFlow` is
+        // create-or-open, so this attaches to the existing flow.
+        if (!writer) {
+          writer.emplace(openWriter(reader));
+        }
         auto writeAccess = writer->openGrain(index);
         writeAccess.writeTxTimestamp(::mxlGetTime());
         writeAccess.cancel();
@@ -176,6 +222,20 @@ void Initiator::transferGrains(::mxl::DiscreteFlowReader reader,
     } catch (::mxl::Exception const &ex) {
       auto timeSinceLastGrainRead =
           std::chrono::steady_clock::now() - lastSuccessfullGrainRead;
+
+      // Nothing is flowing, so the tx timestamp has nothing to stamp and the
+      // lock the writer holds is pure cost. Releasing it here is what lets a
+      // withdrawn target worker's flow be cleaned up rather than stranded
+      // (LATENCY_WRITER_GRACE). Ahead of the idle-timeout check only for
+      // tidiness: that path throws and unwinds the writer anyway.
+      if (writer && (timeSinceLastGrainRead > LATENCY_WRITER_GRACE)) {
+        spdlog::debug("releasing the latency writer after {}ms without a grain",
+                      std::chrono::duration_cast<std::chrono::milliseconds>(
+                          timeSinceLastGrainRead)
+                          .count());
+        writer.reset();
+      }
+
       if (_config.idleTimeout &&
           (timeSinceLastGrainRead > *_config.idleTimeout)) {
         throw Exception{MXL_ERR_TIMEOUT,

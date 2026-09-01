@@ -1771,3 +1771,113 @@ func TestALabelReportsWhatItWouldStart(t *testing.T) {
 	assert.Equal(t, []string{"default/wide"}, planned.Started[0].Requests)
 	assert.Empty(t, planned.Stopped)
 }
+
+// --- parking a leg (§9.1, §11) -------------------------------------------------------------
+
+// The write path end to end: park the only destination of a live request and its path goes, the
+// request reports DISABLED, and the entry is still in the spec that comes back.
+//
+// This is the whole of the feature from an API client's side — one boolean, one POST, no new
+// endpoint and no new verb.
+func TestParkingADestinationStopsItsPathAndKeepsTheSpec(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	h.fleet()
+
+	spec := flowRequestSpec("cam1")
+	require.Equal(t, http.StatusCreated, h.do(http.MethodPost, defaultRequests, spec).status)
+
+	var live api.Request
+	h.do(http.MethodGet, defaultRequests+"/cam1", nil).decode(t, &live)
+	require.NotEmpty(t, live.Status.Paths, "the request is carrying a path before it is parked")
+
+	spec.Destinations[0].Disabled = true
+	parked := h.do(http.MethodPost, defaultRequests, spec)
+	require.Equal(t, http.StatusOK, parked.status)
+	assert.Equal(t, api.OutcomeUpdated, parked.header.Get(api.HeaderOutcome),
+		"flipping the flag is an ordinary spec edit")
+
+	var got api.Request
+	h.do(http.MethodGet, defaultRequests+"/cam1", nil).decode(t, &got)
+	assert.Equal(t, api.StateDisabled, got.Status.State)
+	assert.Equal(t, api.ReasonAllDestinationsDisabled, got.Status.ReasonCode)
+	assert.Empty(t, got.Status.Paths, "a parked destination is not a pairing")
+
+	// Not a soft delete: the request is still there, still named, and still carries the entry that
+	// would come back.
+	require.Len(t, got.Destinations, 1)
+	assert.True(t, got.Destinations[0].Disabled)
+	assert.Equal(t, "fast/ingest", got.Destinations[0].DomainName())
+
+	// And un-parking is the same edit in reverse, with the path back.
+	spec.Destinations[0].Disabled = false
+	require.Equal(t, http.StatusOK, h.do(http.MethodPost, defaultRequests, spec).status)
+	h.do(http.MethodGet, defaultRequests+"/cam1", nil).decode(t, &got)
+	assert.NotEqual(t, api.StateDisabled, got.Status.State)
+	assert.NotEmpty(t, got.Status.Paths)
+}
+
+// **An apply that omits the flag enables the leg** (§9.1). The file is authoritative over the
+// requests it names, so a leg parked through the API comes back the next time somebody applies the
+// file that names its request.
+//
+// It falls out of create-or-update rather than needing code, which is exactly why it is pinned here:
+// it is the single most surprising thing about the feature, and nothing would fail if it silently
+// changed.
+func TestAnApplyThatOmitsTheFlagEnablesTheLeg(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	h.fleet()
+
+	parked := flowRequestSpec("cam1")
+	parked.Destinations[0].Disabled = true
+	require.Equal(t, http.StatusCreated, h.do(http.MethodPost, defaultRequests, parked).status)
+
+	var before api.Request
+	h.do(http.MethodGet, defaultRequests+"/cam1", nil).decode(t, &before)
+	require.Equal(t, api.StateDisabled, before.Status.State)
+
+	// The same request as a manifest would send it: no `disabled` key at all.
+	resp := h.do(http.MethodPost, defaultRequests, flowRequestSpec("cam1"))
+	require.Equal(t, http.StatusOK, resp.status)
+	assert.Equal(t, api.OutcomeUpdated, resp.header.Get(api.HeaderOutcome))
+
+	// A *fresh* target, and it matters: `disabled` is `omitempty`, so decoding a re-enabled request
+	// over a struct that still holds the parked one leaves the old `true` in place — encoding/json
+	// unmarshals into the existing slice elements rather than replacing them. A polling client that
+	// reuses its decode target will show a leg as parked forever after it comes back.
+	var after api.Request
+	h.do(http.MethodGet, defaultRequests+"/cam1", nil).decode(t, &after)
+	assert.False(t, after.Destinations[0].Disabled, "an omitted flag is a false flag, and the file wins")
+	assert.NotEqual(t, api.StateDisabled, after.Status.State)
+	assert.NotEmpty(t, after.Status.Paths)
+}
+
+// A dry run previews the parking before it happens, which is what makes the click safe: parking
+// stops media, so it carries a cancellation's blast radius and must be previewable like one.
+func TestParkingIsPreviewableWithADryRun(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	h.fleet()
+
+	spec := flowRequestSpec("cam1")
+	require.Equal(t, http.StatusCreated, h.do(http.MethodPost, defaultRequests, spec).status)
+
+	spec.Destinations[0].Disabled = true
+	preview := h.do(http.MethodPost, defaultRequests+"?dry_run=true", spec)
+	require.Equal(t, http.StatusOK, preview.status)
+
+	var previewed api.Request
+	preview.decode(t, &previewed)
+	assert.Equal(t, api.StateDisabled, previewed.Status.State)
+	assert.Empty(t, previewed.Status.Paths)
+
+	// And nothing was written: the live request is still carrying its path.
+	var live api.Request
+	h.do(http.MethodGet, defaultRequests+"/cam1", nil).decode(t, &live)
+	assert.NotEqual(t, api.StateDisabled, live.Status.State)
+	assert.NotEmpty(t, live.Status.Paths)
+}

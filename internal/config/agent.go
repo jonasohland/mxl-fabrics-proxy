@@ -26,6 +26,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -69,7 +70,7 @@ type Agent struct {
 	Areas []api.Area `yaml:"areas"`
 
 	// Fabrics is what this node can be reached on (§10.1). Each entry is a (provider, fabric)
-	// pair plus at most one selector; the join against the worker's probe is [probe.Join].
+	// pair plus its selectors; the join against the worker's probe is [probe.Join].
 	Fabrics []probe.Attachment `yaml:"fabrics"`
 }
 
@@ -212,6 +213,8 @@ func cutLast(s, sep string) (before, after string, found bool) {
 // ParseFabric reads an attachment from a compact `key=value,key=value` flag value:
 //
 //	provider=tcp,fabric=dc1-data,interface=eth1
+//	provider=tcp,fabric=dc1-data,network=10.1.0.0/16
+//	provider=verbs,fabric=ib-a,device=mlx5_0,ip_version=4
 //	provider=efa,fabric=vpc1-subnet-a
 //	provider=shm
 //
@@ -246,8 +249,16 @@ func ParseFabric(value string) (probe.Attachment, error) {
 			attachment.Interface = val
 		case "device":
 			attachment.Device = val
+		case "network":
+			attachment.Network = val
+		case "ip_version":
+			version, err := strconv.Atoi(val)
+			if err != nil {
+				return probe.Attachment{}, fmt.Errorf("fabric %q: ip_version %q is not a number", value, val)
+			}
+			attachment.IPVersion = version
 		default:
-			return probe.Attachment{}, fmt.Errorf("fabric %q: unknown key %q (want provider, fabric, address, interface or device)", value, key)
+			return probe.Attachment{}, fmt.Errorf("fabric %q: unknown key %q (want provider, fabric, address, interface, device, network or ip_version)", value, key)
 		}
 	}
 

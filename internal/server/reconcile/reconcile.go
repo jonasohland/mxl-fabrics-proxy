@@ -40,6 +40,7 @@ import (
 	"slices"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/jonasohland/mxl-replicator/internal/api"
@@ -426,6 +427,15 @@ func Compute(fleet *state.Fleet, cfg Config) *Result {
 
 		for srcIndex, src := range record.Spec.Sources {
 			for dstIndex, dst := range record.Spec.Destinations {
+				// **A parked destination is not a pairing** (§7.2, §9.1). It produces no leg, so it
+				// is validated against nothing, expands to nothing and carries no session — which is
+				// the whole of the behaviour, and it is deliberately here rather than deeper: past
+				// this point a leg is a thing the fleet is being asked for, and a parked one is not
+				// being asked for at all. Its codes are reported when it is enabled, and
+				// `?dry_run=true` is how an operator finds out before flipping it.
+				if dst.Disabled {
+					continue
+				}
 				// *The resolved output root used to be written back onto the destination here*, so
 				// that a shadow path carried the same identity a real one would. A destination's
 				// identity is complete the moment the request is read now — the area is the first
@@ -1397,8 +1407,23 @@ func (b *builder) assign(plan *pathPlan, record state.SessionRecord, flow api.Fl
 }
 
 // carryForward copies a frozen session's existing assignments through untouched.
+//
+// **The two ends may be one node**, and the loop below reads every assignment that node holds for
+// the session rather than the one belonging to this end — so visiting it twice copies both roles
+// twice. Each reconcile pass reads back what the last one wrote, so that is not an off-by-one but
+// a doubling: 2^n after n passes, and a same-node session left running for a couple of minutes
+// grows the assignment document into the hundreds of megabytes and takes the server out with it.
+//
+// Deduplicating here rather than in [builder.append] on purpose: append is also the path a fresh
+// plan takes, where a node legitimately receives two assignments for one session — the target and
+// the initiator of a loopback — and a dedup there could not tell the two cases apart.
 func (b *builder) carryForward(record state.SessionRecord) {
-	for _, node := range []string{record.Path.Source.Node, record.Path.Destination.Node} {
+	nodes := []string{record.Path.Source.Node}
+	if record.Path.Destination.Node != record.Path.Source.Node {
+		nodes = append(nodes, record.Path.Destination.Node)
+	}
+
+	for _, node := range nodes {
 		entry, ok := b.fleet.Assignments[node]
 		if !ok {
 			continue
@@ -1553,6 +1578,20 @@ func fold(
 	var worst verdict
 
 	switch {
+	case !api.AnyEnabled(destinations):
+		// **Everything is parked, so this is asking for nothing** (§9.1, §11). First in the switch
+		// rather than last: with no enabled destination there are no legs to have failed and no
+		// paths to fold, so every branch below would reach the empty-set case and call it WAITING —
+		// which claims a flow is missing and that this resolves by itself, and both are false.
+		//
+		// It applies to a source row as well as to the request, because a row of a fully parked
+		// request is dark for this reason and not for one of its own.
+		worst = verdict{
+			state:  api.StateDisabled,
+			reason: disabledReason(destinations),
+			code:   api.ReasonAllDestinationsDisabled,
+		}
+
 	case whole != nil:
 		worst = verdict{state: api.StateInvalid, reason: whole.Message, code: whole.Code}
 
@@ -1611,6 +1650,32 @@ func fold(
 		}
 	}
 	return worst
+}
+
+// disabledReason says which legs are parked, which is the one thing an operator reading DISABLED
+// still has to be told (§9.1).
+//
+// The state already says the request is off; what it does not say is *what would come back*, and for
+// anything past one destination that is the question — a request parked in June is read in September
+// by somebody deciding whether to switch it on. Named rather than counted for that reason, and capped
+// so a twelve-destination request does not put a paragraph in a status column.
+func disabledReason(destinations []api.Destination) string {
+	const limit = 3
+
+	names := make([]string, 0, len(destinations))
+	for _, dst := range destinations {
+		names = append(names, dst.Endpoint())
+	}
+
+	switch {
+	case len(names) == 1:
+		return "disabled: " + names[0]
+	case len(names) > limit:
+		return fmt.Sprintf("disabled: %s and %d more",
+			strings.Join(names[:limit], ", "), len(names)-limit)
+	default:
+		return "disabled: " + strings.Join(names, ", ")
+	}
 }
 
 // noPaths explains an empty path set, which is a legitimate steady state and not a failure.

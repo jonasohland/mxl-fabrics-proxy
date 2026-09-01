@@ -1,0 +1,323 @@
+{{- if .Values.server.enabled }}
+{{- $p := .Values.server.persistence }}
+{{- $sqlite := eq .Values.server.store.backend "sqlite" }}
+{{- $store := and $sqlite $p.enabled }}
+{{- $claim := and $store (has $p.type (list "local" "storageClass" "existingClaim")) }}
+{{- $pinned := and $store (has $p.type (list "hostPath" "local")) }}
+{{- $etcdTLS := and (eq .Values.server.store.backend "etcd") .Values.server.store.etcd.tls.existingSecret }}
+
+{{- /*
+Both of these are spelled `x == "sqlite"` / `x == "hostPath"` throughout, so a typo would take the
+other branch silently — an etcd-flavoured command line on a `sqllite` backend, or an emptyDir on a
+`hostpath` store, which loses the request set on every restart and looks like it worked.
+*/}}
+{{- if not (has .Values.server.store.backend (list "sqlite" "etcd")) }}
+{{- fail (printf "server.store.backend must be sqlite or etcd, not %q" .Values.server.store.backend) }}
+{{- end }}
+{{- if not (has $p.type (list "hostPath" "local" "existingClaim" "storageClass" "emptyDir")) }}
+{{- fail (printf "server.persistence.type must be one of hostPath, local, existingClaim, storageClass, emptyDir — not %q" $p.type) }}
+{{- end }}
+{{- if and (eq $p.type "existingClaim") (not $p.existingClaim) }}
+{{- fail "server.persistence.type=existingClaim needs server.persistence.existingClaim" }}
+{{- end }}
+{{- if and (eq .Values.server.store.backend "etcd") (not .Values.server.store.etcd.endpoints) }}
+{{- fail "server.store.backend=etcd needs server.store.etcd.endpoints" }}
+{{- end }}
+
+{{- /*
+The control plane.
+
+A Deployment rather than a DaemonSet, and it rolls *before* the agents: the server must tolerate
+agents a version or more behind, agents may assume the server is at least as new, and the server
+refuses an agent newer than itself.
+
+With sqlite this is one replica, one volume, always the leader — a real production shape for a
+single control-plane node. For HA, point `server.store.backend` at etcd and raise the replica
+count; every replica then serves the API and one of them is elected reconciler leader.
+*/}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ printf "%s-server" (include "mxl-replicator.fullname" .) }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "mxl-replicator.labels" . | nindent 4 }}
+    app.kubernetes.io/component: server
+  {{- with .Values.commonAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- if $sqlite }}
+  # One. The sqlite backend is single-node; etcd is required for more.
+  replicas: 1
+  strategy:
+    # The volume has one writer and so does sqlite: the old pod must be gone before the new one
+    # starts. A server restart does not glitch media — the settling window and deterministic
+    # session IDs mean the new process adopts running sessions rather than re-establishing them —
+    # so there is nothing to gain from overlapping them.
+    type: Recreate
+  {{- else }}
+  replicas: {{ .Values.server.replicas }}
+  strategy:
+    type: RollingUpdate
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "mxl-replicator.selectorLabels" (dict "root" . "component" "server") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "mxl-replicator.labels" . | nindent 8 }}
+        app.kubernetes.io/component: server
+        {{- with .Values.server.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        {{- if .Values.metrics.annotations }}
+        prometheus.io/scrape: "true"
+        prometheus.io/port: {{ .Values.server.listenPort | quote }}
+        prometheus.io/path: /metrics
+        {{- end }}
+        {{- with .Values.commonAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+        {{- with .Values.server.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "mxl-replicator.serviceAccountName" . }}
+      {{- include "mxl-replicator.imagePullSecrets" . | nindent 6 }}
+      terminationGracePeriodSeconds: {{ .Values.server.terminationGracePeriodSeconds }}
+      {{- with .Values.server.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      {{- with .Values.server.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if or $pinned .Values.server.nodeSelector }}
+      nodeSelector:
+        {{- if $pinned }}
+        # The store is a directory on this node's disk, so the server goes back to it every time.
+        {{ $p.nodeLabel }}: {{ $p.node | quote }}
+        {{- end }}
+        {{- with .Values.server.nodeSelector }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- end }}
+      {{- with .Values.server.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.server.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.server.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if or $sqlite .Values.server.tls.enabled $etcdTLS .Values.server.extraVolumes }}
+      volumes:
+        {{- if $store }}
+        - name: store
+          {{- if eq $p.type "hostPath" }}
+          hostPath:
+            path: {{ $p.hostPath }}
+            type: DirectoryOrCreate
+          {{- else if $claim }}
+          persistentVolumeClaim:
+            claimName: {{ include "mxl-replicator.storeClaimName" . }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+        {{- else if $sqlite }}
+        - name: store
+          # persistence is off: the request set does not survive a restart.
+          emptyDir: {}
+        {{- end }}
+        {{- if .Values.server.tls.enabled }}
+        - name: tls
+          secret:
+            secretName: {{ required "server.tls.enabled needs server.tls.existingSecret" .Values.server.tls.existingSecret }}
+        {{- end }}
+        {{- if $etcdTLS }}
+        - name: etcd-tls
+          secret:
+            secretName: {{ .Values.server.store.etcd.tls.existingSecret }}
+        {{- end }}
+        {{- with .Values.server.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- end }}
+      {{- if and $store $p.initChown.enabled (ne $p.type "emptyDir") }}
+      initContainers:
+        # The image runs as a non-root user; a directory kubelet just created is owned by root,
+        # and hostPath volumes get no fsGroup treatment from Kubernetes. The uid is resolved
+        # inside the image rather than hardcoded here, so it follows the image.
+        - name: init-store
+          image: {{ include "mxl-replicator.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: [/bin/sh, -c]
+          args:
+            - |
+              set -eu
+              chown -R "$(id -u {{ $p.initChown.user }}):$(id -g {{ $p.initChown.user }})" {{ $p.mountPath }}
+          securityContext:
+            runAsUser: 0
+            runAsGroup: 0
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+              add: [CHOWN]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+          volumeMounts:
+            - name: store
+              mountPath: {{ $p.mountPath }}
+      {{- end }}
+      containers:
+        - name: server
+          image: {{ include "mxl-replicator.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - run
+            - --server
+            - --server-listen
+            - {{ printf "0.0.0.0:%v" .Values.server.listenPort | quote }}
+            - --server-store-backend
+            - {{ .Values.server.store.backend | quote }}
+            {{- if $sqlite }}
+            - --server-store-sqlite-path
+            - {{ .Values.server.store.sqlite.path | quote }}
+            {{- else }}
+            {{- range .Values.server.store.etcd.endpoints }}
+            - --server-store-etcd-endpoints
+            - {{ . | quote }}
+            {{- end }}
+            - --server-store-etcd-prefix
+            - {{ .Values.server.store.etcd.prefix | quote }}
+            {{- if $etcdTLS }}
+            - --server-store-etcd-ca
+            - /etc/mxl-replicator/etcd/ca.crt
+            - --server-store-etcd-cert
+            - /etc/mxl-replicator/etcd/tls.crt
+            - --server-store-etcd-key
+            - /etc/mxl-replicator/etcd/tls.key
+            {{- end }}
+            {{- end }}
+            - --server-heartbeat-interval
+            - {{ .Values.server.heartbeatInterval | quote }}
+            - --server-lease-ttl
+            - {{ .Values.server.leaseTTL | quote }}
+            - --server-settling-heartbeats
+            - {{ .Values.server.settlingHeartbeats | quote }}
+            - --server-max-long-poll-wait
+            - {{ .Values.server.maxLongPollWait | quote }}
+            - --server-provider-order
+            - {{ join "," .Values.server.providerOrder | quote }}
+            - --server-idle-timeout
+            - {{ .Values.server.idleTimeout | quote }}
+            - --server-idle-teardown
+            - {{ .Values.server.idleTeardown | quote }}
+            - --server-connect-timeout
+            - {{ .Values.server.connectTimeout | quote }}
+            - --server-degraded-restarts
+            - {{ .Values.server.degradedRestarts | quote }}
+            - --server-failed-restarts
+            - {{ .Values.server.failedRestarts | quote }}
+            {{- if .Values.server.noNetworkLatencyMeasurement }}
+            - --server-no-network-latency-measurement
+            {{- end }}
+            {{- if .Values.server.tls.enabled }}
+            - --server-tls-cert
+            - /etc/mxl-replicator/tls/tls.crt
+            - --server-tls-key
+            - /etc/mxl-replicator/tls/tls.key
+            {{- end }}
+            {{- with .Values.server.extraArgs }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          env:
+            - name: MXL_REPLICATOR_LOG_LEVEL
+              value: {{ .Values.server.logLevel | quote }}
+            {{- include "mxl-replicator.authEnv" . | nindent 12 }}
+            {{- if eq .Values.server.store.backend "etcd" }}
+            {{- with .Values.server.store.etcd.existingSecret }}
+            - name: MXL_REPLICATOR_ETCD_USERNAME
+              valueFrom:
+                secretKeyRef: {name: {{ . }}, key: username}
+            - name: MXL_REPLICATOR_ETCD_PASSWORD
+              valueFrom:
+                secretKeyRef: {name: {{ . }}, key: password}
+            {{- end }}
+            {{- if and (not .Values.server.store.etcd.existingSecret) .Values.server.store.etcd.username }}
+            - name: MXL_REPLICATOR_ETCD_USERNAME
+              value: {{ .Values.server.store.etcd.username | quote }}
+            - name: MXL_REPLICATOR_ETCD_PASSWORD
+              value: {{ .Values.server.store.etcd.password | quote }}
+            {{- end }}
+            {{- end }}
+            {{- with .Values.server.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.server.listenPort }}
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+              {{- if .Values.server.tls.enabled }}
+              scheme: HTTPS
+              {{- end }}
+            initialDelaySeconds: 2
+            periodSeconds: 5
+            timeoutSeconds: 3
+          livenessProbe:
+            # Deliberately /healthz and not /readyz. Readiness reports whether the reconciler has
+            # settled; restarting the server because it has not yet would be a loop, and a server
+            # that is up but settling is not a failed one.
+            httpGet:
+              path: /healthz
+              port: http
+              {{- if .Values.server.tls.enabled }}
+              scheme: HTTPS
+              {{- end }}
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          {{- with .Values.server.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.server.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- if or $sqlite .Values.server.tls.enabled $etcdTLS .Values.server.extraVolumeMounts }}
+          volumeMounts:
+            {{- if $sqlite }}
+            - name: store
+              mountPath: {{ $p.mountPath }}
+            {{- end }}
+            {{- if .Values.server.tls.enabled }}
+            - name: tls
+              mountPath: /etc/mxl-replicator/tls
+              readOnly: true
+            {{- end }}
+            {{- if $etcdTLS }}
+            - name: etcd-tls
+              mountPath: /etc/mxl-replicator/etcd
+              readOnly: true
+            {{- end }}
+            {{- with .Values.server.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- end }}
+{{- end }}

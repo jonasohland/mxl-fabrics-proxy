@@ -1,0 +1,74 @@
+{{ .Chart.Name }} {{ .Chart.Version }} — release {{ .Release.Name }} in {{ .Release.Namespace }}
+
+Nothing is being replicated yet. This chart provisions the fleet; what it carries is requested
+through the API.
+
+1. Wait for the fleet to come up.
+
+     kubectl -n {{ .Release.Namespace }} rollout status deploy/{{ include "mxl-replicator.fullname" . }}-server
+{{- if .Values.agent.enabled }}
+{{- if .Values.agent.pools }}
+{{- range .Values.agent.pools }}
+     kubectl -n {{ $.Release.Namespace }} rollout status ds/{{ include "mxl-replicator.fullname" $ }}-agent-{{ .name }}
+{{- end }}
+{{- else }}
+     kubectl -n {{ .Release.Namespace }} rollout status ds/{{ include "mxl-replicator.fullname" . }}-agent
+{{- end }}
+{{- end }}
+
+2. Reach the API. The CLI is the same binary as the server, so run it from the pod, or port-forward
+   and point a local `mxl-replicator` at it.
+
+     kubectl -n {{ .Release.Namespace }} exec deploy/{{ include "mxl-replicator.fullname" . }}-server -- \
+         mxl-replicator status --server http://127.0.0.1:{{ .Values.server.listenPort }}
+
+     kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "mxl-replicator.fullname" . }} {{ .Values.server.service.port }}:{{ .Values.server.service.port }}
+{{- if .Values.auth.enabled }}
+     export MXL_REPLICATOR_SERVER=http://127.0.0.1:{{ .Values.server.service.port }}
+     export MXL_REPLICATOR_AUTH_TOKEN=$(kubectl -n {{ .Release.Namespace }} get secret {{ include "mxl-replicator.authSecretName" . }} -o jsonpath='{.data.{{ include "mxl-replicator.authSecretKey" . }}}' | base64 -d)
+{{- else }}
+     export MXL_REPLICATOR_SERVER=http://127.0.0.1:{{ .Values.server.service.port }}
+{{- end }}
+     mxl-replicator status
+
+3. Check that the nodes you expect registered, with the areas and fabrics you configured.
+
+     mxl-replicator get nodes
+     mxl-replicator describe node <name>
+
+4. Apply a manifest.
+
+     mxl-replicator apply -f studio-a.yaml
+     mxl-replicator get requests
+
+{{- if .Values.agent.enabled }}
+{{- range $pool := (default (list (dict)) .Values.agent.pools) }}
+{{- $a := mergeOverwrite (deepCopy (omit $.Values.agent "pools")) (omit $pool "name") }}
+{{- if and (not $a.fabrics) (not $a.detectDefaultFabric) }}
+
+WARNING: agent pool "{{ default "default" (get $pool "name") }}" declares no fabric attachment. It will
+assume `shm`, which only ever pairs with itself — nothing will replicate to another host. Set
+agent.fabrics, or agent.detectDefaultFabric on a flat network.
+{{- end }}
+{{- end }}
+{{- end }}
+
+{{- if not .Values.auth.enabled }}
+
+WARNING: auth.enabled is false. The user API is a fleet-wide bandwidth exhaustion primitive and
+the agent API can claim to be a node and read other nodes' RDMA rkeys. That is a supported
+posture on a trusted network and nowhere else.
+{{- end }}
+
+{{- if and .Values.server.enabled (eq .Values.server.store.backend "sqlite") (or (not .Values.server.persistence.enabled) (eq .Values.server.persistence.type "emptyDir")) }}
+
+WARNING: the store is ephemeral. Every replication request is lost when the server pod is
+replaced. Set server.persistence.enabled and a type other than emptyDir.
+{{- end }}
+
+{{- if and .Values.server.enabled (eq .Values.server.store.backend "sqlite") (has .Values.server.persistence.type (list "hostPath" "local")) }}
+
+The store is on node {{ .Values.server.persistence.node }} at {{ .Values.server.persistence.hostPath }}, and the server is
+pinned there. Draining that node takes the control plane down until it comes back — which does not
+stop running media, but does stop reconciliation. Move to the etcd backend when that matters.
+{{- end }}

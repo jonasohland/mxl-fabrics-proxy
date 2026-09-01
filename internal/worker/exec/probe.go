@@ -104,8 +104,9 @@ type InterfaceCaps struct {
 // This is as close as the API comes to naming a physical interface, and it is **not** a netdev
 // name in general: it is one for tcp (`eth1`, `wlan0`), but the libfabric device name for verbs
 // and efa (`mlx5_0`, `rdmap0s6-rdm`), and shm reports none at all. That is why a configured
-// `ib0` cannot simply be looked up here, and why the join in §10.5 has four selectors rather
-// than a name match.
+// `ib0` cannot simply be looked up here, and why the join in §10.5 has a class of selectors
+// rather than a name match. One device name also covers every address on that device, which is
+// why there is a second class narrowing them.
 func (i Interface) Device() string {
 	if len(i.Attr) == 0 {
 		return ""

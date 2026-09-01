@@ -1,4 +1,4 @@
-# `mxl-fabrics-proxy-worker` — runtime surface
+# `mxl-replicator-worker` — runtime surface
 
 Reference for anyone driving the C++ worker from a new supervisor/replication manager.
 Everything below is the *contract as implemented*, derived from `src/` and from how
@@ -42,7 +42,7 @@ The role and format combination picks one of four code paths in `src/initiator.c
 ## 2. Command line
 
 ```
-mxl-fabrics-proxy-worker [OPTIONS] <CONFIG-FILE>
+mxl-replicator-worker [OPTIONS] <CONFIG-FILE>
 ```
 
 `src/main.cpp:167-201`. The argument parser is deliberately minimal.
@@ -612,7 +612,7 @@ Everything the Go tree does *around* the worker, i.e. what needs reimplementing:
    leaves the capabilities at the worker's built-in default.
 
    Joining the probe output against operator configuration needs care, because the probe
-   names no interface (§2). Four selectors, at most one per configured attachment:
+   names no interface (§2). Four *naming* selectors, at most one per configured attachment:
 
    | Configured | Match against | Works for |
    |---|---|---|
@@ -626,6 +626,14 @@ Everything the Go tree does *around* the worker, i.e. what needs reimplementing:
    selector is both the simplest config and an unambiguous one. When it *is* ambiguous the
    supervisor cannot guess — refuse the attachment and log every candidate entry, which
    hands the operator the exact strings they could have written.
+
+   The probe printing one entry per `(interface, address, provider)` is also why a name is
+   often not enough: one device with a v4 address and a link-local v6 one is two entries
+   under one `attr.device_name`. Two *narrowing* selectors conjoin with a name and with each
+   other, and the exactly-one-entry rule applies to the conjunction — `network:` (probe
+   `node` parsed, tested for containment in a CIDR prefix) and `ip_version:` (probe `node`
+   parsed, 4 or 6). Both are decided entirely from the probe's `node` field, so neither adds
+   anything to what the worker must report.
 
    A configured attachment matching nothing is a configuration error and must be loud. It is
    the difference between "this node has no verbs" and "someone typo'd `ib0`".

@@ -1,0 +1,34 @@
+{{- if .Values.server.enabled }}
+{{- /*
+`helm test` runs the CLI against the deployed server, which exercises the Service, the token and
+the user API in one call — and prints the fleet, so a failing install says which part is not up.
+*/}}
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {{ include "mxl-replicator.fullname" . }}-test-status
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "mxl-replicator.labels" . | nindent 4 }}
+    app.kubernetes.io/component: test
+  annotations:
+    helm.sh/hook: test
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+spec:
+  restartPolicy: Never
+  {{- include "mxl-replicator.imagePullSecrets" . | nindent 2 }}
+  containers:
+    - name: status
+      image: {{ include "mxl-replicator.image" . }}
+      imagePullPolicy: {{ .Values.image.pullPolicy }}
+      args:
+        - status
+        - --server
+        - {{ printf "%s://%s.%s.svc:%v" (ternary "https" "http" .Values.server.tls.enabled) (include "mxl-replicator.fullname" .) .Release.Namespace .Values.server.service.port | quote }}
+      env:
+        {{- include "mxl-replicator.authEnv" . | nindent 8 }}
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop: [ALL]
+{{- end }}

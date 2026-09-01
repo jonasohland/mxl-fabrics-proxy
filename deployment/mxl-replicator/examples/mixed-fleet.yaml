@@ -1,0 +1,60 @@
+# A fleet whose nodes are not alike: an InfiniBand pool, an EFA pool and a plain TCP pool, each
+# with its own image, areas and attachments.
+#
+#   helm install mxl -n mxl --create-namespace \
+#       ./deployment/mxl-replicator -f examples/mixed-fleet.yaml
+#
+# `agent.pools` **replaces** the single DaemonSet rather than adding to it. Selectors must not
+# overlap: two agents claiming one node name both receive the same assignments, both start
+# workers, and they fight over ports — so the server makes the liveness lease exclusive and
+# rejects the second claimant.
+
+image:
+  tag: v0.3.0
+
+server:
+  persistence:
+    type: hostPath
+    node: ctrl-0
+
+agent:
+  # Everything below is the baseline every pool inherits. A pool states only what differs, and a
+  # list it declares replaces the one here rather than appending to it.
+  areas:
+    - {name: media, path: /dev/shm/mxl0, read: true}
+    - {name: fast, path: /dev/shm/mxl, read: true, write: true}
+
+  pools:
+    - name: ib
+      nodeSelector: {mxl.ebu.org/fabric: ib}
+      # `ip_version` because the HCA also carries a link-local IPv6 address, which is a second
+      # probe entry under the same device name — `device` alone is ambiguous and gets dropped.
+      fabrics:
+        - {provider: verbs, fabric: ib-fabric-a, device: mlx5_0, ip_version: 4}
+
+    - name: efa
+      nodeSelector: {mxl.ebu.org/fabric: efa}
+      efa: {enabled: true}
+      fabrics:
+        - {provider: efa, fabric: vpc1-subnet-a, device: rdmap0s6-rdm}
+
+    - name: tcp
+      nodeSelector: {mxl.ebu.org/fabric: tcp}
+      # `network` rather than `interface`, because the netdev name is the one thing that is not
+      # uniform across a pool — `eth1` on some of these, `ens5f0` on the rest — while the prefix
+      # is the same value everywhere and still picks each node's own address.
+      fabrics:
+        - {provider: tcp, fabric: dc1-data, network: 10.1.0.0/16}
+      # No RDMA hardware on these, so nothing to mount and no capabilities to ask for.
+      devices:
+        infiniband:
+          enabled: false
+      privileged: false
+      capabilities: []
+      # Bulk capture on NVMe rather than tmpfs, which is what a per-pool area list is for.
+      hostMounts:
+        - {name: dev-shm, hostPath: /dev/shm, mountPath: /dev/shm, type: Directory}
+        - {name: nvme, hostPath: /mnt/nvme, mountPath: /mnt/nvme, type: Directory}
+      areas:
+        - {name: media, path: /dev/shm/mxl0, read: true}
+        - {name: bulk, path: /mnt/nvme/mxl, read: true, write: true}

@@ -56,7 +56,7 @@ RUN apt-get update && \
         && rm -r /var/lib/apt/lists/*
 
 COPY --from=builder /usr/bin/mxl-replicator /usr/bin/mxl-replicator
-COPY --from=builder /usr/bin/mxl-fabrics-proxy-worker /usr/bin/mxl-fabrics-proxy-worker
+COPY --from=builder /usr/bin/mxl-replicator-worker /usr/bin/mxl-replicator-worker
 
 # The agent's per-worker work directories. Each holds a config.json, a metrics socket and, for a
 # target, a target-info.json; a fresh one per worker *start*, because the worker does not unlink a

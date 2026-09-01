@@ -1,0 +1,43 @@
+{{- if and .Values.server.enabled .Values.server.ingress.enabled }}
+{{- /*
+Only the user API is worth exposing this way. Agents reach the server over the Service — and if
+they are outside the cluster they reach it through this, in which case set `agent.servers` to the
+external URL and read §13 first: the agent API can claim to be a node and read other nodes' RDMA
+rkeys, so `auth.enabled` is not optional on a route anyone else can take.
+*/}}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "mxl-replicator.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "mxl-replicator.labels" . | nindent 4 }}
+    app.kubernetes.io/component: server
+  {{- with (merge (dict) .Values.server.ingress.annotations .Values.commonAnnotations) }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- with .Values.server.ingress.className }}
+  ingressClassName: {{ . }}
+  {{- end }}
+  {{- with .Values.server.ingress.tls }}
+  tls:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  rules:
+    {{- range .Values.server.ingress.hosts }}
+    - host: {{ .host | quote }}
+      http:
+        paths:
+          {{- range .paths }}
+          - path: {{ .path }}
+            pathType: {{ default "Prefix" .pathType }}
+            backend:
+              service:
+                name: {{ include "mxl-replicator.fullname" $ }}
+                port:
+                  number: {{ $.Values.server.service.port }}
+          {{- end }}
+    {{- end }}
+{{- end }}
