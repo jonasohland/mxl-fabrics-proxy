@@ -124,7 +124,7 @@ func runLoopback(t *testing.T, provider api.Provider, attachment probe.Attachmen
 	// quietly landed on shm would report a pass for something it did not test.
 	request := f.request(api.RequestSpec{
 		Name:         "loopback-" + string(provider),
-		Source:       api.Source{Node: "loopback", Domain: node.source("src"), Select: api.Selector{Flow: definition.id}},
+		Sources:      []api.Source{{Node: "loopback", Domain: node.source("src"), Select: api.Selector{Flow: definition.id}}},
 		Destinations: []api.Destination{{Node: "loopback", Domain: api.Domain{Area: "fast", Elements: []string{"dst"}}}},
 		Provider:     api.ProviderPin{provider},
 		Labels:       map[string]string{"suite": "e2e"},

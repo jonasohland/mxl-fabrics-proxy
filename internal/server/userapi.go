@@ -202,7 +202,7 @@ func (s *Server) handleCreateRequest(w http.ResponseWriter, r *http.Request) {
 
 		s.logger.Info("replication request accepted",
 			"request", id.String(),
-			"source", record.Spec.Source.Node+"/"+record.Spec.Source.Domain.String(),
+			"sources", sourceList(record.Spec.Sources),
 			"destinations", destinationList(record.Spec.Destinations),
 			"updated", existing.Found)
 	}
@@ -560,6 +560,14 @@ func validateLabels(labels map[string]string) error {
 }
 
 // destinationList renders a request's fan-out for a log line.
+func sourceList(sources []api.Source) string {
+	names := make([]string, 0, len(sources))
+	for _, src := range sources {
+		names = append(names, src.Describe())
+	}
+	return strings.Join(names, ",")
+}
+
 func destinationList(destinations []api.Destination) string {
 	names := make([]string, 0, len(destinations))
 	for _, dst := range destinations {

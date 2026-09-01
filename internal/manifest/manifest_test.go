@@ -32,10 +32,10 @@ func TestTheDocumentedManifestDecodes(t *testing.T) {
 
 	const file = `
 name: cam1-distribution
-source:
-  node: studio-a
-  domain: media/cameras
-  group_hint: {name: "Studio A:Camera 1"}
+sources:
+  - node: studio-a
+    domain: media/cameras
+    group_hint: {name: "Studio A:Camera 1"}
 destinations:
   - {node: edge-01,    domain: fast/ingest}
   - {node: edge-02,    domain: fast/ingest}
@@ -47,10 +47,10 @@ labels:
 ---
 
 name: talkback
-source:
-  node: studio-a
-  domain: media/audio
-  flow: 5592a23b-0974-45bb-9388-89ea81c42537
+sources:
+  - node: studio-a
+    domain: media/audio
+    flow: 5592a23b-0974-45bb-9388-89ea81c42537
 destinations:
   - {node: edge-01, domain: fast/ingest}
 idle_teardown_ms: 0
@@ -64,14 +64,14 @@ idle_teardown_ms: 0
 
 	cam1 := specs[0]
 	assert.Equal(t, "cam1-distribution", cam1.Name)
-	assert.Equal(t, "studio-a", cam1.Source.Node)
+	assert.Equal(t, "studio-a", cam1.Sources[0].Node)
 
 	// The selector is flattened in the file and a tagged union on the wire (§9.1). Omitting
 	// `type` selects every flow sharing the name, which is how a camera's video and audio are
 	// replicated together.
-	require.NotNil(t, cam1.Source.Select.GroupHint)
-	assert.Equal(t, "Studio A:Camera 1", cam1.Source.Select.GroupHint.Name)
-	assert.Empty(t, cam1.Source.Select.GroupHint.Type)
+	require.NotNil(t, cam1.Sources[0].Select.GroupHint)
+	assert.Equal(t, "Studio A:Camera 1", cam1.Sources[0].Select.GroupHint.Name)
+	assert.Empty(t, cam1.Sources[0].Select.GroupHint.Type)
 
 	require.Len(t, cam1.Destinations, 3)
 	assert.Equal(t, "edge-01/fast/ingest", cam1.Destinations[0].Endpoint())
@@ -86,7 +86,7 @@ idle_teardown_ms: 0
 	assert.Equal(t, map[string]string{"show": "nab"}, cam1.Labels)
 
 	talkback := specs[1]
-	assert.Equal(t, "5592a23b-0974-45bb-9388-89ea81c42537", talkback.Source.Select.Flow)
+	assert.Equal(t, "5592a23b-0974-45bb-9388-89ea81c42537", talkback.Sources[0].Select.Flow)
 	require.NotNil(t, talkback.IdleTeardown)
 	assert.Zero(t, talkback.IdleTeardown.Duration(), "0 disables teardown: keep a bursty feed hot")
 }
@@ -100,7 +100,7 @@ func TestAnUnknownKeyIsAnError(t *testing.T) {
 
 	const file = `
 name: cam1
-source: {node: studio-a, domain: media/cameras, flow: flow-1}
+sources: [{node: studio-a, domain: media/cameras, flow: flow-1}]
 destinations: [{node: edge-01, domain: fast/ingest}]
 destinaton: [{node: edge-02, domain: fast/ingest}]
 `
@@ -117,40 +117,46 @@ func TestDocumentRejections(t *testing.T) {
 		file string
 		want string
 	}{
-		"no selector": {
-			file: "name: a\nsource: {node: s, domain: media/d}\ndestinations: [{node: e, domain: fast/i}]",
-			want: "no selector",
+		"no sources": {
+			file: "name: a\ndestinations: [{node: e, domain: fast/i}]",
+			want: "at least one source is required",
 		},
 		"two selectors": {
-			file: "name: a\nsource: {node: s, domain: media/d, flow: f, group_hint: {name: g}}\ndestinations: [{node: e, domain: fast/i}]",
+			file: "name: a\nsources: [{node: s, domain: media/d, flow: f, group_hint: {name: g}}]\ndestinations: [{node: e, domain: fast/i}]",
 			want: "names both flow and group_hint",
 		},
 		"group hint with no name": {
-			file: "name: a\nsource: {node: s, domain: media/d, group_hint: {type: video}}\ndestinations: [{node: e, domain: fast/i}]",
+			file: "name: a\nsources: [{node: s, domain: media/d, group_hint: {type: video}}]\ndestinations: [{node: e, domain: fast/i}]",
 			want: "group_hint.name is required",
 		},
+		// The whole source written twice is a copy-paste error: it expands identically and every
+		// path it produces is the same path (§9.1).
+		"duplicate source": {
+			file: "name: a\nsources: [{node: s, domain: media/d, flow: f}, {node: s, domain: media/d, flow: f}]\ndestinations: [{node: e, domain: fast/i}]",
+			want: "are the same source",
+		},
 		"no destinations": {
-			file: "name: a\nsource: {node: s, domain: media/d, flow: f}",
+			file: "name: a\nsources: [{node: s, domain: media/d, flow: f}]",
 			want: "at least one destination",
 		},
 		// The same (node, domain) twice is one path written twice, and the entries can disagree
 		// about the root or the provider.
 		"duplicate destination": {
-			file: "name: a\nsource: {node: s, domain: media/d, flow: f}\ndestinations: [{node: e, domain: fast/i}, {node: e, domain: fast/i}]",
+			file: "name: a\nsources: [{node: s, domain: media/d, flow: f}]\ndestinations: [{node: e, domain: fast/i}, {node: e, domain: fast/i}]",
 			want: "both name e/fast/i",
 		},
 		// A destination domain is a directory this API asks a node to create, so the name rule is
 		// structural and refused before anything reaches the server (§10.6).
 		"destination domain is a path": {
-			file: "name: a\nsource: {node: s, domain: media/d, flow: f}\ndestinations: [{node: e, domain: /dev/shm/x}]",
+			file: "name: a\nsources: [{node: s, domain: media/d, flow: f}]\ndestinations: [{node: e, domain: /dev/shm/x}]",
 			want: "destinations[0].domain",
 		},
 		"no name": {
-			file: "source: {node: s, domain: media/d, flow: f}\ndestinations: [{node: e, domain: fast/i}]",
+			file: "sources: [{node: s, domain: media/d, flow: f}]\ndestinations: [{node: e, domain: fast/i}]",
 			want: "name is required",
 		},
 		"unknown provider": {
-			file: "name: a\nsource: {node: s, domain: media/d, flow: f}\ndestinations: [{node: e, domain: fast/i}]\nprovider: infiniband",
+			file: "name: a\nsources: [{node: s, domain: media/d, flow: f}]\ndestinations: [{node: e, domain: fast/i}]\nprovider: infiniband",
 			want: "unknown provider",
 		},
 	} {
@@ -170,11 +176,11 @@ func TestErrorsNameTheDocument(t *testing.T) {
 
 	const file = `
 name: good
-source: {node: s, domain: media/d, flow: f}
+sources: [{node: s, domain: media/d, flow: f}]
 destinations: [{node: e, domain: fast/i}]
 ---
 name: bad
-source: {node: s, domain: media/d}
+sources: [{node: s, domain: media/d, group_hint: {type: video}}]
 destinations: [{node: e, domain: fast/i}]
 `
 	err := parseAndConvert(strings.NewReader(file), "studio-a.yaml")
@@ -188,7 +194,7 @@ func TestEmptyDocumentsAreSkipped(t *testing.T) {
 
 	const file = `---
 name: a
-source: {node: s, domain: media/d, flow: f}
+sources: [{node: s, domain: media/d, flow: f}]
 destinations: [{node: e, domain: fast/i}]
 ---
 `
@@ -205,7 +211,7 @@ func write(t *testing.T, dir, name, body string) string {
 }
 
 func doc(name, dstNode string) string {
-	return "name: " + name + "\nsource: {node: s, domain: media/d, flow: f}\ndestinations: [{node: " + dstNode + ", domain: fast/i}]\n"
+	return "name: " + name + "\nsources: [{node: s, domain: media/d, flow: f}]\ndestinations: [{node: " + dstNode + ", domain: fast/i}]\n"
 }
 
 // -f takes a file, a directory or "-", and is repeatable. A directory is flat and sorted: a
@@ -263,7 +269,7 @@ func TestADomainStringSplitsIntoAreaAndElements(t *testing.T) {
 
 	const file = `
 name: cam1
-source: {node: studio-a, domain: media/cameras, flow: flow-1}
+sources: [{node: studio-a, domain: media/cameras, flow: flow-1}]
 destinations:
   - {node: edge-01, domain: fast/studio-a/cam1}
   - {node: edge-02, domain: bulk/ingest}
@@ -284,7 +290,7 @@ destinations:
 
 	// *There used to be a separate `root:` key beside the elements.* It is gone, and a file that
 	// still carries one is refused as an unknown key rather than quietly ignored (§10.6).
-	_, err = Parse(strings.NewReader("name: a\nsource: {node: s, domain: media/d, flow: f}\ndestinations: [{node: e, domain: fast/i, root: fast}]"), "m.yaml")
+	_, err = Parse(strings.NewReader("name: a\nsources: [{node: s, domain: media/d, flow: f}]\ndestinations: [{node: e, domain: fast/i, root: fast}]"), "m.yaml")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "root")
 }
@@ -352,12 +358,12 @@ name: talkback
 	// The same documents are not a valid *apply*, and say so rather than being half-accepted.
 	_, err = Specs(docs)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "names.yaml: source names no selector")
+	assert.Contains(t, err.Error(), "names.yaml: at least one source is required")
 
 	// A drifted document — one whose destinations no longer describe anything real — still
 	// deletes, because delete never looks at them.
 	docs, err = Parse(strings.NewReader(
-		"name: cam1\nsource: {node: gone, domain: gone, flow: f}\ndestinations: [{node: gone, domain: gone}]\n"), "old.yaml")
+		"name: cam1\nsources: [{node: gone, domain: gone, flow: f}]\ndestinations: [{node: gone, domain: gone}]\n"), "old.yaml")
 	require.NoError(t, err)
 	assert.Equal(t, []string{"cam1"}, docNames(docs))
 }
@@ -397,7 +403,7 @@ func TestNamespaceIsARealField(t *testing.T) {
 	const file = `
 name: cam1
 namespace: nab
-source: {node: studio-a, domain: media/cameras, flow: f-1}
+sources: [{node: studio-a, domain: media/cameras, flow: f-1}]
 destinations: [{node: edge-01, domain: fast/ingest}]
 labels: {show: gala}
 `
@@ -421,7 +427,7 @@ func TestNoNamespaceReadsAsTheDefault(t *testing.T) {
 
 	const file = `
 name: cam1
-source: {node: studio-a, domain: media/cameras, flow: f-1}
+sources: [{node: studio-a, domain: media/cameras, flow: f-1}]
 destinations: [{node: edge-01, domain: fast/ingest}]
 `
 	docs, err := Parse(strings.NewReader(file), "-")
@@ -442,7 +448,7 @@ func TestTheLabelSpellingIsJustALabelNow(t *testing.T) {
 
 	const file = `
 name: cam1
-source: {node: studio-a, domain: media/cameras, flow: f-1}
+sources: [{node: studio-a, domain: media/cameras, flow: f-1}]
 destinations: [{node: edge-01, domain: fast/ingest}]
 labels: {namespace: archive}
 `
@@ -465,7 +471,7 @@ func TestNamespaceNameIsValidatedInTheFile(t *testing.T) {
 		file := fmt.Sprintf(`
 name: cam1
 namespace: %s
-source: {node: studio-a, domain: media/cameras, flow: f-1}
+sources: [{node: studio-a, domain: media/cameras, flow: f-1}]
 destinations: [{node: edge-01, domain: fast/ingest}]
 `, ns)
 		err := parseAndConvert(strings.NewReader(file), "-")
@@ -483,7 +489,7 @@ func TestKindDefaultsToRequest(t *testing.T) {
 
 	const file = `
 name: cam1
-source: {node: studio-a, domain: media/cameras, flow: f-1}
+sources: [{node: studio-a, domain: media/cameras, flow: f-1}]
 destinations: [{node: edge-01, domain: fast/ingest}]
 `
 	docs, err := Parse(strings.NewReader(file), "-")
@@ -549,7 +555,7 @@ func TestKeysAreStrictPerKind(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "paths")
 
-	_, err = Parse(strings.NewReader("kind: namespace\nname: nab\nsource: {node: a}\n"), "-")
+	_, err = Parse(strings.NewReader("kind: namespace\nname: nab\nsources: [{node: a}]\n"), "-")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "source")
 }
@@ -564,7 +570,7 @@ func TestApplyOrdersNamespacesFirst(t *testing.T) {
 	const file = `
 name: cam1
 namespace: nab
-source: {node: studio-a, domain: media/cameras, flow: f-1}
+sources: [{node: studio-a, domain: media/cameras, flow: f-1}]
 destinations: [{node: edge-01, domain: fast/ingest}]
 ---
 kind: namespace
@@ -595,12 +601,12 @@ func TestOneNameInTwoNamespacesIsNotADuplicate(t *testing.T) {
 	const file = `
 name: cam1
 namespace: nab
-source: {node: studio-a, domain: media/cameras, flow: f-1}
+sources: [{node: studio-a, domain: media/cameras, flow: f-1}]
 destinations: [{node: edge-01, domain: fast/ingest}]
 ---
 name: cam1
 namespace: archive
-source: {node: studio-a, domain: media/cameras, flow: f-1}
+sources: [{node: studio-a, domain: media/cameras, flow: f-1}]
 destinations: [{node: edge-02, domain: fast/ingest}]
 `
 	dir := t.TempDir()
@@ -631,14 +637,14 @@ func TestSourceDomainIsAScalarOrAMap(t *testing.T) {
 
 	const file = `
 name: by-name
-source: {node: studio-a, domain: media/cameras, flow: f-1}
+sources: [{node: studio-a, domain: media/cameras, flow: f-1}]
 destinations: [{node: edge-01, domain: fast/ingest}]
 ---
 name: by-label
-source:
-  node: studio-a
-  domain: {role: cameras, site: studio-a}
-  flow: f-1
+sources:
+  - node: studio-a
+    domain: {role: cameras, site: studio-a}
+    flow: f-1
 destinations: [{node: edge-01, domain: fast/ingest}]
 `
 	docs, err := Parse(strings.NewReader(file), "-")
@@ -649,11 +655,88 @@ destinations: [{node: edge-01, domain: fast/ingest}]
 
 	// The scalar goes through [ParseDomain] — the one parser of a domain string in the tree — and
 	// lands as the same structured value a destination carries (§10.6).
-	assert.Equal(t, api.DomainSelectorKindName, specs[0].Source.Domain.Kind())
-	assert.Equal(t, api.Domain{Area: "media", Elements: []string{"cameras"}}, *specs[0].Source.Domain.Name)
+	assert.Equal(t, api.DomainSelectorKindName, specs[0].Sources[0].Domain.Kind())
+	assert.Equal(t, api.Domain{Area: "media", Elements: []string{"cameras"}}, *specs[0].Sources[0].Domain.Name)
 
-	assert.Equal(t, api.DomainSelectorKindLabels, specs[1].Source.Domain.Kind())
-	assert.Equal(t, map[string]string{"role": "cameras", "site": "studio-a"}, specs[1].Source.Domain.Labels)
+	assert.Equal(t, api.DomainSelectorKindLabels, specs[1].Sources[0].Domain.Kind())
+	assert.Equal(t, map[string]string{"role": "cameras", "site": "studio-a"}, specs[1].Sources[0].Domain.Labels)
+}
+
+// A source that names a domain and says nothing else replicates every flow in it — the retired
+// proxy's subscription shape, and the cheap thing to write (§9.1, §16).
+//
+// **The file may default this and the wire may not.** Strict decoding is what buys it: a typo'd key
+// is an error here, so nothing can *fall* into the default and silently widen a one-camera request
+// into a whole-domain one.
+func TestAnOmittedSelectorIsEveryFlowInTheDomain(t *testing.T) {
+	t.Parallel()
+
+	const file = `
+name: whole-domain
+sources:
+  - {node: studio-b, domain: media/cameras}
+destinations: [{node: edge-01, domain: fast/ingest}]
+`
+	docs, err := Parse(strings.NewReader(file), "-")
+	require.NoError(t, err)
+	specs, err := Specs(docs)
+	require.NoError(t, err)
+	require.Len(t, specs, 1)
+
+	assert.Equal(t, api.SelectorKindAll, specs[0].Sources[0].Select.Kind())
+	assert.True(t, specs[0].Sources[0].Select.All)
+}
+
+// Both ends are lists, and a request is the cross product of them (§9.1).
+func TestARequestFansInAsWellAsOut(t *testing.T) {
+	t.Parallel()
+
+	const file = `
+name: ingest-wall
+sources:
+  - {node: studio-a, domain: media/cameras, group_hint: {name: "Studio A:Camera 1"}}
+  - {node: studio-b, domain: media/cameras}
+  - {node: studio-c, domain: {role: cameras}, flow: 5592a23b-0974-45bb-9388-89ea81c42537}
+destinations:
+  - {node: edge-01, domain: fast/ingest}
+  - {node: edge-02, domain: fast/ingest}
+`
+	docs, err := Parse(strings.NewReader(file), "-")
+	require.NoError(t, err)
+	specs, err := Specs(docs)
+	require.NoError(t, err)
+	require.Len(t, specs, 1)
+
+	spec := specs[0]
+	require.Len(t, spec.Sources, 3)
+	require.Len(t, spec.Destinations, 2)
+
+	// Each source keeps its own selector: the list is not a shared selector applied N times.
+	assert.Equal(t, api.SelectorKindGroupHint, spec.Sources[0].Select.Kind())
+	assert.Equal(t, api.SelectorKindAll, spec.Sources[1].Select.Kind())
+	assert.Equal(t, api.SelectorKindFlow, spec.Sources[2].Select.Kind())
+
+	// A source's node stays *pinned* while its domain may be selected — which is what keeps the
+	// expansion one node wide and §10.8's cross-product hazards out of this (§9.1).
+	assert.Equal(t, "studio-c", spec.Sources[2].Node)
+	assert.Equal(t, api.DomainSelectorKindLabels, spec.Sources[2].Domain.Kind())
+}
+
+// The error names which source, because a source has no name of its own and its position in the
+// list is the only handle an operator has on it (§9.1).
+func TestASourceErrorNamesItsIndex(t *testing.T) {
+	t.Parallel()
+
+	const file = `
+name: wall
+sources:
+  - {node: studio-a, domain: media/cameras}
+  - {node: studio-b, domain: media/cameras, flow: f, group_hint: {name: g}}
+destinations: [{node: edge-01, domain: fast/ingest}]
+`
+	err := parseAndConvert(strings.NewReader(file), "-")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "sources[1]")
 }
 
 // `domain: {}` is a label selector with no keys, not a third thing needing a rule of its own — and
@@ -664,7 +747,7 @@ func TestAnEmptySourceDomainMapIsRefused(t *testing.T) {
 
 	const file = `
 name: wide
-source: {node: studio-a, domain: {}, flow: f-1}
+sources: [{node: studio-a, domain: {}, flow: f-1}]
 destinations: [{node: edge-01, domain: fast/ingest}]
 `
 	err := parseAndConvert(strings.NewReader(file), "-")
@@ -717,7 +800,7 @@ func TestApplyOrdersDomainsBetweenNamespacesAndRequests(t *testing.T) {
 
 	const file = `
 name: cam1
-source: {node: studio-a, domain: {role: cameras}, flow: f-1}
+sources: [{node: studio-a, domain: {role: cameras}, flow: f-1}]
 destinations: [{node: edge-01, domain: fast/ingest}]
 ---
 kind: domain

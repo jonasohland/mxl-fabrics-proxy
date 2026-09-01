@@ -394,6 +394,24 @@ func TestNoFabricsMeansSHM(t *testing.T) {
 	assert.True(t, cli.Run.AgentOpts.fabricsDefaulted, "the assumption is warned about at startup")
 }
 
+// --agent-detect-default-fabric is the other answer to the same question, and it replaces the shm
+// assumption rather than joining it: the detection needs the probe, so it happens on the
+// registration path and leaves nothing to resolve here (§10.1).
+func TestDetectDefaultFabricReplacesTheSHMAssumption(t *testing.T) {
+	cli, _ := mustParse(t, agentOnly("--agent-detect-default-fabric")...)
+
+	assert.True(t, cli.Run.AgentOpts.DetectDefaultFabric)
+	assert.Empty(t, cli.Run.AgentOpts.fabrics, "detection happens against the probe, not at parse time")
+	assert.False(t, cli.Run.AgentOpts.fabricsDefaulted)
+
+	// An attachment the operator wrote is never joined by a detected one — the two would be
+	// competing descriptions of the same hardware and the second is the guess. Inert rather than
+	// wrong, so it parses and is warned about at startup.
+	cli, _ = mustParse(t, agentOnly("--agent-detect-default-fabric", "--agent-fabric", "provider=tcp,fabric=dc1,address=10.0.0.1")...)
+	require.Len(t, cli.Run.AgentOpts.fabrics, 1)
+	assert.Equal(t, "dc1", cli.Run.AgentOpts.fabrics[0].Fabric)
+}
+
 // A flag wins over a file for a scalar and adds to it for a collection, so a file describing a
 // host's hardware stays extensible on the command line.
 func TestAgentConfigFileIsMergedWithFlags(t *testing.T) {

@@ -99,6 +99,12 @@ func TestTheLeaderReportsTheFleet(t *testing.T) {
 		assert.Contains(t, body, `mxl_repl_sessions{state="`+string(state)+`"}`)
 	}
 
+	// PARTIAL is a request series and **not** a path one. It aggregates, so a path gauge for it
+	// would be a series that is structurally always zero — which reads as a condition being
+	// monitored rather than one that cannot occur (§11, §12).
+	assert.Contains(t, body, `mxl_repl_requests{state="PARTIAL"}`)
+	assert.NotContains(t, body, `mxl_repl_paths{state="PARTIAL"}`)
+
 	// The fleet's version spread, which only the server can see (§13.1).
 	assert.Contains(t, body, `mxl_repl_agent_versions{protocol="`+
 		strconv.Itoa(api.ProtocolVersion)+`",replicator="test"} 2`)

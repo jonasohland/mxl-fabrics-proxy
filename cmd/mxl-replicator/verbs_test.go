@@ -126,14 +126,14 @@ func manifestFile(t *testing.T, body string) string {
 
 const twoRequests = `
 name: cam1
-source: {node: studio-a, domain: media/cameras, flow: flow-1}
+sources: [{node: studio-a, domain: media/cameras, flow: flow-1}]
 destinations:
   - {node: edge-01, domain: fast/ingest}
   - {node: edge-02, domain: fast/ingest}
 labels: {show: nab}
 ---
 name: cam2
-source: {node: studio-a, domain: media/cameras, flow: flow-2}
+sources: [{node: studio-a, domain: media/cameras, flow: flow-2}]
 destinations: [{node: edge-01, domain: fast/ingest2}]
 labels: {show: nab}
 `
@@ -238,7 +238,7 @@ func TestPruneCancelsOnlyUnnamedMatches(t *testing.T) {
 
 	other := manifestFile(t, `
 name: someone-elses
-source: {node: studio-a, domain: media/cameras, flow: flow-9}
+sources: [{node: studio-a, domain: media/cameras, flow: flow-9}]
 destinations: [{node: edge-01, domain: fast/other}]
 labels: {show: other-show}
 `)
@@ -247,7 +247,7 @@ labels: {show: other-show}
 	// Now apply a manifest naming only cam1, pruning show=nab.
 	narrowed := manifestFile(t, `
 name: cam1
-source: {node: studio-a, domain: media/cameras, flow: flow-1}
+sources: [{node: studio-a, domain: media/cameras, flow: flow-1}]
 destinations:
   - {node: edge-01, domain: fast/ingest}
   - {node: edge-02, domain: fast/ingest}
@@ -366,6 +366,64 @@ func TestDescribeEveryKind(t *testing.T) {
 			cmd.Output = "json"
 			require.NoError(t, cmd.Run(t.Context()))
 		})
+	}
+}
+
+// A fan-in request renders in every view: both ends are lists now, and the source column, the
+// per-source rows and the aggregate all have to survive a request with more than one of them
+// (§9.1, §11).
+func TestFanInRendersInEveryView(t *testing.T) {
+	t.Parallel()
+
+	base := fleet(t)
+	flags := ClientFlags{Server: []string{base}}
+
+	// A second studio, publishing a flow of its own. Distinct IDs: one flow ID from two studios
+	// into one domain is the corruption case and is refused (§7.2).
+	register(t, base, "studio-b")
+	post(t, base, api.InventoryPath("studio-b"), api.InventorySnapshot{
+		Node: "studio-b", Instance: "i-studio-b",
+		Domains: []api.DomainInventory{{Domain: api.Domain{Area: "media", Elements: []string{"cameras"}}, Flows: []api.FlowInventory{{
+			ID:         "flow-b",
+			Definition: json.RawMessage(`{"id":"flow-b","format":"urn:x-nmos:format:video","media_type":"video/v210"}`),
+			Producing:  true,
+		}}}},
+	}, 204)
+
+	// The second source omits its selector, which is the whole domain — the one place the default
+	// may be applied, because an unrecognised key in a manifest is an error (§9.1).
+	require.NoError(t, (&ApplyCmd{ClientFlags: flags, Files: []string{manifestFile(t, `
+name: wall
+sources:
+  - {node: studio-a, domain: media/cameras, flow: flow-1}
+  - {node: studio-b, domain: media/cameras}
+destinations: [{node: edge-01, domain: fast/ingest}]
+`)}}).Run(t.Context()))
+
+	wall, err := userClient(t, flags).Request(t.Context(), api.RequestID{Namespace: api.DefaultNamespace, Name: "wall"})
+	require.NoError(t, err)
+
+	require.Len(t, wall.Sources, 2)
+	assert.Equal(t, api.SelectorKindAll, wall.Sources[1].Select.Kind(), "an omitted selector is the whole domain")
+	assert.Len(t, wall.Status.Paths, 2, "one path per source, into the one destination")
+
+	// A row per source, in the order the request lists them — the view that says *which* studio,
+	// which the one-line aggregate cannot.
+	require.Len(t, wall.Status.Sources, 2)
+	assert.Equal(t, "studio-a", wall.Status.Sources[0].Source.Node)
+	assert.Equal(t, "studio-b", wall.Status.Sources[1].Source.Node)
+	for _, row := range wall.Status.Sources {
+		assert.Len(t, row.Paths, 1)
+	}
+
+	for _, run := range []func() error{
+		func() error { return (&GetCmd{Kind: "requests", ClientFlags: flags}).Run(t.Context()) },
+		func() error {
+			return (&DescribeCmd{Kind: "request", Name: "wall", ClientFlags: flags}).Run(t.Context())
+		},
+		func() error { return (&StatusCmd{ClientFlags: flags}).Run(t.Context()) },
+	} {
+		require.NoError(t, run())
 	}
 }
 
@@ -689,7 +747,7 @@ labels: {role: cameras}
 	// A second apply that names no domain at all, pruning the default namespace.
 	other := manifestFile(t, `
 name: cam1
-source: {node: studio-a, domain: media/cameras, flow: flow-1}
+sources: [{node: studio-a, domain: media/cameras, flow: flow-1}]
 destinations: [{node: edge-01, domain: fast/ingest}]
 `)
 	require.NoError(t, (&ApplyCmd{

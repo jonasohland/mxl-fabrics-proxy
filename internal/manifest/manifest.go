@@ -229,7 +229,10 @@ type RequestDoc struct {
 	// server.
 	Namespace string `yaml:"namespace"`
 
-	Source       SourceDoc        `yaml:"source"`
+	// Sources is where to replicate from. **Always a list, with no singular `source:` beside it**
+	// (§9.1) — see [api.RequestSpec.Sources] for why the two spellings `provider:` gets are refused
+	// here.
+	Sources      []SourceDoc      `yaml:"sources"`
 	Destinations []DestinationDoc `yaml:"destinations"`
 
 	// Provider is the default pin for every destination (§10.4). A bare string pins; a list
@@ -250,7 +253,8 @@ func (d RequestDoc) namespace() string {
 	return d.Namespace
 }
 
-// SourceDoc is where to replicate from. Exactly one of Flow and GroupHint must be set.
+// SourceDoc is one place to replicate from. At most one of Flow and GroupHint may be set, and
+// **neither** means every flow in the domain.
 //
 // The selector is flattened onto the source here where the wire type nests it under `select`.
 // §9.1's tagged-union discipline is about the wire type and survives intact: this decodes into
@@ -274,6 +278,21 @@ type SourceDoc struct {
 	// every flow sharing the name, which is how a camera's video and audio are replicated
 	// together.
 	GroupHint *GroupHintDoc `yaml:"group_hint"`
+
+	// Omitting both is `select: {all: true}` on the wire — every flow in the domain (§9.1):
+	//
+	//	sources:
+	//	  - {node: studio-b, domain: media/cameras}
+	//
+	// This is the retired proxy's subscription shape (§16) and should be the cheap thing to write.
+	// **The file may default it and the wire may not**, which is not an inconsistency: an
+	// unrecognised key is an error here (see the package comment), so a typo cannot silently reach
+	// the default and widen a request into a whole domain. A hand-rolled POST has no such guard,
+	// which is why an absent `select` stays an error there.
+	//
+	// The residual accident is real — deleting a `group_hint:` line turns a one-camera request into
+	// a whole-domain one — and is paid for by `apply` printing each request's resulting path count
+	// (§9.1).
 }
 
 // DomainSelectorDoc is `source.domain`: a scalar name or a label map (§9.1, §10.7).
@@ -297,7 +316,7 @@ func (d *DomainSelectorDoc) UnmarshalYAML(node *yaml.Node) error {
 		d.Labels = map[string]string{}
 		return node.Decode(&d.Labels)
 	default:
-		return fmt.Errorf("source.domain: expected a name or a label map, got %s", kindName(node.Kind))
+		return fmt.Errorf("domain: expected a name or a label map, got %s", kindName(node.Kind))
 	}
 }
 
@@ -306,20 +325,20 @@ func (d DomainSelectorDoc) selector() (api.DomainSelector, error) {
 	var out api.DomainSelector
 	switch {
 	case d.Name != "" && d.Labels != nil:
-		return out, errors.New("source.domain is both a name and a label set")
+		return out, errors.New("domain is both a name and a label set")
 	case d.Name != "":
 		// **The one parser of a domain string in the tree** (§10.6). A `name` selector carries the
 		// same structured value a destination does, so the "parsed at exactly one boundary" rule is
 		// not quietly broken by the selector.
 		domain, err := ParseDomain(d.Name)
 		if err != nil {
-			return out, fmt.Errorf("source.domain %w", err)
+			return out, fmt.Errorf("domain %w", err)
 		}
 		out.Name = &domain
 	case d.Labels != nil:
 		out.Labels = d.Labels
 	default:
-		return out, errors.New("source.domain is required: a name like media/cameras, or a label set")
+		return out, errors.New("domain is required: a name like media/cameras, or a label set")
 	}
 
 	if err := out.Validate(); err != nil {
@@ -398,23 +417,23 @@ func (p ProviderDoc) pin() api.ProviderPin {
 func (d RequestDoc) Spec() (api.RequestSpec, error) {
 	var spec api.RequestSpec
 
-	selector, err := d.Source.selector()
-	if err != nil {
-		return spec, err
-	}
-
-	domain, err := d.Source.Domain.selector()
-	if err != nil {
-		return spec, err
-	}
-
 	spec = api.RequestSpec{
 		Namespace: d.namespace(),
 		Name:      d.Name,
-		Source:    api.Source{Node: d.Source.Node, Domain: domain, Select: selector},
 		Provider:  d.Provider.pin(),
 		SchedPrio: d.SchedPrio,
 		Labels:    d.Labels,
+	}
+	for i, src := range d.Sources {
+		selector, err := src.selector()
+		if err != nil {
+			return api.RequestSpec{}, fmt.Errorf("sources[%d]: %w", i, err)
+		}
+		domain, err := src.Domain.selector()
+		if err != nil {
+			return api.RequestSpec{}, fmt.Errorf("sources[%d].%w", i, err)
+		}
+		spec.Sources = append(spec.Sources, api.Source{Node: src.Node, Domain: domain, Select: selector})
 	}
 	for i, dst := range d.Destinations {
 		domain, err := ParseDomain(dst.Domain)
@@ -438,23 +457,31 @@ func (d RequestDoc) Spec() (api.RequestSpec, error) {
 	return spec, nil
 }
 
-// selector enforces the tagged union the flattened spelling cannot enforce structurally.
+// selector enforces the tagged union the flattened spelling cannot enforce structurally, and
+// defaults an omitted selector to `all` (§9.1).
+//
+// **The default is legitimate here and nowhere else.** Strict decoding (see the package comment)
+// means a typo'd key is an error rather than a silently ignored one, so nothing can *fall* into
+// this default — a source reaches it only by an author having written a node and a domain and
+// nothing more, which is the retired proxy's subscription shape and should be the cheap thing to
+// write (§16). On the wire the zero value stays an error, because a hand-rolled POST has no such
+// guard and widening is the wrong direction to fail in.
 func (s SourceDoc) selector() (api.Selector, error) {
 	switch {
 	case s.Flow != "" && s.GroupHint != nil:
-		return api.Selector{}, errors.New("source names both flow and group_hint")
+		return api.Selector{}, errors.New("names both flow and group_hint")
 	case s.Flow != "":
 		return api.Selector{Flow: s.Flow}, nil
 	case s.GroupHint != nil:
 		if s.GroupHint.Name == "" {
-			return api.Selector{}, errors.New("source.group_hint.name is required")
+			return api.Selector{}, errors.New("group_hint.name is required")
 		}
 		return api.Selector{GroupHint: &api.GroupHintSelector{
 			Name: s.GroupHint.Name,
 			Type: s.GroupHint.Type,
 		}}, nil
 	default:
-		return api.Selector{}, errors.New("source names no selector: give it a flow or a group_hint")
+		return api.Selector{All: true}, nil
 	}
 }
 

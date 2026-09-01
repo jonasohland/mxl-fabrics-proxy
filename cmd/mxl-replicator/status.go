@@ -236,22 +236,22 @@ func printRequestTable(requests []api.Request) {
 	// NAMESPACE is a column of its own rather than being folded into the name, because a request's
 	// ID is the pair (§9.3) and two requests called `cam1` in two partitions are two rows that
 	// would otherwise be indistinguishable.
-	out := table("NAMESPACE", "NAME", "STATE", "PATHS", "SOURCE", "DESTINATIONS", "LABELS")
+	out := table("NAMESPACE", "NAME", "STATE", "PATHS", "SOURCES", "DESTINATIONS", "LABELS")
 	for _, request := range requests {
 		fmt.Fprintf(out, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
 			request.NamespaceOrDefault(),
 			request.Name,
 			request.Status.State,
 			pathSummary(request.Status),
-			request.Source.Node+"/"+request.Source.Domain.String(),
+			sources(request.Sources),
 			destinations(request.Destinations),
 			sortedLabels(request.Labels),
 		)
 	}
 	_ = out.Flush()
 
-	// The reason is what says which destination is wrong, so it must not be lost to a column
-	// width. Printed under the table rather than in it.
+	// The reason is what says which end is wrong, so it must not be lost to a column width. Printed
+	// under the table rather than in it.
 	for _, request := range requests {
 		if request.Status.Reason != "" && request.Status.State != api.StateActive {
 			fmt.Printf("\n%s: %s\n", request.ID, request.Status.Reason)
@@ -260,15 +260,33 @@ func printRequestTable(requests []api.Request) {
 }
 
 // pathSummary is the "1 of 3 active" numerator and denominator (§9.1).
+//
+// For a PARTIAL request it counts the ACTIVE paths, not the paths in the request's own state:
+// PARTIAL is an aggregate and no path is ever in it, so `status.Counts[status.State]` is zero and
+// the cell would read "0/12" for a request with eleven paths carrying media (§11).
 func pathSummary(status api.RequestStatus) string {
 	total := len(status.Paths)
 	if total == 0 {
 		return "0"
 	}
-	if count := status.Counts[status.State]; count != total {
+	state := status.State
+	if state == api.StatePartial {
+		state = api.StateActive
+	}
+	if count := status.Counts[state]; count != total {
 		return fmt.Sprintf("%d/%d", count, total)
 	}
 	return fmt.Sprintf("%d", total)
+}
+
+// sources renders a request's source list for a table cell. A label selector renders its labels,
+// which is the line the operator wrote (§9.1).
+func sources(list []api.Source) string {
+	names := make([]string, 0, len(list))
+	for _, src := range list {
+		names = append(names, src.Describe())
+	}
+	return strings.Join(names, ",")
 }
 
 func destinations(list []api.Destination) string {
@@ -287,6 +305,8 @@ func selectorText(selector api.Selector) string {
 		return fmt.Sprintf("group_hint %q", selector.GroupHint.Name)
 	case selector.Flow != "":
 		return "flow " + selector.Flow
+	case selector.All:
+		return "all flows"
 	default:
 		return ""
 	}

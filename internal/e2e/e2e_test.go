@@ -48,7 +48,7 @@ func (p *pair) replicate(name string) api.Request {
 
 	return p.request(api.RequestSpec{
 		Name:         name,
-		Source:       api.Source{Node: "studio-a", Domain: p.src.source("cameras"), Select: api.Selector{Flow: p.flow.ID()}},
+		Sources:      []api.Source{{Node: "studio-a", Domain: p.src.source("cameras"), Select: api.Selector{Flow: p.flow.ID()}}},
 		Destinations: []api.Destination{{Node: "edge-01", Domain: api.Domain{Area: "fast", Elements: []string{"ingest"}}}},
 	})
 }
@@ -509,9 +509,9 @@ func TestAGroupHintRequestFollowsTheFlowsThatMatchIt(t *testing.T) {
 
 	request := f.request(api.RequestSpec{
 		Name: "camera-1",
-		Source: api.Source{Node: "studio-a", Domain: src.source("cameras"), Select: api.Selector{
+		Sources: []api.Source{{Node: "studio-a", Domain: src.source("cameras"), Select: api.Selector{
 			GroupHint: &api.GroupHintSelector{Name: "Studio A:Camera 1"},
-		}},
+		}}},
 		Destinations: []api.Destination{{Node: "edge-01", Domain: api.Domain{Area: "fast", Elements: []string{"ingest"}}}},
 	})
 
@@ -562,6 +562,107 @@ func TestAGroupHintRequestFollowsTheFlowsThatMatchIt(t *testing.T) {
 	require.Equal(t, http.StatusOK, resp.status)
 }
 
+// --- 6b. fan-in: many sources into one destination domain (§9.1) --------------------------------
+
+// The arrangement fan-in exists for: two studios into one ingest domain, as **one** request.
+//
+// The whole of the change is at the request level. Below it nothing moved — a path is still one
+// source flow address to one (node, domain), each path is still its own session and worker pair,
+// and the destination domain is materialised once and shared, which is the refcount that already
+// governed two requests naming one domain (§10.6).
+func TestARequestFansInFromSeveralSources(t *testing.T) {
+	f := newFleet(t, fleetOptions{})
+	a := f.addNode("studio-a", nodeOptions{domains: []string{"cameras"}})
+	b := f.addNode("studio-b", nodeOptions{domains: []string{"cameras"}})
+	dst := f.addNode("edge-01", nodeOptions{})
+
+	// Distinct flow IDs: one ID from two studios into one domain is the corruption case, and it is
+	// refused rather than replicated (§7.2).
+	fromA := a.createFlow("cameras", videoFlowDef("Studio A:Camera 1", "video"))
+	fromB := b.createFlow("cameras", videoFlowDef("Studio B:Camera 1", "video"))
+	fromA.produce()
+	fromB.produce()
+
+	request := f.request(api.RequestSpec{
+		Name: "ingest-wall",
+		Sources: []api.Source{
+			{Node: "studio-a", Domain: a.source("cameras"), Select: api.Selector{All: true}},
+			{Node: "studio-b", Domain: b.source("cameras"), Select: api.Selector{All: true}},
+		},
+		Destinations: []api.Destination{{Node: "edge-01", Domain: api.Domain{Area: "fast", Elements: []string{"ingest"}}}},
+	})
+
+	// Every flow in each domain, which is what `all` means: the produced camera *and* the seed flow
+	// every source domain is created with. Four paths, two of which have anything to do.
+	f.eventually("both produced flows to establish into one domain", func() bool {
+		paths := f.paths().Paths
+		if len(paths) != 4 {
+			return false
+		}
+		running := 0
+		for _, path := range paths {
+			if path.Session == nil || path.Session.Epoch == "" {
+				continue
+			}
+			if dst.worker(path.Session.ID, api.RoleTarget) == nil {
+				continue
+			}
+			initiator := a
+			if path.Source.Node == "studio-b" {
+				initiator = b
+			}
+			if initiator.worker(path.Session.ID, api.RoleInitiator) == nil {
+				continue
+			}
+			running++
+		}
+		return running == 2
+	})
+
+	// One target per *producing* source on the destination node — 2× ingress there, which is the
+	// grouping fan-in makes legible and the binding direction for an ingest wall (§9.1). An idle
+	// source starts no workers at all (§11.1), which is why the seed flows cost nothing.
+	assert.Equal(t, 2, dst.starts())
+	assert.Equal(t, 1, a.starts())
+	assert.Equal(t, 1, b.starts())
+
+	seen := map[string]int{}
+	replicated := map[string]bool{}
+	for _, path := range f.paths().Paths {
+		assert.Equal(t, "edge-01/fast/ingest", path.Destination.Endpoint())
+		assert.Equal(t, []string{request.ID}, path.Requests, "one request owns every path")
+		seen[path.Source.Node]++
+		replicated[path.Source.Flow] = true
+	}
+	assert.Equal(t, map[string]int{"studio-a": 2, "studio-b": 2}, seen)
+	assert.True(t, replicated[fromA.ID()])
+	assert.True(t, replicated[fromB.ID()])
+
+	// One domain directory, materialised once and shared by both sources.
+	assert.DirExists(t, dst.path("ingest"))
+
+	// The per-source breakdown is the view fan-in needs: the aggregate is one line and cannot say
+	// which studio is which (§11).
+	var got api.Request
+	f.do(http.MethodGet, api.RequestPath(request.RequestID()), nil).decode(t, &got)
+	require.Len(t, got.Status.Sources, 2)
+	assert.Equal(t, "studio-a", got.Status.Sources[0].Source.Node)
+	assert.Equal(t, "studio-b", got.Status.Sources[1].Source.Node)
+	for _, row := range got.Status.Sources {
+		assert.Len(t, row.Paths, 2)
+	}
+
+	// **Not PARTIAL**: nothing here is ACTIVE. A fake worker never makes the destination flow
+	// advance, so both established paths settle into PAUSED beside the two idle ones — and PARTIAL
+	// claims something is working, which it must not say when nothing is (§11).
+	assert.NotEqual(t, api.StatePartial, got.Status.State)
+	assert.Zero(t, got.Status.Counts[api.StateActive])
+
+	// Cancelling the one request takes both sessions and the shared domain with it.
+	f.cancel(request.RequestID())
+	f.eventually("both sessions to be withdrawn", func() bool { return len(f.paths().Paths) == 0 })
+}
+
 // --- 7. the state progression -------------------------------------------------------------------
 
 // M7.7: WAITING → ESTABLISHING → PAUSED → ACTIVE, driven by head-index movement on real flow
@@ -592,7 +693,7 @@ func TestThePathStateFollowsTheFlows(t *testing.T) {
 	def := videoFlowDef("Studio A:Camera 1", "video")
 	f.request(api.RequestSpec{
 		Name:         "cam1",
-		Source:       api.Source{Node: "studio-a", Domain: src.source("cameras"), Select: api.Selector{Flow: def.ID}},
+		Sources:      []api.Source{{Node: "studio-a", Domain: src.source("cameras"), Select: api.Selector{Flow: def.ID}}},
 		Destinations: []api.Destination{{Node: "edge-01", Domain: api.Domain{Area: "fast", Elements: []string{"ingest"}}}},
 	})
 
@@ -695,7 +796,7 @@ func TestAnOutputDomainIsRefcountedAcrossRequests(t *testing.T) {
 	replicate := func(name, flowID string) api.Request {
 		return f.request(api.RequestSpec{
 			Name:         name,
-			Source:       api.Source{Node: "studio-a", Domain: src.source("cameras"), Select: api.Selector{Flow: flowID}},
+			Sources:      []api.Source{{Node: "studio-a", Domain: src.source("cameras"), Select: api.Selector{Flow: flowID}}},
 			Destinations: []api.Destination{{Node: "edge-01", Domain: api.Domain{Area: "fast", Elements: []string{"ingest"}}}},
 		})
 	}
@@ -757,7 +858,7 @@ func TestAChainUsesAMaterialisedDomainAsItsSource(t *testing.T) {
 
 	f.request(api.RequestSpec{
 		Name:         "a-to-b",
-		Source:       api.Source{Node: "studio-a", Domain: a.source("cameras"), Select: api.Selector{Flow: flow.ID()}},
+		Sources:      []api.Source{{Node: "studio-a", Domain: a.source("cameras"), Select: api.Selector{Flow: flow.ID()}}},
 		Destinations: []api.Destination{{Node: "edge-01", Domain: api.Domain{Area: "fast", Elements: []string{"mid"}}}},
 	})
 	f.eventually("the first hop to establish", func() bool {
@@ -785,7 +886,7 @@ func TestAChainUsesAMaterialisedDomainAsItsSource(t *testing.T) {
 
 	f.request(api.RequestSpec{
 		Name:         "b-to-c",
-		Source:       api.Source{Node: "edge-01", Domain: named("fast/mid"), Select: api.Selector{Flow: middle.ID()}},
+		Sources:      []api.Source{{Node: "edge-01", Domain: named("fast/mid"), Select: api.Selector{Flow: middle.ID()}}},
 		Destinations: []api.Destination{{Node: "edge-02", Domain: api.Domain{Area: "fast", Elements: []string{"ingest"}}}},
 	})
 
@@ -922,8 +1023,8 @@ func TestADomainInAReadOnlyAreaIsASourceAndNeverADestination(t *testing.T) {
 	// (§10.6). Refused at the API boundary rather than stored as INVALID, which is the better
 	// place for it: nothing is persisted and no reconcile ever sees it.
 	refused := f.do(http.MethodPost, api.NamespaceRequestsPath(api.DefaultNamespace), api.RequestSpec{
-		Name:   "write-anywhere",
-		Source: api.Source{Node: "studio-a", Domain: src.source("cameras"), Select: api.Selector{Flow: flow.ID()}},
+		Name:    "write-anywhere",
+		Sources: []api.Source{{Node: "studio-a", Domain: src.source("cameras"), Select: api.Selector{Flow: flow.ID()}}},
 		Destinations: []api.Destination{{
 			Node: "edge-01", Domain: api.Domain{Area: "ro", Elements: []string{"adhoc"}},
 		}},
@@ -940,8 +1041,8 @@ func TestADomainInAReadOnlyAreaIsASourceAndNeverADestination(t *testing.T) {
 	// And a raw path where a domain's elements belong is refused structurally, before the fleet
 	// is consulted at all: a separator is simply not something an element may contain (§10.6).
 	raw := f.do(http.MethodPost, api.NamespaceRequestsPath(api.DefaultNamespace), api.RequestSpec{
-		Name:   "raw-path",
-		Source: api.Source{Node: "studio-a", Domain: src.source("cameras"), Select: api.Selector{Flow: flow.ID()}},
+		Name:    "raw-path",
+		Sources: []api.Source{{Node: "studio-a", Domain: src.source("cameras"), Select: api.Selector{Flow: flow.ID()}}},
 		Destinations: []api.Destination{{
 			Node: "edge-01", Domain: api.Domain{Area: "fast", Elements: []string{found}},
 		}},
@@ -953,7 +1054,7 @@ func TestADomainInAReadOnlyAreaIsASourceAndNeverADestination(t *testing.T) {
 	// The same domain as a *source* is fine, and replicates into a writable area.
 	f.request(api.RequestSpec{
 		Name:         "adhoc-in",
-		Source:       api.Source{Node: "studio-a", Domain: named("ro/adhoc"), Select: api.Selector{Flow: flow.ID()}},
+		Sources:      []api.Source{{Node: "studio-a", Domain: named("ro/adhoc"), Select: api.Selector{Flow: flow.ID()}}},
 		Destinations: []api.Destination{{Node: "edge-01", Domain: api.Domain{Area: "fast", Elements: []string{"ingest"}}}},
 	})
 	f.eventually("a session from the discovered domain", func() bool {
@@ -998,7 +1099,7 @@ func TestNoSharedFabricIsRefusedAtTheRequest(t *testing.T) {
 
 	refused := f.do(http.MethodPost, api.NamespaceRequestsPath(api.DefaultNamespace), api.RequestSpec{
 		Name:         "across-fabrics",
-		Source:       api.Source{Node: "studio-a", Domain: src.source("cameras"), Select: api.Selector{Flow: flow.ID()}},
+		Sources:      []api.Source{{Node: "studio-a", Domain: src.source("cameras"), Select: api.Selector{Flow: flow.ID()}}},
 		Destinations: []api.Destination{{Node: "edge-01", Domain: api.Domain{Area: "fast", Elements: []string{"ingest"}}}},
 	})
 	require.Equal(t, http.StatusBadRequest, refused.status, "body: %s", refused.body)
@@ -1073,7 +1174,7 @@ func TestALabelAppliedBeforeItsDomainResolvesWhenAProducerAppears(t *testing.T) 
 	// an error.
 	request := f.request(api.RequestSpec{
 		Name:         "late",
-		Source:       api.Source{Node: "studio-a", Domain: api.SelectLabels(map[string]string{"role": "late"}), Select: api.Selector{Flow: "does-not-exist"}},
+		Sources:      []api.Source{{Node: "studio-a", Domain: api.SelectLabels(map[string]string{"role": "late"}), Select: api.Selector{Flow: "does-not-exist"}}},
 		Destinations: []api.Destination{{Node: "edge-01", Domain: api.Domain{Area: "fast", Elements: []string{"ingest"}}}},
 	})
 	assert.Equal(t, api.StateWaiting, request.Status.State)
@@ -1107,11 +1208,11 @@ func TestARelabelMovesTheExpansionWithoutRestartingAWorker(t *testing.T) {
 
 	f.request(api.RequestSpec{
 		Name: "live",
-		Source: api.Source{
+		Sources: []api.Source{{
 			Node:   "studio-a",
 			Domain: api.SelectLabels(map[string]string{"role": "live"}),
 			Select: api.Selector{GroupHint: &api.GroupHintSelector{Name: "Studio A:Camera 1"}},
-		},
+		}},
 		Destinations: []api.Destination{{Node: "edge-01", Domain: api.Domain{Area: "fast", Elements: []string{"ingest"}}}},
 	})
 
@@ -1172,7 +1273,7 @@ func TestASelectorSkipsThisProjectsOutputWhileNamingItStillChains(t *testing.T) 
 	// thing writing it — which is what `replicated` reports (§6).
 	f.request(api.RequestSpec{
 		Name:         "a-to-b",
-		Source:       api.Source{Node: "studio-a", Domain: src.source("cameras"), Select: api.Selector{Flow: original.ID()}},
+		Sources:      []api.Source{{Node: "studio-a", Domain: src.source("cameras"), Select: api.Selector{Flow: original.ID()}}},
 		Destinations: []api.Destination{{Node: "edge-01", Domain: api.Domain{Area: "fast", Elements: []string{"ingest"}}}},
 	})
 	f.eventually("the first hop to establish", func() bool {
@@ -1212,11 +1313,11 @@ func TestASelectorSkipsThisProjectsOutputWhileNamingItStillChains(t *testing.T) 
 	// A **label selector** takes the sibling and not the replicated one.
 	f.request(api.RequestSpec{
 		Name: "matched",
-		Source: api.Source{
+		Sources: []api.Source{{
 			Node:   "edge-01",
 			Domain: api.SelectLabels(map[string]string{"role": "onward"}),
 			Select: api.Selector{GroupHint: &api.GroupHintSelector{Name: "Studio A:Camera 1"}},
-		},
+		}},
 		Destinations: []api.Destination{{Node: "edge-02", Domain: api.Domain{Area: "fast", Elements: []string{"ingest"}}}},
 	})
 
@@ -1248,7 +1349,7 @@ func TestASelectorSkipsThisProjectsOutputWhileNamingItStillChains(t *testing.T) 
 	// explicit chaining is intent, matched chaining is emergence (§10.7).
 	f.request(api.RequestSpec{
 		Name:         "named",
-		Source:       api.Source{Node: "edge-01", Domain: named("fast/ingest"), Select: api.Selector{Flow: replicated.ID()}},
+		Sources:      []api.Source{{Node: "edge-01", Domain: named("fast/ingest"), Select: api.Selector{Flow: replicated.ID()}}},
 		Destinations: []api.Destination{{Node: "edge-02", Domain: api.Domain{Area: "fast", Elements: []string{"onward"}}}},
 	})
 	f.eventually("the named source to reach the replicated flow", func() bool {

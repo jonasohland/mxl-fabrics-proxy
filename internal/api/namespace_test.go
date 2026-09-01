@@ -62,7 +62,7 @@ func TestRequestNamespaceIsAField(t *testing.T) {
 	require.NoError(t, json.Unmarshal([]byte(`{
 		"name": "cam1",
 		"namespace": "nab",
-		"source": {"node": "studio-a", "domain": {"name": {"area": "media", "elements": ["cameras"]}}, "select": {"flow": "f-1"}},
+		"sources": [{"node": "studio-a", "domain": {"name": {"area": "media", "elements": ["cameras"]}}, "select": {"flow": "f-1"}}],
 		"destinations": [{"node": "edge-01", "domain": {"area": "fast", "elements": ["ingest"]}}]
 	}`), &spec))
 

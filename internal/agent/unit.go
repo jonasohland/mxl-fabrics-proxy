@@ -157,6 +157,18 @@ func (u *unit) run(ctx context.Context) {
 // the distinction to mean something, and it does not — a bad domain path kills a target before
 // its metrics socket exists, which looks like neither (WRS §5.1).
 func (u *unit) attempt(ctx context.Context) (worker.Exit, bool) {
+	// Rate control, and note where it sits: inside the supervision goroutine, so a start that has
+	// to wait for a permit delays this worker and nothing else (§6.3). Reconcile never blocks on a
+	// start (§6), which is what keeps a queued start from stopping the node from noticing the
+	// assignment that would withdraw it — including this one.
+	//
+	// Before the state is stamped, because the queue is not the process: [unit.startedAt] anchors
+	// how long this worker has been *running*, which is what the server classifies from (§15.1),
+	// and a permit wait is not running.
+	if !u.agent.starts.admit(ctx, u.waitingForPermit) {
+		return worker.Exit{At: u.agent.now(), Stopped: true}, false
+	}
+
 	u.setState(api.WorkerStarting, "", "")
 
 	// The worker does not create its domain directory (WRS §5.1). Writable areas are pre-created
@@ -252,6 +264,26 @@ func (u *unit) terminate(ctx context.Context, handle worker.Handle) {
 	if err := handle.Stop(stopCtx); err != nil {
 		u.log.Warn("stopping the worker did not complete cleanly", "error", err)
 	}
+}
+
+// waitingForPermit records that this worker is queued behind the start gate (§6.3).
+//
+// Reported rather than left silent: a worker that has not been launched yet is otherwise
+// indistinguishable from one that was launched and is coming up slowly, and an operator watching
+// a bulk re-establishment needs to be able to tell "the node is pacing itself" from "this session
+// is stuck". It is only ever reached on a start that actually waited, so the unthrottled path
+// still produces no status change at all.
+//
+// Not [unit.setState]: the state is already `starting` and re-stamping [unit.startedAt] here
+// would count the queue as running time.
+func (u *unit) waitingForPermit() {
+	u.log.Info("waiting for a permit to start")
+
+	u.mu.Lock()
+	u.state, u.reason, u.reasonCode = api.WorkerStarting, "waiting for a permit to start", ""
+	u.mu.Unlock()
+
+	u.agent.Notify()
 }
 
 func (u *unit) setState(state api.WorkerState, reason string, code api.ReasonCode) {

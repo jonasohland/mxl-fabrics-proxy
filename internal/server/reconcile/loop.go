@@ -446,7 +446,7 @@ func (l *Loop) observe(fleet *state.Fleet, result *Result, took time.Duration) {
 		Nodes:        len(fleet.Nodes),
 		Leases:       len(fleet.Leases),
 		Versions:     map[VersionKey]int{},
-		Requests:     zeroed(api.States()),
+		Requests:     zeroed(api.RequestStates()),
 		Paths:        zeroed(api.States()),
 		Workers:      zeroed(api.WorkerStates()),
 		Frozen:       len(result.Frozen),

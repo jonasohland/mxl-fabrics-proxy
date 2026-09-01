@@ -559,6 +559,79 @@ func TestShutdownStopsEveryWorker(t *testing.T) {
 	}
 }
 
+// Worker starts are paced (§6.3). What the gate must *not* do is pace anything else, and this
+// covers the two halves: a queued start reports why it is queued rather than sitting silent, and
+// the workers that were admitted come up normally beside it.
+func TestWorkerStartsArePaced(t *testing.T) {
+	h := newHarness(t, harnessOptions{tweak: func(cfg *Config) {
+		// One start per twenty seconds, burst of one: anything past the first is still queued when
+		// this test ends, which is what makes the assertions below about pacing rather than about
+		// timing.
+		cfg.StartRate, cfg.StartBurst = 0.05, 1
+	}})
+	h.server.assign("edge-01", targetAssignment("s1"), targetAssignment("s2"), targetAssignment("s3"))
+	h.run()
+
+	h.eventually("the first worker", func() bool { return h.launcher.StartCount() == 1 })
+	h.consistently("only one worker started", 300*time.Millisecond, func() bool {
+		return h.launcher.StartCount() == 1
+	})
+
+	// Reported, not silent: a worker that has not been launched yet is otherwise
+	// indistinguishable from one that was launched and is coming up slowly.
+	h.eventually("the queued workers to say so", func() bool {
+		queued := 0
+		for _, session := range []string{"s1", "s2", "s3"} {
+			status, ok := h.server.lastStatus(session, api.RoleTarget)
+			if ok && status.State == api.WorkerStarting && status.Reason == "waiting for a permit to start" {
+				queued++
+			}
+		}
+		return queued == 2
+	})
+
+	// The one that was admitted is a normal worker: it produced its blob and its epoch, and
+	// nothing about the gate is on that path.
+	h.eventually("the admitted worker to be ready", func() bool {
+		for _, session := range []string{"s1", "s2", "s3"} {
+			status, ok := h.server.lastStatus(session, api.RoleTarget)
+			if ok && status.State == api.WorkerReady && status.Epoch != "" {
+				return true
+			}
+		}
+		return false
+	})
+
+	body := h.expose()
+	assert.Contains(t, body, "mxl_repl_worker_starts_waiting 2")
+	assert.Contains(t, body, "mxl_repl_worker_starts_delayed_total 2")
+}
+
+// **Rate control applies to starts and to nothing else.** Reconcile stops workers synchronously
+// (§6), so a queued start that ignored its cancelled context would hold every other stop on the
+// node behind a permit that is minutes away — a withdrawal, an agent shutdown and a rolling
+// upgrade all wedged by a worker that never ran.
+func TestAQueuedStartDoesNotHoldUpAWithdrawal(t *testing.T) {
+	h := newHarness(t, harnessOptions{tweak: func(cfg *Config) {
+		cfg.StartRate, cfg.StartBurst = 0.05, 1
+	}})
+	h.server.assign("edge-01", targetAssignment("s1"), targetAssignment("s2"))
+	h.run()
+
+	h.eventually("one worker to be queued", func() bool {
+		waiting, _, _ := h.starts.stats()
+		return waiting == 1 && h.launcher.StartCount() == 1
+	})
+
+	// Both withdrawn. The queued one has a permit twenty seconds away and must leave now: the
+	// harness's own deadline is five seconds, so waiting it out fails this test.
+	h.server.assign("edge-01")
+	h.eventually("both sessions to be released", func() bool {
+		waiting, _, _ := h.starts.stats()
+		return waiting == 0 && len(h.cfg.Ports.Owners()) == 0
+	})
+}
+
 // A capability probe that fails must not produce a registration claiming this node can do
 // nothing: an attachment list is what negotiation runs on, and an empty one silently makes every
 // request through this node fail with no_shared_fabric.

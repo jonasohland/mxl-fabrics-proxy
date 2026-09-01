@@ -131,6 +131,27 @@ func (c *collector) Collect(ch chan<- prometheus.Metric) {
 		float64(running(targets)))
 	ch <- prometheus.MustNewConstMetric(scrapeFailuresDesc, prometheus.CounterValue,
 		float64(failures))
+
+	c.emitStartGate(ch)
+}
+
+// emitStartGate exposes what rate control on worker starts is doing (§6.3, §12).
+//
+// Three series, unlabelled, because the gate is one thing per node rather than one per worker —
+// and it is the thing that makes a paced node legible. Without them a fleet that is deliberately
+// spreading a re-establishment over seconds looks identical to one whose workers are failing to
+// come up, which is the state an operator would otherwise reach for the restart counters to
+// diagnose and find nothing.
+//
+// The counters are cumulative and the gauge is instantaneous, deliberately in that split: a
+// permit wait is over in seconds, so a gauge alone would usually read zero during exactly the
+// event worth seeing, and a counter alone could not say that the node is queued *now*.
+func (c *collector) emitStartGate(ch chan<- prometheus.Metric) {
+	waiting, delayed, waited := c.agent.starts.stats()
+
+	ch <- prometheus.MustNewConstMetric(startsWaitingDesc, prometheus.GaugeValue, float64(waiting))
+	ch <- prometheus.MustNewConstMetric(startsDelayedDesc, prometheus.CounterValue, float64(delayed))
+	ch <- prometheus.MustNewConstMetric(startDelayDesc, prometheus.CounterValue, waited.Seconds())
 }
 
 var (
@@ -147,6 +168,21 @@ var (
 	scrapeFailuresDesc = prometheus.NewDesc(
 		metrics.Control("worker_scrapes_failed_total"),
 		"Worker scrapes that returned an error or timed out.",
+		nil, nil)
+
+	startsWaitingDesc = prometheus.NewDesc(
+		metrics.Control("worker_starts_waiting"),
+		"Workers currently waiting for a permit before this node will start them.",
+		nil, nil)
+
+	startsDelayedDesc = prometheus.NewDesc(
+		metrics.Control("worker_starts_delayed_total"),
+		"Worker starts that had to wait for a permit. Unthrottled starts are not counted.",
+		nil, nil)
+
+	startDelayDesc = prometheus.NewDesc(
+		metrics.Control("worker_start_delay_seconds_total"),
+		"Total time worker starts have spent waiting for a permit.",
 		nil, nil)
 )
 

@@ -76,7 +76,7 @@ func TestProviderPinValidateRejectsTypos(t *testing.T) {
 func validSpec() RequestSpec {
 	return RequestSpec{
 		Name:         "studio-a-cam1-to-edge",
-		Source:       Source{Node: "studio-a", Domain: SelectDomain(Domain{Area: "media", Elements: []string{"cameras"}}), Select: Selector{Flow: "5592a23b"}},
+		Sources:      []Source{{Node: "studio-a", Domain: SelectDomain(Domain{Area: "media", Elements: []string{"cameras"}}), Select: Selector{Flow: "5592a23b"}}},
 		Destinations: []Destination{{Node: "edge-01", Domain: Domain{Area: "fast", Elements: []string{"ingest"}}}},
 	}
 }
@@ -90,11 +90,11 @@ func TestRequestSpecValidate(t *testing.T) {
 		"no name":          func(s *RequestSpec) { s.Name = "" },
 		"control char":     func(s *RequestSpec) { s.Name = "cam\n1" },
 		"overlong name":    func(s *RequestSpec) { s.Name = string(make([]byte, maxNameLength+1)) },
-		"no source node":   func(s *RequestSpec) { s.Source.Node = "" },
-		"no source domain": func(s *RequestSpec) { s.Source.Domain = DomainSelector{} },
-		"no selector":      func(s *RequestSpec) { s.Source.Select = Selector{} },
+		"no source node":   func(s *RequestSpec) { s.Sources[0].Node = "" },
+		"no source domain": func(s *RequestSpec) { s.Sources[0].Domain = DomainSelector{} },
+		"no selector":      func(s *RequestSpec) { s.Sources[0].Select = Selector{} },
 		"two selectors": func(s *RequestSpec) {
-			s.Source.Select.GroupHint = &GroupHintSelector{Name: "Studio A"}
+			s.Sources[0].Select.GroupHint = &GroupHintSelector{Name: "Studio A"}
 		},
 		"no destination node":   func(s *RequestSpec) { s.Destinations[0].Node = "" },
 		"no destination domain": func(s *RequestSpec) { s.Destinations[0].Domain = Domain{} },
@@ -144,11 +144,18 @@ func TestRequestSpecDecodesTheDocumentedBody(t *testing.T) {
 
 	const body = `{
 	  "name": "cam1-distribution",
-	  "source": {
-	    "node": "studio-a",
-	    "domain": { "name": { "area": "media", "elements": ["cameras"] } },
-	    "select": { "flow": "5592a23b-0974-45bb-9388-89ea81c42537" }
-	  },
+	  "sources": [
+	    {
+	      "node": "studio-a",
+	      "domain": { "labels": { "role": "cameras" } },
+	      "select": { "flow": "5592a23b-0974-45bb-9388-89ea81c42537" }
+	    },
+	    {
+	      "node": "studio-b",
+	      "domain": { "name": { "area": "media", "elements": ["cameras"] } },
+	      "select": { "all": true }
+	    }
+	  ],
 	  "destinations": [
 	    { "node": "edge-01", "domain": {"area": "fast", "elements": ["ingest"]} },
 	    { "node": "edge-02", "domain": {"area": "fast", "elements": ["studio-a", "cam1"]} },
@@ -162,7 +169,14 @@ func TestRequestSpecDecodesTheDocumentedBody(t *testing.T) {
 	require.NoError(t, spec.Validate())
 
 	assert.Equal(t, "cam1-distribution", spec.Name)
-	assert.Equal(t, "5592a23b-0974-45bb-9388-89ea81c42537", spec.Source.Select.Flow)
+	require.Len(t, spec.Sources, 2)
+	assert.Equal(t, "5592a23b-0974-45bb-9388-89ea81c42537", spec.Sources[0].Select.Flow)
+
+	// A source's domain is a selector, not a name: `{"labels": …}` matches, `{"name": …}` addresses
+	// one directly (§10.7). And `all` is a selector kind like any other on the wire (§9.1).
+	assert.Equal(t, DomainSelectorKindLabels, spec.Sources[0].Domain.Kind())
+	assert.Equal(t, DomainSelectorKindName, spec.Sources[1].Domain.Kind())
+	assert.Equal(t, SelectorKindAll, spec.Sources[1].Select.Kind())
 	assert.Equal(t, ProviderPin{ProviderVerbs}, spec.Provider)
 	require.Len(t, spec.Destinations, 3)
 
@@ -204,7 +218,7 @@ func TestRequestFlattensItsSpec(t *testing.T) {
 
 	assert.Contains(t, raw, "id")
 	assert.Contains(t, raw, "name")
-	assert.Contains(t, raw, "source")
+	assert.Contains(t, raw, "sources")
 	assert.Contains(t, raw, "destinations")
 	assert.NotContains(t, raw, "RequestSpec")
 }

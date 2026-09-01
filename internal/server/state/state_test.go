@@ -54,7 +54,7 @@ func TestLoadRoutesEveryLayer(t *testing.T) {
 		Spec: api.RequestSpec{
 			Namespace:    "nab",
 			Name:         "cam1",
-			Source:       api.Source{Node: "studio-a", Domain: named("media/cameras"), Select: api.Selector{Flow: "flow-1"}},
+			Sources:      []api.Source{{Node: "studio-a", Domain: named("media/cameras"), Select: api.Selector{Flow: "flow-1"}}},
 			Destinations: []api.Destination{{Node: "edge-01", Domain: api.Domain{Area: "fast", Elements: []string{"ingest"}}}},
 		},
 	})

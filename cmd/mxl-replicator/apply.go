@@ -133,8 +133,18 @@ func (c *ApplyCmd) applyRequest(ctx context.Context, cl *client.Client, doc mani
 		fmt.Printf("%s %s\n", id, applyError(err))
 		return 1
 	}
-	fmt.Printf("%s %s%s\n", id, applied.Outcome, statusSuffix(applied.Request.Status))
+	fmt.Printf("%s %s%s%s\n", id, applied.Outcome, pathCount(applied.Request.Status), statusSuffix(applied.Request.Status))
 	return 0
+}
+
+// pathCount is the blast radius of what was just applied, and it is not decoration (§9.1).
+//
+// The outcome header says `created` / `updated` / `unchanged` and says nothing about a request whose
+// expansion went from one path to forty — which is exactly what deleting a `group_hint:` line does,
+// since an omitted selector means every flow in the domain. It costs nothing to print: the POST
+// response already carries the expansion.
+func pathCount(status api.RequestStatus) string {
+	return fmt.Sprintf(" (%d path(s))", len(status.Paths))
 }
 
 // applyNamespace posts one namespace document and prints its line. Returns 1 if it failed.

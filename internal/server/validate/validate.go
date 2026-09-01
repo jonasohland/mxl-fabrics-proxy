@@ -37,24 +37,33 @@ type Result struct {
 
 func (r Result) String() string { return fmt.Sprintf("%s: %s", r.Code, r.Message) }
 
-// Destination checks everything about **one destination of a request** that follows from node
-// registrations alone: the endpoints, the destination domain, the requested scheduling priority,
-// and whether any interface pair exists at all.
+// Pairing checks everything about **one (source, destination) pairing of a request** that follows
+// from node registrations alone: the endpoints, the destination domain, the requested scheduling
+// priority, and whether any interface pair exists at all.
 //
-// It returns nil when that destination is acceptable, and a [Result] naming precisely what an
-// operator has to change when it is not. It never returns "not yet" — a destination that is fine
-// but not currently satisfiable is WAITING, and that is decided elsewhere.
+// It returns nil when that pairing is acceptable, and a [Result] naming precisely what an operator
+// has to change when it is not. It never returns "not yet" — a pairing that is fine but not
+// currently satisfiable is WAITING, and that is decided elsewhere.
 //
-// **Per destination, not per request**, because a request fans out (§9.1) and its destinations
-// fail independently: a node that dropped its writable area must not stop the request's other two
-// destinations from establishing new sessions. The caller decides what a failure here means for
-// the request as a whole — at POST it is a rejection, on a stored request it is one INVALID leg
+// **Per pairing, not per request**, because a request fans in and out (§9.1) and its pairings fail
+// independently: a node that dropped its writable area must not stop the request's other two
+// destinations from establishing new sessions. The caller decides what a failure here means for the
+// request as a whole — at POST it is a rejection, on a stored request it is one INVALID leg
 // alongside working ones.
+//
+// *This used to be per destination*, and was per destination only because there was one source. It
+// was always per pairing in substance: an interface config is negotiated for a session, and a
+// session has two ends (§10.3).
+//
+// Indices rather than the values themselves, because several of these messages have to name **both
+// ends** — "source and destination are both edge-01/fast/ingest" does not say which of nine sources
+// it is — and the position in the request is the only handle an operator has on a source that
+// carries no name of its own.
 //
 // The negotiated result is returned too, because the caller needs it anyway and negotiating
 // twice is how the answer at validation time and the answer at assignment time drift apart.
-func Destination(spec api.RequestSpec, dst api.Destination, fleet *state.Fleet, cfg negotiate.Config) (negotiate.Result, *Result) {
-	src := spec.Source
+func Pairing(spec api.RequestSpec, srcIndex, dstIndex int, fleet *state.Fleet, cfg negotiate.Config) (negotiate.Result, *Result) {
+	src, dst := spec.Sources[srcIndex], spec.Destinations[dstIndex]
 
 	// A session from a (node, domain) to itself would have the initiator and the target reading
 	// and writing one ring buffer. Same node, *different* domain is legitimate and is exactly
@@ -66,11 +75,15 @@ func Destination(spec api.RequestSpec, dst api.Destination, fleet *state.Fleet, 
 	// it was asked to, and refusing the request would put its author at the mercy of which domains
 	// happen to carry a label. There the pairing is *elided* and the rest of the expansion stands,
 	// which happens in the reconciler, where the expansion is.
+	//
+	// Refusing the whole request for one bad pairing is right *here* and nowhere else: with both
+	// ends named it is a typo, and the author can see both halves of it in the file they just wrote.
 	if src.Domain.Kind() == api.DomainSelectorKindName &&
 		src.Node == dst.Node && src.Domain.Name.Equal(dst.Domain) {
 		return negotiate.Result{}, &Result{
-			Code:    api.ReasonSameEndpoint,
-			Message: fmt.Sprintf("source and destination are both %s/%s", src.Node, dst.DomainName()),
+			Code: api.ReasonSameEndpoint,
+			Message: fmt.Sprintf("sources[%d] and destinations[%d] are both %s/%s",
+				srcIndex, dstIndex, src.Node, dst.DomainName()),
 		}
 	}
 
@@ -97,19 +110,11 @@ func Destination(spec api.RequestSpec, dst api.Destination, fleet *state.Fleet, 
 		return negotiate.Result{}, bad
 	}
 
-	// Requested but unavailable scheduling priority fails now rather than producing workers that
-	// silently run at normal priority — which would look like a performance problem in the
-	// media, not a configuration problem in the request.
-	if spec.SchedPrio != nil {
-		for _, node := range []state.Entry[state.NodeRecord]{source, destination} {
-			if !node.Value.Capabilities.SchedPrio {
-				return negotiate.Result{}, &Result{
-					Code:    api.ReasonSchedPrioUnavailable,
-					Message: fmt.Sprintf("node %q cannot apply sched_prio: no CAP_SYS_NICE or RLIMIT_RTPRIO", node.Value.Node),
-				}
-			}
-		}
-	}
+	// *`sched_prio` used to be checked here.* It is a property of the **host**, not of a pairing, so
+	// it belongs in [Request]: checked once over every node the request names, reported once naming
+	// the node that lacks it. Checked per pairing it produced one failure per pairing, each naming
+	// whichever end happened to be examined first — which makes a single missing capability look
+	// like several problems and defeats the attribution rule §9.1 asks for.
 
 	result, err := negotiate.Negotiate(
 		source.Value.Capabilities.Fabrics,
@@ -124,6 +129,108 @@ func Destination(spec api.RequestSpec, dst api.Destination, fleet *state.Fleet, 
 	}
 
 	return result, nil
+}
+
+// Request checks the things that are wrong about a request **as a whole** rather than about one of
+// its pairings, and that follow from the request body alone (§7.2, §9.1).
+//
+// Two rules today, and what they have in common is the reason they are not in [Pairing]: neither
+// belongs to a pairing, and reporting either one per pairing would make one problem look like
+// several and point at whichever end happened to be examined first (§9.1).
+//
+//   - `duplicate_source_flow` — two sources pinning the same flow UUID, with a destination in
+//     common, are two initiators writing one destination ring buffer. [Conflicts]' flow_conflict
+//     arriving from inside a single request, and decidable here because both sources pinned rather
+//     than selected. *Not* the general case: a source that selects rather than pins can collide
+//     with anything at any time, and that collision is [api.ReasonFlowConflict] on the path,
+//     resolved by §7.5. This catches only the form an operator could have seen in the file they
+//     wrote.
+//   - `sched_prio_unavailable` — the capability is a property of the **host** (§10.2), so it is
+//     checked over every node the request names and the rejection names the node, not the pairing.
+//     Requested but unavailable priority fails now rather than producing workers that silently run
+//     at normal priority, which would look like a performance problem in the media rather than a
+//     configuration problem in the request.
+//
+// Both live beside [Pairing] rather than in [api.RequestSpec.Validate] for the reason the whole
+// package exists: this is the code that answers both "can I accept this POST" and "is this stored
+// request still valid", and a rule that only ran at POST would let a request written straight into
+// the store reach an agent as an assignment.
+func Request(spec api.RequestSpec, fleet *state.Fleet) *Result {
+	if bad := duplicateSourceFlow(spec); bad != nil {
+		return bad
+	}
+	return schedPrio(spec, fleet)
+}
+
+// schedPrio checks the requested priority against every node the request names.
+//
+// Unregistered nodes are skipped: [Pairing] reports those as `node_not_registered`, which is the
+// more actionable message, and a node that does not exist has no capabilities to be missing.
+func schedPrio(spec api.RequestSpec, fleet *state.Fleet) *Result {
+	if spec.SchedPrio == nil {
+		return nil
+	}
+
+	names := make([]string, 0, len(spec.Sources)+len(spec.Destinations))
+	for _, src := range spec.Sources {
+		names = append(names, src.Node)
+	}
+	for _, dst := range spec.Destinations {
+		names = append(names, dst.Node)
+	}
+
+	for _, name := range names {
+		node, registered := fleet.Nodes[name]
+		if !registered || node.Value.Capabilities.SchedPrio {
+			continue
+		}
+		return &Result{
+			Code:    api.ReasonSchedPrioUnavailable,
+			Message: fmt.Sprintf("node %q cannot apply sched_prio: no CAP_SYS_NICE or RLIMIT_RTPRIO", name),
+		}
+	}
+	return nil
+}
+
+func duplicateSourceFlow(spec api.RequestSpec) *Result {
+	if len(spec.Sources) < 2 {
+		return nil
+	}
+
+	// Which source first pinned each flow UUID. Only pinned selectors participate — a group hint or
+	// `all` may or may not produce that flow, and refusing on a maybe is refusing a request that
+	// probably works.
+	holder := map[string]int{}
+	for i, src := range spec.Sources {
+		if src.Select.Kind() != api.SelectorKindFlow {
+			continue
+		}
+		flow := src.Select.Flow
+		first, taken := holder[flow]
+		if !taken {
+			holder[flow] = i
+			continue
+		}
+
+		// "Share a destination" needs no test: a request is the full cross product of its two lists
+		// (§9.1), so any two of its sources share *every* destination it names. The check is
+		// therefore two sources, one pinned flow ID — and it would become an intersection the moment
+		// a request could pair its ends selectively, which §10.8 explicitly does not do.
+		//
+		// Two entries that are the same source are caught by the dedup rule in
+		// [api.RequestSpec.Validate] and never reach here through the API. Tolerated rather than
+		// reported for a record written straight into the store: they expand to one path, which is
+		// not the corruption this refuses.
+		if spec.Sources[first].Describe() == src.Describe() {
+			continue
+		}
+		return &Result{
+			Code: api.ReasonDuplicateSourceFlow,
+			Message: fmt.Sprintf("sources[%d] (%s) and sources[%d] (%s) both pin flow %s into the same destination",
+				first, spec.Sources[first].Describe(), i, src.Describe(), flow),
+		}
+	}
+	return nil
 }
 
 // resolveArea checks that a destination names an area the node advertises and grants writing on,
@@ -258,10 +365,18 @@ func Conflicts(paths []PathRef) map[string]Result {
 
 		if existing, taken := holder[destFlow]; taken {
 			if existing != src {
+				// **Both sources, not the winner alone** (§7.5). Fan-in makes two paths of one
+				// request colliding routine rather than merely reachable, and there the tie falls
+				// all the way through to the path ID — deterministic, and *arbitrary* from the
+				// operator's point of view, because nothing in the request says which of two sources
+				// of one flow ID was meant. A message naming only the incumbent reads as an
+				// explanation when it is really a coin toss, and the fix is to change one of the two
+				// lines the operator can only find if both are named.
 				out[ref.ID] = Result{
 					Code: api.ReasonFlowConflict,
-					Message: fmt.Sprintf("%s/%s already receives flow %s from %s/%s",
-						dst.Node, dst.DomainName(), src.Flow, existing.Node, existing.Domain),
+					Message: fmt.Sprintf("%s/%s receives flow %s from %s/%s, so it cannot also receive it from %s/%s",
+						dst.Node, dst.DomainName(), src.Flow,
+						existing.Node, existing.Domain, src.Node, src.Domain),
 				}
 				continue
 			}

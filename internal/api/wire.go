@@ -143,7 +143,34 @@ const (
 	ReasonDomainNameInUse ReasonCode = "domain_name_in_use"
 
 	// ReasonSameEndpoint is a source and destination with the same (node, domain).
+	//
+	// **Checked over every (source, destination) pairing, and refusing on any one of them**, now
+	// that both ends are lists (§9.1). The message names both indices, because "source and
+	// destination are both edge-01/fast/ingest" does not say which of nine sources it is.
+	//
+	// It applies to a *named* source only. A label selector matching the destination's own domain
+	// produces the same pairing without anybody having written it twice, so there it is elided and
+	// the rest of the expansion stands (§10.7).
+	//
+	// It subsumes the disjointness check §10.8 wants as `overlapping_selectors`: with both ends
+	// enumerated, "the source and destination sets must not intersect" *is* this pairwise test, and
+	// any intra-request cycle puts one endpoint on both sides and therefore produces a self-pair in
+	// the cross product.
 	ReasonSameEndpoint ReasonCode = "same_endpoint"
+
+	// ReasonDuplicateSourceFlow is two of a request's sources pinning the same flow UUID against a
+	// shared destination: two initiators writing one destination ring buffer (§7.2, §9.1).
+	//
+	// [ReasonFlowConflict]'s harm arriving from inside a single request — and when both sources pin
+	// a flow ID it is decidable from the request body alone, so it is refused at POST rather than
+	// waiting for the fleet to produce it.
+	//
+	// **A separate code rather than an early flow_conflict**, because a code has one disposition:
+	// flow_conflict invalidates a path and tears the loser down, and giving it a second,
+	// request-time disposition for one decidable subcase is what the §7.2 partition exists to
+	// prevent. The undecidable form — one or both sources selecting rather than pinning, so the
+	// collision arrives with a producer months later — stays flow_conflict and stays per path.
+	ReasonDuplicateSourceFlow ReasonCode = "duplicate_source_flow"
 
 	// ReasonNodeNotRegistered is a source or destination node no agent has ever registered.
 	//

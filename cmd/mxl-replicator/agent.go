@@ -72,6 +72,20 @@ type AgentOptions struct {
 	// `provider=verbs,fabric=ib-a` into two flag values, each of which is half an attachment.
 	Fabric []string `help:"Declare a fabric attachment, e.g. --agent-fabric provider=verbs,fabric=ib-a,interface=ib0. Repeatable. Selectors: address, interface, device, or none when the node has exactly one of that provider." sep:"none"`
 
+	// The other answer to "this node configured no attachments", and a better one than shm
+	// wherever a fleet is flat enough for the question not to have an operator (§10.1).
+	//
+	// It is deliberately *only* a replacement for that fallback: an attachment the operator wrote
+	// is never joined by a detected one, because the two would then be competing descriptions of
+	// the same hardware and the second one is the guess.
+	//
+	// **The flag names the label because the label is the part with a consequence.** Two nodes
+	// pair iff they share one (§10.1), so `default` pairs a node with every other node that also
+	// detected and with nothing else — which is why this is a flag and not the behaviour. An
+	// operator turning it on is asserting that their fleet is one flat network, a claim they are
+	// entitled to make and the server cannot check.
+	DetectDefaultFabric bool `help:"When no fabric attachment is configured, detect one from what libfabric reports rather than assuming shm, and label it \"default\". Nodes pair only with other nodes using the same label, so this is for a flat network where every node is reachable from every other."`
+
 	Listen string `help:"Address to serve agent metrics and health on." default:":2284"`
 
 	PortRange ports.Range `help:"Range to allocate fabric ports from. The fabric connection is inbound to the destination node, so this range must be open there." default:"24000-24999"`
@@ -80,6 +94,22 @@ type AgentOptions struct {
 	// policy: this decides when a flow is *reported* as no longer producing, not what the fleet
 	// does about it (§11.1).
 	FlowIdleAfter time.Duration `help:"Report a flow as no longer producing after its head index has stood still for this long. Coarse on purpose: a raw head index must never reach inventory." default:"3s"`
+
+	// Rate control on worker *starts* (§6.3). Agent-local rather than session-level, unlike the
+	// idle and connect timeouts: it describes what this host can absorb while workers are coming
+	// up, there is nothing for two nodes to disagree about, and the server could not know the
+	// answer for a node it has never run on (§5.5, §6.2).
+	//
+	// The burst is the number that matters — how many workers may go into setup at the same
+	// instant — and the rate bounds the tail of a bulk re-establishment. Zero on the rate means no
+	// limit, which is the direction the sentinel has to point: a zero meaning "start nothing"
+	// would be a typo that silently stops every flow on the node.
+	//
+	// The defaults are conservative and a node with headroom should raise them, the burst first:
+	// two at once and one every two seconds re-establishes fifty workers in a minute and a half
+	// (§6.1, §6.3).
+	StartRate  float64 `help:"Workers this node may start per second. 0 means no limit." default:"0.5"`
+	StartBurst int     `help:"How many workers may start at once before --agent-start-rate applies." default:"2"`
 
 	WorkerBinary string `help:"Path to the data-plane worker binary." default:"mxl-fabrics-proxy-worker" env:"MXL_REPLICATOR_WORKER_BINARY"`
 	// Fresh directory per worker *start* (not per logical worker): the worker does not
@@ -138,7 +168,7 @@ func (c *AgentOptions) resolve() error {
 		c.fabrics = append(c.fabrics, attachment)
 	}
 
-	if len(c.fabrics) == 0 {
+	if len(c.fabrics) == 0 && !c.DetectDefaultFabric {
 		// **Plan decision — no attachments configured means shm.** A node with none can do
 		// nothing, so the alternative is refusing to start; but that would make
 		// `mxl-replicator run` with no arguments fail, and that invocation is the single-host and
@@ -149,6 +179,12 @@ func (c *AgentOptions) resolve() error {
 		// from the node name, and same-host replication between two domains is exactly what the
 		// legacy loopback.yml scenario does. A node that is meant to reach other hosts declares
 		// what it can reach them on, and says so.
+		//
+		// --agent-detect-default-fabric is the other answer to the same question, for a node that would
+		// rather guess at connectivity than assume it has none: it is checked here rather than
+		// resolved here because the guess needs the probe, and the probe belongs to the
+		// registration path (§10.5). Left to that path, the two fallbacks stay mutually
+		// exclusive by construction.
 		c.fabrics = []probe.Attachment{{Provider: api.ProviderSHM}}
 		c.fabricsDefaulted = true
 	}
@@ -173,6 +209,18 @@ func (c *AgentOptions) Validate() error {
 	}
 	if c.FlowIdleAfter <= 0 {
 		return fmt.Errorf("--flow-idle-after must be positive")
+	}
+
+	// Zero is a mode — no rate control — so only a negative rate is a mistake. A burst below one
+	// is refused outright rather than clamped: it is the one setting in this block that would stop
+	// the node's media, since a bucket that can never hold a token admits no worker ever, and
+	// discovering that at parse time is the difference between a failed start and a node that
+	// comes up looking healthy with every session in `starting` (§6.3).
+	if c.StartRate < 0 {
+		return fmt.Errorf("--start-rate cannot be negative; 0 means no limit")
+	}
+	if c.StartBurst < 1 {
+		return fmt.Errorf("--start-burst must be at least 1; use --start-rate 0 to turn rate control off")
 	}
 
 	// The merged picture, and the only place that has one. **The one rule left is that no two
@@ -201,13 +249,34 @@ func (c *AgentOptions) Run(ctx context.Context, logger *slog.Logger) error {
 		"server", c.Server,
 		"areas", len(c.areas),
 		"fabrics", len(c.fabrics),
+		"detect_default_fabric", c.DetectDefaultFabric,
 		"port_range", c.PortRange.String(),
+		"start_rate", c.StartRate,
+		"start_burst", c.StartBurst,
 		"worker_binary", c.WorkerBinary,
 		"work_dir", c.WorkDir)
+
+	if c.StartRate <= 0 {
+		// Worth a line: it is not the default, and the symptom it takes the guard off — a node
+		// running out of pinned memory or registrations when a bulk re-establishment starts every
+		// worker at once — presents as workers failing rather than as a missing setting (§6.3).
+		logger.Warn("worker starts are not rate limited on this node",
+			"hint", "set --agent-start-rate if a bulk re-establishment exhausts this host")
+	}
 
 	if c.fabricsDefaulted {
 		logger.Warn("no fabric attachments configured; assuming shm, which only ever pairs with this node",
 			"hint", "declare --agent-fabric or a fabrics: block to replicate to other hosts")
+	}
+
+	// Inert rather than wrong, so it is warned about rather than refused at parse time. A
+	// fallback that is not taken is not a configuration error — and the arrangement that produces
+	// this is layered configuration, a base deployment setting the flag and a node adding the
+	// `fabrics:` block it turns out to need, where refusing would break the node that got it
+	// right.
+	if c.DetectDefaultFabric && len(c.fabrics) > 0 {
+		logger.Warn("--agent-detect-default-fabric has no effect: this node configured its fabric attachments explicitly",
+			"attachments", len(c.fabrics))
 	}
 
 	// Bound before the agent starts, and synchronously. The bind is the one startup step that
@@ -296,13 +365,15 @@ func (c *AgentOptions) build(ctx context.Context, logger *slog.Logger) (*agent.A
 	}
 
 	built, err = agent.New(agent.Config{
-		Node:      c.Node,
-		Client:    apiClient,
-		Launcher:  launcher,
-		Inventory: inv,
-		Ports:     allocator,
-		Probe:     c.prober(logger),
-		Logger:    logger,
+		Node:       c.Node,
+		Client:     apiClient,
+		Launcher:   launcher,
+		Inventory:  inv,
+		Ports:      allocator,
+		Probe:      c.prober(logger),
+		Logger:     logger,
+		StartRate:  c.StartRate,
+		StartBurst: c.StartBurst,
 	})
 	if err != nil {
 		return nil, err
@@ -333,7 +404,7 @@ func (c *AgentOptions) prober(logger *slog.Logger) func(context.Context) (api.Ca
 			return api.Capabilities{}, err
 		}
 
-		joined := probe.Join(c.fabrics, interfaces, probe.Options{
+		joined := probe.Join(c.detectFabrics(interfaces, logger), interfaces, probe.Options{
 			Node:   c.Node,
 			Logger: logger.With("module", "probe"),
 		})
@@ -351,6 +422,41 @@ func (c *AgentOptions) prober(logger *slog.Logger) func(context.Context) (api.Ca
 			SchedPrio: agent.SchedPrioAvailable(),
 		}, nil
 	}
+}
+
+// detectFabrics returns the attachments to join against the probe: the configured ones, or the one
+// --agent-detect-default-fabric detected out of the probe itself (§10.1).
+//
+// It runs here rather than at parse time because it is the only place the probe's output exists,
+// and it re-runs on every re-registration for the same reason capabilities do (§10.2): a node
+// that gained an interface should advertise it, and re-detecting is how it does. That the answer
+// can change across a re-registration is the flag's real cost — a node whose tcp address moved
+// re-detects onto the new one and every session through it re-establishes, where an operator who
+// named the address would have seen the attachment dropped and the reason logged. Explicit
+// configuration is still the better answer for anything that has one.
+//
+// The detection is logged whether or not it succeeded, at info: it is a decision made on the
+// operator's behalf, and it is the kind that presents a long way from its cause when it goes
+// wrong — as `no_shared_fabric` on some other node.
+func (c *AgentOptions) detectFabrics(interfaces []exec.Interface, logger *slog.Logger) []probe.Attachment {
+	if len(c.fabrics) > 0 || !c.DetectDefaultFabric {
+		return c.fabrics
+	}
+
+	detected, skipped := probe.Detect(interfaces, api.DefaultProviderOrder)
+	if detected.Provider == "" {
+		logger.Error("--agent-detect-default-fabric found nothing usable in what libfabric reports on this node",
+			"skipped", skipped,
+			"hint", "declare --agent-fabric or a fabrics: block")
+		return nil
+	}
+
+	logger.Info("fabric attachment detected",
+		"provider", detected.Provider,
+		"address", detected.Address,
+		"fabric", detected.Fabric,
+		"skipped", skipped)
+	return []probe.Attachment{detected}
 }
 
 // workerLogLevel resolves MXL_LOG_LEVEL for worker processes (§12).

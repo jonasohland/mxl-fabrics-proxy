@@ -8,12 +8,11 @@
 //
 // # What it does, in order
 //
-//  1. Validate each request's *destinations* against registrations (§7.2), one at a time. A
-//     request fans out (§9.1) and its destinations fail independently: an unusable one makes the
-//     request INVALID without stopping its siblings from establishing.
-//  2. Expand each valid (request, destination) leg's selector against inventory into paths,
-//     deduplicating: N requests naming one edge share one path, one session and one worker pair
-//     (§9.1).
+//  1. Validate each request's *(source, destination) pairings* against registrations (§7.2), one at
+//     a time. A request fans in and out (§9.1) and its pairings fail independently: an unusable one
+//     makes the request INVALID without stopping its siblings from establishing.
+//  2. Expand each valid leg's source selectors against inventory into paths, deduplicating: N
+//     requests naming one edge share one path, one session and one worker pair (§9.1).
 //  3. Reject the conflicts only visible across paths — two sources into one destination flow,
 //     and loops (§7.2).
 //  4. Admit or hold each path. A source that is not being produced starts no workers at all,
@@ -278,22 +277,35 @@ func (p *pathPlan) tornDown(idle time.Duration) bool {
 	return idle >= p.teardown
 }
 
-// leg is one (request, destination) pair, with the root resolved and the provider pin already
-// reduced to the one that applies to this destination.
+// leg is one **(request, source, destination) pairing**, with the provider pin already reduced to
+// the one that applies to this destination.
 //
-// A request fans out to many destinations (§9.1) and they are validated, negotiated and expanded
-// independently — so this, not the request, is the unit the reconciler works on.
+// A request fans in and out (§9.1) and its pairings are validated, negotiated and expanded
+// independently — so this, not the request, is the unit the reconciler works on. A request with two
+// sources and three destinations has six legs.
+//
+// *This used to be a (request, destination) pair*, and it was that only because there was one
+// source. Validation and negotiation were always per pairing in substance: an interface config is
+// negotiated for a session, and a session has two ends (§10.3).
 type leg struct {
 	request api.RequestID
 	record  state.RequestRecord
-	dst     api.Destination
-	pin     api.ProviderPin
-	agreed  negotiate.Result
-	bad     *validate.Result
+
+	// srcIndex and dstIndex are positions in the spec's two lists. Carried alongside the values
+	// because a source has no name of its own, so its position is the only handle a message or a
+	// status row has on it (§9.1).
+	srcIndex int
+	dstIndex int
+
+	src    api.Source
+	dst    api.Destination
+	pin    api.ProviderPin
+	agreed negotiate.Result
+	bad    *validate.Result
 }
 
-// identicalFailures reports whether every leg failed the same way, which means the cause is not
-// destination-specific.
+// identicalFailures reports whether every leg failed the same way, which means the cause is neither
+// source- nor destination-specific.
 func identicalFailures(failures []legFailure) bool {
 	for _, failure := range failures[1:] {
 		if failure.Result != failures[0].Result {
@@ -303,16 +315,18 @@ func identicalFailures(failures []legFailure) bool {
 	return true
 }
 
-// legFailure is one destination a request cannot use, kept per request so that the failure is
+// legFailure is one pairing a request cannot use, kept per request so that the failure is
 // reported even when the leg expands to no paths at all — a request whose source flow does not
 // exist yet and whose destination names an area the node does not advertise is INVALID, not
 // WAITING, and saying WAITING would let a POST through that §7.2 requires be rejected.
 type legFailure struct {
+	SourceIndex int
+	Source      api.Source
 	Destination api.Destination
 	Result      validate.Result
 
 	// Structural marks a failure that follows from the request and the node registrations alone,
-	// which is the only kind a `POST` refuses (§7.2). Destination validation is structural;
+	// which is the only kind a `POST` refuses (§7.2). Pairing validation is structural;
 	// losing a namespace overlap is not, because it depends on what *another* request expanded
 	// onto and on inventory neither author controls. See [Result.Structural].
 	Structural bool
@@ -345,45 +359,99 @@ func Compute(fleet *state.Fleet, cfg Config) *Result {
 	requestPaths := map[api.RequestID][]string{}
 	invalidLegs := map[api.RequestID][]legFailure{}
 
-	// The expansion depends on the source and its two selectors only, so it is the same for every
-	// leg of one request and is worth resolving once — a request with eight destinations would
-	// otherwise walk the whole inventory eight times. It is also where the exclusion list comes
-	// from, and that has to be per request rather than per leg.
-	expansions := map[api.RequestID]expansion{}
-	expansionOf := func(record state.RequestRecord) expansion {
-		if cached, ok := expansions[record.ID]; ok {
+	// A failure of the request as a whole rather than of one of its pairings ([validate.Request]).
+	// Kept apart from `invalidLegs` because it belongs to no leg and must not be attributed to one:
+	// naming a destination for `duplicate_source_flow` would send an operator to a node that is
+	// working fine, when the thing to change is two lines of the request (§9.1).
+	requestInvalid := map[api.RequestID]validate.Result{}
+
+	// Where each leg's paths went, so the status can be folded per source as well as over the
+	// request (§9.1, §11). Only the source index is keyed on — a source's row aggregates over every
+	// destination it was paired with, which is the grouping that answers "which camera is dark".
+	sourcePaths := map[api.RequestID]map[int][]string{}
+	addSourcePath := func(id api.RequestID, srcIndex int, pid string) {
+		byIndex := sourcePaths[id]
+		if byIndex == nil {
+			byIndex = map[int][]string{}
+			sourcePaths[id] = byIndex
+		}
+		byIndex[srcIndex] = append(byIndex[srcIndex], pid)
+	}
+
+	// The expansion depends on **one source** and its two selectors only, so it is the same for
+	// every destination that source is paired with and is worth resolving once — a request with
+	// eight destinations would otherwise walk the whole inventory eight times per source.
+	//
+	// Keyed by (request, source index) rather than by request, which is the whole of the fan-in
+	// change here: the sources of one request expand independently and there is no longer one answer
+	// to cache for the request as a whole.
+	//
+	// The exclusion list is still per *request*, because it is what the request's status reports and
+	// an operator reading it wants one list, not one per source. It is accumulated across the
+	// sources into `excluded` below.
+	type expansionKey struct {
+		request api.RequestID
+		source  int
+	}
+	expansions := map[expansionKey]expansion{}
+	expansionOf := func(record state.RequestRecord, srcIndex int) expansion {
+		key := expansionKey{request: record.ID, source: srcIndex}
+		if cached, ok := expansions[key]; ok {
 			return cached
 		}
-		out := expand(fleet, record.Spec)
-		expansions[record.ID] = out
+		out := expand(fleet, record.Spec.Sources[srcIndex])
+		expansions[key] = out
 		return out
 	}
 
 	// The negotiated interface config for a path, kept only for the single-request case — see
-	// [negotiatedFor]. Keyed by path rather than by request because a request now contributes one
-	// path per destination, and those destinations can negotiate differently.
+	// [negotiatedFor]. Keyed by path rather than by request because a request contributes one path
+	// per pairing, and those pairings can negotiate differently.
 	negotiated := map[string]negotiate.Result{}
 
-	// A leg is one (request, destination) pair: the unit validation and expansion work on, since
-	// a request fans out and its destinations succeed or fail independently (§9.1).
+	// A leg is one (request, source, destination) pairing: the unit validation and expansion work
+	// on, since a request fans in and out and its pairings succeed or fail independently (§9.1).
 	var valid, invalid []leg
 	for _, id := range fleet.SortedRequestIDs() {
 		record := fleet.Requests[id].Value
-		for _, dst := range record.Spec.Destinations {
-			// *The resolved output root used to be written back onto the destination here*, so
-			// that a shadow path carried the same identity a real one would. A destination's
-			// identity is complete the moment the request is read now — the area is the first
-			// segment of the domain's name (§10.6) — so there is nothing left to resolve into it.
-			agreed, bad := validate.Destination(record.Spec, dst, fleet, cfg.Negotiate)
 
-			this := leg{request: id, record: record, dst: dst, pin: record.Spec.ProviderFor(dst), agreed: agreed}
-			if bad != nil {
-				this.bad = bad
-				invalid = append(invalid, this)
-				invalidLegs[id] = append(invalidLegs[id], legFailure{Destination: dst, Result: *bad, Structural: true})
-				continue
+		// A request-wide failure is not attributable to any pairing, so it is recorded once and the
+		// legs are still built: `duplicate_source_flow` refuses the POST, and on a stored request it
+		// must not tear down sessions that are running (§7.2, and the same argument the invalid-leg
+		// loop below makes at greater length).
+		if bad := validate.Request(record.Spec, fleet); bad != nil {
+			result.Structural[id] = *bad
+			requestInvalid[id] = *bad
+		}
+
+		for srcIndex, src := range record.Spec.Sources {
+			for dstIndex, dst := range record.Spec.Destinations {
+				// *The resolved output root used to be written back onto the destination here*, so
+				// that a shadow path carried the same identity a real one would. A destination's
+				// identity is complete the moment the request is read now — the area is the first
+				// segment of the domain's name (§10.6) — so there is nothing left to resolve into it.
+				agreed, bad := validate.Pairing(record.Spec, srcIndex, dstIndex, fleet, cfg.Negotiate)
+
+				this := leg{
+					request:  id,
+					record:   record,
+					srcIndex: srcIndex,
+					dstIndex: dstIndex,
+					src:      src,
+					dst:      dst,
+					pin:      record.Spec.ProviderFor(dst),
+					agreed:   agreed,
+				}
+				if bad != nil {
+					this.bad = bad
+					invalid = append(invalid, this)
+					invalidLegs[id] = append(invalidLegs[id], legFailure{
+						SourceIndex: srcIndex, Source: src, Destination: dst, Result: *bad, Structural: true,
+					})
+					continue
+				}
+				valid = append(valid, this)
 			}
-			valid = append(valid, this)
 		}
 	}
 
@@ -400,7 +468,9 @@ func Compute(fleet *state.Fleet, cfg Config) *Result {
 			}
 			leg.bad = &bad
 			invalid = append(invalid, leg)
-			invalidLegs[leg.request] = append(invalidLegs[leg.request], legFailure{Destination: leg.dst, Result: bad})
+			invalidLegs[leg.request] = append(invalidLegs[leg.request], legFailure{
+				SourceIndex: leg.srcIndex, Source: leg.src, Destination: leg.dst, Result: bad,
+			})
 		}
 		valid = kept
 	}
@@ -408,10 +478,10 @@ func Compute(fleet *state.Fleet, cfg Config) *Result {
 	// Valid legs first, so that a path a valid one wants is never turned into a shadow path by an
 	// invalid leg that happens to name the same edge.
 	for _, leg := range valid {
-		for _, address := range expansionOf(leg.record).addresses {
+		for _, address := range expansionOf(leg.record, leg.srcIndex).addresses {
 			// **A self-pair a label selector produced is elided, not rejected** (§7.2, §10.7). A
 			// named source resolving to the destination is a typo and is refused by
-			// [validate.Destination]; a *matched* one is the selector doing what it was asked to,
+			// [validate.Pairing]; a *matched* one is the selector doing what it was asked to,
 			// and refusing the whole request would put its author at the mercy of which domains
 			// happen to carry a label. The rest of the expansion stands.
 			if address.Node == leg.dst.Node && address.Domain == leg.dst.DomainName() {
@@ -429,6 +499,7 @@ func Compute(fleet *state.Fleet, cfg Config) *Result {
 			plan.merge(leg.record, leg.pin, cfg.IdleTeardown)
 			negotiated[pid] = leg.agreed
 			requestPaths[leg.request] = append(requestPaths[leg.request], pid)
+			addSourcePath(leg.request, leg.srcIndex, pid)
 		}
 	}
 
@@ -442,10 +513,10 @@ func Compute(fleet *state.Fleet, cfg Config) *Result {
 	//
 	// So an invalid leg still expands, onto shadow paths that retain whatever session exists and
 	// carry its assignments forward untouched. Its *sibling* legs are unaffected: they were
-	// planned above and establish normally, which is the point of validating per destination.
+	// planned above and establish normally, which is the point of validating per pairing.
 	for _, leg := range invalid {
 		verdict := *leg.bad
-		for _, address := range expansionOf(leg.record).addresses {
+		for _, address := range expansionOf(leg.record, leg.srcIndex).addresses {
 			if address.Node == leg.dst.Node && address.Domain == leg.dst.DomainName() {
 				continue
 			}
@@ -453,6 +524,7 @@ func Compute(fleet *state.Fleet, cfg Config) *Result {
 			identity := state.PathIdentity{Source: address, Destination: leg.dst}
 			pid := identity.ID()
 			requestPaths[leg.request] = append(requestPaths[leg.request], pid)
+			addSourcePath(leg.request, leg.srcIndex, pid)
 
 			if _, wanted := plans[pid]; wanted {
 				// Some other leg wants this path and is valid; it decides.
@@ -462,7 +534,7 @@ func Compute(fleet *state.Fleet, cfg Config) *Result {
 		}
 	}
 
-	retain(fleet, plans, requestPaths, sessionsByPath, cfg.IdleTeardown)
+	retain(fleet, plans, requestPaths, addSourcePath, sessionsByPath, cfg.IdleTeardown)
 
 	conflicts := validate.Conflicts(conflictRefs(plans))
 
@@ -491,13 +563,25 @@ func Compute(fleet *state.Fleet, cfg Config) *Result {
 		result.Assignments[node] = sorted
 	}
 
-	// Every request's expansion, whether or not it produced a leg: a request whose only
+	// Every source's expansion, whether or not it produced a leg: a request whose only
 	// destination is invalid still has an exclusion list, and an operator looking at why it has no
 	// paths needs it.
+	//
+	// The request's list is the concatenation over its sources, in source order, and the cap is
+	// applied to the joined list rather than per source — `excluded_dropped` counts what an operator
+	// is not being shown, and a per-source cap would let twelve sources show 12×32 entries while
+	// each claimed to have dropped nothing (§9.1).
+	excluded := map[api.RequestID]expansion{}
 	for _, id := range fleet.SortedRequestIDs() {
-		expansionOf(fleet.Requests[id].Value)
+		record := fleet.Requests[id].Value
+		var joined expansion
+		for srcIndex := range record.Spec.Sources {
+			joined.absorb(expansionOf(record, srcIndex))
+		}
+		excluded[id] = joined
 	}
-	summarise(result, fleet, requestPaths, invalidLegs, expansions)
+
+	summarise(result, fleet, requestPaths, sourcePaths, invalidLegs, requestInvalid, excluded)
 	return result
 }
 
@@ -540,7 +624,7 @@ func negotiatedFor(plan *pathPlan, perPath map[string]negotiate.Result, fleet *s
 	return result, nil
 }
 
-// expansion is what a request's source selectors resolve to: the flow addresses to replicate, and
+// expansion is what **one source's** selectors resolve to: the flow addresses to replicate, and
 // what was deliberately left out.
 type expansion struct {
 	addresses []api.FlowAddress
@@ -558,6 +642,23 @@ func (e *expansion) exclude(node, domain, flow string, reason api.ExclusionReaso
 		return
 	}
 	e.excluded = append(e.excluded, api.Exclusion{Node: node, Domain: domain, Flow: flow, Reason: reason})
+}
+
+// absorb folds one source's expansion into a request-wide one, for the status the request reports
+// (§9.1).
+//
+// The cap is re-applied as entries arrive rather than being a per-source limit, so a request with
+// twelve sources shows [api.MaxExclusions] entries in total and counts the rest — a per-source cap
+// would show 12× that while every source claimed to have dropped nothing.
+//
+// Addresses are deliberately *not* folded: nothing needs a request's addresses in one list, and
+// producing one would lose which source each came from, which is what the per-source status and the
+// "name the right end" rule both rest on (§11).
+func (e *expansion) absorb(other expansion) {
+	for _, entry := range other.excluded {
+		e.exclude(entry.Node, entry.Domain, entry.Flow, entry.Reason)
+	}
+	e.dropped += other.dropped
 }
 
 // expand resolves a request's source — first to a set of domains, then to flow addresses within
@@ -590,10 +691,13 @@ func (e *expansion) exclude(node, domain, flow string, reason api.ExclusionReaso
 //
 // A pinned flow ID always expands to exactly one address per domain, whether or not the flow is
 // currently observed: a request naming a specific flow deserves to be told that *that* flow is
-// missing, rather than silently having no paths at all. A group hint expands to whatever matches,
-// and matching nothing is simply a request with zero paths.
-func expand(fleet *state.Fleet, spec api.RequestSpec) expansion {
-	src := spec.Source
+// missing, rather than silently having no paths at all. A group hint and `all` expand to whatever
+// matches, and matching nothing is simply a request with zero paths.
+//
+// **One source, not the request.** A request's sources expand independently (§9.1), and folding
+// them here would lose which source produced which address — which is exactly what the per-source
+// status breakdown and the "name the right end" rule for failures both need (§11).
+func expand(fleet *state.Fleet, src api.Source) expansion {
 	var out expansion
 
 	switch src.Domain.Kind() {
@@ -663,10 +767,21 @@ func flowsIn(fleet *state.Fleet, src api.Source, domain string, skipReplicated b
 		}
 		return []api.FlowAddress{{Node: src.Node, Domain: domain, Flow: src.Select.Flow}}
 
-	case api.SelectorKindGroupHint:
+	case api.SelectorKindGroupHint, api.SelectorKindAll:
+		// `all` is a group hint that matches everything, and it is written as one branch rather than
+		// two because the two differ in a predicate and nothing else — the self-output guard, the
+		// "matched nothing is zero paths" behaviour and the ordering are all the same, and splitting
+		// them is how the guard gets added to one and not the other (§10.7).
+		matches := func(flow api.FlowInventory) bool {
+			if src.Select.Kind() == api.SelectorKindAll {
+				return true
+			}
+			return flow.GroupHint != nil && src.Select.GroupHint.Matches(*flow.GroupHint)
+		}
+
 		var addresses []api.FlowAddress
 		for _, flow := range fleet.Flows(src.Node, domain) {
-			if flow.GroupHint == nil || !src.Select.GroupHint.Matches(*flow.GroupHint) {
+			if !matches(flow) {
 				continue
 			}
 			if skipReplicated && flow.Replicated {
@@ -690,7 +805,14 @@ func flowsIn(fleet *state.Fleet, src api.Source, domain string, skipReplicated b
 // agent — and "no flows matched" is indistinguishable from "I cannot see this node". Without
 // this, a control-plane-visible agent restart would withdraw every assignment on that node's
 // peers, which is media stopping because a lease expired.
-func retain(fleet *state.Fleet, plans map[string]*pathPlan, requestPaths map[api.RequestID][]string, sessionsByPath map[string][]state.SessionRecord, defaultTeardown time.Duration) {
+func retain(
+	fleet *state.Fleet,
+	plans map[string]*pathPlan,
+	requestPaths map[api.RequestID][]string,
+	attribute func(id api.RequestID, srcIndex int, pid string),
+	sessionsByPath map[string][]state.SessionRecord,
+	defaultTeardown time.Duration,
+) {
 	for _, pid := range sortedKeys(sessionsByPath) {
 		if _, planned := plans[pid]; planned {
 			continue
@@ -714,16 +836,9 @@ func retain(fleet *state.Fleet, plans map[string]*pathPlan, requestPaths map[api
 		// close as this can get — and it is only ever used for display.
 		for _, rid := range fleet.SortedRequestIDs() {
 			spec := fleet.Requests[rid].Value.Spec
-			// A named source has to match; a label selector cannot be re-evaluated without the
-			// inventory that went away with the agent, so it is taken as plausible. This is only
-			// ever used for display (see the comment above).
-			if spec.Source.Node != identity.Source.Node {
-				continue
-			}
-			if name := spec.Source.Domain.Name; name != nil && name.String() != identity.Source.Domain {
-				continue
-			}
-			if spec.Source.Select.Kind() == api.SelectorKindFlow && spec.Source.Select.Flow != identity.Source.Flow {
+
+			srcIndex, ok := matchingSource(spec, identity.Source)
+			if !ok {
 				continue
 			}
 			// Which of the request's destinations this retained path belongs to, if any. It
@@ -735,8 +850,38 @@ func retain(fleet *state.Fleet, plans map[string]*pathPlan, requestPaths map[api
 			}
 			plan.merge(fleet.Requests[rid].Value, spec.ProviderFor(dst), defaultTeardown)
 			requestPaths[rid] = append(requestPaths[rid], pid)
+			attribute(rid, srcIndex, pid)
 		}
 	}
+}
+
+// matchingSource finds which of a request's sources a path identity plausibly came from, and is
+// **display-only** — see [retain], its one caller.
+//
+// "Plausibly", because this runs precisely when the inventory that would answer it properly has
+// gone away with a lease. A named source has to match exactly; a label selector cannot be
+// re-evaluated at all, so it is taken as plausible rather than dropped, which is the direction that
+// keeps a retained path visible in the status of the request that is probably holding it.
+//
+// The **first** match wins where the first destination match is unique, and that asymmetry is
+// deliberate rather than an oversight: [api.RequestSpec.Validate] rejects two identical sources, but
+// two *different* ones can both plausibly match the same address once a label selector is involved,
+// and there is nothing here that could choose between them. Picking the first keeps the answer
+// deterministic, and it is only deciding which row of a status display a frozen path appears in.
+func matchingSource(spec api.RequestSpec, path api.FlowAddress) (int, bool) {
+	for i, src := range spec.Sources {
+		if src.Node != path.Node {
+			continue
+		}
+		if name := src.Domain.Name; name != nil && name.String() != path.Domain {
+			continue
+		}
+		if src.Select.Kind() == api.SelectorKindFlow && src.Select.Flow != path.Flow {
+			continue
+		}
+		return i, true
+	}
+	return 0, false
 }
 
 // matchingDestination finds which of a request's destinations a path identity belongs to.
@@ -835,16 +980,21 @@ func namespaceOverlaps(fleet *state.Fleet, legs []leg) map[int]validate.Result {
 		return x.ID.String() < y.ID.String()
 	})
 
-	// The expansion depends on the source and selector only, so it is the same for every leg of
-	// one request and is worth resolving once — a request with eight destinations otherwise
-	// walks the whole inventory eight times.
-	expansions := map[api.RequestID][]api.FlowAddress{}
-	expansionOf := func(record state.RequestRecord) []api.FlowAddress {
-		if cached, ok := expansions[record.ID]; ok {
+	// The expansion depends on one source and its selectors only, so it is the same for every
+	// destination that source is paired with and is worth resolving once — a request with eight
+	// destinations otherwise walks the whole inventory eight times per source.
+	type expansionKey struct {
+		request api.RequestID
+		source  int
+	}
+	expansions := map[expansionKey][]api.FlowAddress{}
+	expansionOf := func(record state.RequestRecord, srcIndex int) []api.FlowAddress {
+		key := expansionKey{request: record.ID, source: srcIndex}
+		if cached, ok := expansions[key]; ok {
 			return cached
 		}
-		addresses := expand(fleet, record.Spec).addresses
-		expansions[record.ID] = addresses
+		addresses := expand(fleet, record.Spec.Sources[srcIndex]).addresses
+		expansions[key] = addresses
 		return addresses
 	}
 
@@ -858,7 +1008,7 @@ func namespaceOverlaps(fleet *state.Fleet, legs []leg) map[int]validate.Result {
 			continue
 		}
 
-		for _, address := range expansionOf(leg.record) {
+		for _, address := range expansionOf(leg.record, leg.srcIndex) {
 			pid := state.PathIdentity{Source: address, Destination: leg.dst}.ID()
 
 			// Keyed on both, so a path held in one namespace says nothing about another.
@@ -1291,6 +1441,9 @@ func notLeasedReason(fleet *state.Fleet, src, dst string) string {
 // with one path waiting on a missing flow is waiting, whatever the rest are doing. The counts
 // carry the detail an operator actually reads ("1 of 3 active"), so this only has to be
 // defensible, not clever.
+//
+// [api.StatePartial] is deliberately absent: it is not a state a path can be in, so it cannot be
+// found among them. It is applied on top of this fold, in [fold], where the whole set is visible.
 var aggregateOrder = []api.State{
 	api.StateInvalid,
 	api.StateFailed,
@@ -1301,22 +1454,26 @@ var aggregateOrder = []api.State{
 	api.StateActive,
 }
 
-func summarise(result *Result, fleet *state.Fleet, requestPaths map[api.RequestID][]string, invalid map[api.RequestID][]legFailure, expansions map[api.RequestID]expansion) {
+// verdict is what one set of paths and leg failures folds to: a state and the reason for it.
+type verdict struct {
+	state  api.State
+	reason string
+	code   api.ReasonCode
+}
+
+func summarise(
+	result *Result,
+	fleet *state.Fleet,
+	requestPaths map[api.RequestID][]string,
+	sourcePaths map[api.RequestID]map[int][]string,
+	invalid map[api.RequestID][]legFailure,
+	requestInvalid map[api.RequestID]validate.Result,
+	expansions map[api.RequestID]expansion,
+) {
 	for id := range fleet.Requests {
 		spec := fleet.Requests[id].Value.Spec
 
-		pathIDs := slices.Compact(slices.Sorted(slices.Values(requestPaths[id])))
-
-		statuses := make([]api.PathStatus, 0, len(pathIDs))
-		counts := map[api.State]int{}
-		for _, pid := range pathIDs {
-			path, ok := result.Paths[pid]
-			if !ok {
-				continue
-			}
-			statuses = append(statuses, path.PathStatus)
-			counts[path.State]++
-		}
+		statuses, counts := collectPaths(result, requestPaths[id])
 
 		status := api.RequestStatus{
 			Paths:           statuses,
@@ -1328,6 +1485,7 @@ func summarise(result *Result, fleet *state.Fleet, requestPaths map[api.RequestI
 		// What a POST refuses, and only that. A namespace overlap sits in `invalid[id]` beside the
 		// structural failures and is deliberately absent here: it makes the request INVALID and
 		// does not make it unacceptable, because it depends on another request's expansion (§7.2).
+		// A request-wide failure is already in `result.Structural`, written where it was found.
 		for _, failure := range invalid[id] {
 			if failure.Structural {
 				result.Structural[id] = failure.Result
@@ -1335,69 +1493,233 @@ func summarise(result *Result, fleet *state.Fleet, requestPaths map[api.RequestI
 			}
 		}
 
-		switch {
-		case len(invalid[id]) > 0:
-			// **A request with any unusable destination is INVALID, whatever its other
-			// destinations are doing.** Its paths and counts are still reported, because the
-			// sibling legs establish normally and may well be carrying media — hiding that would
-			// make a request that is moving video look like one that never started.
-			//
-			// Reported from the leg rather than from the paths because a leg that expands to *no*
-			// paths still has to say why: a request whose source flow does not exist yet and
-			// whose destination advertises no output root is INVALID and must be refused at POST,
-			// where reading it off the (empty) path set would call it WAITING and let it through.
-			failure := invalid[id][0]
-			status.State = api.StateInvalid
-			status.ReasonCode = failure.Result.Code
-			status.Reason = failure.Result.Message
+		// A failure of the request as a whole outranks its legs' — it is about the request body, so
+		// no leg's message would name the thing to change (§7.2).
+		blocking := invalid[id]
+		var whole *validate.Result
+		if bad, ok := requestInvalid[id]; ok {
+			whole = &bad
+		}
 
-			// **Only blame a destination when the destination is what failed.** Validation is per
-			// leg, but several of the things it checks are about the *source* or the request —
-			// an unregistered source node, a sched_prio the source cannot apply — and those fail
-			// **every** leg identically. Naming one destination for those would point at the wrong
-			// end, and "(and 2 more)" would suggest two further problems rather than the same one
-			// counted three times.
-			//
-			// Both halves are load-bearing: one failing leg among three is destination-specific
-			// even though its failures trivially "all match", so the count has to be checked too.
-			requestWide := len(invalid[id]) == len(spec.Destinations) && identicalFailures(invalid[id])
-			if len(spec.Destinations) > 1 && !requestWide {
-				status.Reason = fmt.Sprintf("destination %s: %s", failure.Destination.Endpoint(), failure.Result.Message)
-				if extra := len(invalid[id]) - 1; extra > 0 {
-					status.Reason += fmt.Sprintf(" (and %d more destination(s))", extra)
+		decided := fold(spec.Sources, spec.Destinations, statuses, counts, blocking, whole, fleet)
+		status.State, status.Reason, status.ReasonCode = decided.state, decided.reason, decided.code
+
+		// The per-source breakdown, in the order the request lists its sources and including the
+		// ones that produced nothing — a source that expanded to no paths is exactly the one an
+		// operator is looking for (§9.1, §11).
+		//
+		// Folded by the same rules as the request, one source wide. A request-wide failure is
+		// deliberately not pushed down onto the rows: `duplicate_source_flow` implicates two sources
+		// and blaming either alone would be a claim the request body does not support.
+		for i, src := range spec.Sources {
+			rowPaths := slices.Compact(slices.Sorted(slices.Values(sourcePaths[id][i])))
+			rowStatuses, rowCounts := collectPaths(result, rowPaths)
+
+			var rowFailures []legFailure
+			for _, failure := range invalid[id] {
+				if failure.SourceIndex == i {
+					rowFailures = append(rowFailures, failure)
 				}
 			}
 
-		case len(statuses) == 0:
-			// A selector that matched nothing is a request with zero paths (§9.1) — but if the
-			// source agent is not reporting at all, that is not the same statement, and saying
-			// "matched nothing" would be a claim this server is in no position to make.
-			status.State = api.StateWaiting
-			if !fleet.Live(spec.Source.Node) {
-				status.ReasonCode = api.ReasonAgentNotLeased
-				status.Reason = "source agent " + spec.Source.Node + " is not currently leased"
-			} else {
-				status.ReasonCode = api.ReasonFlowNotFound
-				status.Reason = "the selector matches no flow in " + spec.Source.Node + "/" + spec.Source.Domain.String()
-			}
-		default:
-			for _, candidate := range aggregateOrder {
-				if counts[candidate] == 0 {
-					continue
-				}
-				status.State = candidate
-				for _, path := range statuses {
-					if path.State == candidate {
-						status.Reason, status.ReasonCode = path.Reason, path.ReasonCode
-						break
-					}
-				}
-				break
-			}
+			row := fold([]api.Source{src}, spec.Destinations, rowStatuses, rowCounts, rowFailures, nil, fleet)
+			status.Sources = append(status.Sources, api.SourceStatus{
+				Source:     src,
+				State:      row.state,
+				Reason:     row.reason,
+				ReasonCode: row.code,
+				Counts:     rowCounts,
+				Paths:      pathIDsOf(rowStatuses),
+			})
 		}
 
 		result.Requests[id] = status
 	}
+}
+
+// fold reduces a set of paths and the failures of the legs that produced them to one state (§11).
+//
+// Used for a request and for each of its sources, which is the point: an operator reading a source
+// row is asking the same question one level down, and two folds would answer it two different ways.
+func fold(
+	sources []api.Source,
+	destinations []api.Destination,
+	statuses []api.PathStatus,
+	counts map[api.State]int,
+	failures []legFailure,
+	whole *validate.Result,
+	fleet *state.Fleet,
+) verdict {
+	var worst verdict
+
+	switch {
+	case whole != nil:
+		worst = verdict{state: api.StateInvalid, reason: whole.Message, code: whole.Code}
+
+	case len(failures) > 0:
+		// **Any unusable pairing makes this INVALID, whatever the others are doing.** Its paths and
+		// counts are still reported, because the sibling legs establish normally and may well be
+		// carrying media — hiding that would make a request that is moving video look like one that
+		// never started.
+		//
+		// Reported from the leg rather than from the paths because a leg that expands to *no* paths
+		// still has to say why: a request whose source flow does not exist yet and whose destination
+		// advertises no output root is INVALID and must be refused at POST, where reading it off the
+		// (empty) path set would call it WAITING and let it through.
+		worst = verdict{
+			state:  api.StateInvalid,
+			reason: describeFailures(failures, len(sources), len(destinations)),
+			code:   failures[0].Result.Code,
+		}
+
+	case len(statuses) == 0:
+		// A selector that matched nothing is zero paths (§9.1) — but if a source's agent is not
+		// reporting at all, that is not the same statement, and "matched nothing" would be a claim
+		// this server is in no position to make.
+		worst = noPaths(sources, fleet)
+
+	default:
+		for _, candidate := range aggregateOrder {
+			if counts[candidate] == 0 {
+				continue
+			}
+			worst = verdict{state: candidate}
+			for _, path := range statuses {
+				if path.State == candidate {
+					worst.reason, worst.code = path.Reason, path.ReasonCode
+					break
+				}
+			}
+			break
+		}
+	}
+
+	// **PARTIAL: some of what was asked for is working and some is not** (§11). It outranks
+	// everything `worst` can hold, INVALID included, because §7.2 already settled that one bad path
+	// among twenty does not condemn the other nineteen — and the top line is exactly where promoting
+	// it would undo that.
+	//
+	// The condition is *disagreement with something working*, not merely "not all active": a set
+	// where nothing is ACTIVE folds worst-first as before, because PARTIAL claims something is
+	// working and must not be said when nothing is.
+	active := counts[api.StateActive]
+	if active > 0 && (active < len(statuses) || len(failures) > 0 || whole != nil) {
+		return verdict{
+			state:  api.StatePartial,
+			reason: fmt.Sprintf("%d of %d paths active; %s: %s", active, len(statuses), worst.state, worst.reason),
+			code:   worst.code,
+		}
+	}
+	return worst
+}
+
+// noPaths explains an empty path set, which is a legitimate steady state and not a failure.
+func noPaths(sources []api.Source, fleet *state.Fleet) verdict {
+	var dark []api.Source
+	for _, src := range sources {
+		if !fleet.Live(src.Node) {
+			dark = append(dark, src)
+		}
+	}
+
+	if len(dark) > 0 {
+		reason := "source agent " + dark[0].Node + " is not currently leased"
+		if extra := len(dark) - 1; extra > 0 {
+			reason += fmt.Sprintf(" (and %d more source(s))", extra)
+		}
+		return verdict{state: api.StateWaiting, reason: reason, code: api.ReasonAgentNotLeased}
+	}
+
+	reason := "the selector matches no flow in " + sources[0].Describe()
+	if len(sources) > 1 {
+		reason = fmt.Sprintf("the selectors match no flow in any of the %d sources", len(sources))
+	}
+	return verdict{state: api.StateWaiting, reason: reason, code: api.ReasonFlowNotFound}
+}
+
+// describeFailures renders the reason a set of leg failures produces, attributing it to the **end**
+// it belongs to (§9.1, §11).
+//
+// Three-way now that both ends are lists, and each way is a different node for an operator to go
+// and look at:
+//
+//   - Every pairing failed identically — the cause is the request, not either end. An unregistered
+//     node named by nothing else, a `sched_prio` no participant can apply. Named plainly, with no
+//     prefix and no "(and 2 more)", which would suggest further problems rather than the same one
+//     counted six times.
+//   - One source failed against every destination — the cause is that source. This is the case
+//     fan-in adds, and getting it wrong is the expensive kind of wrong: naming a destination for a
+//     dark camera sends an operator to the receiving node, where everything is fine.
+//   - One destination failed against every source — the cause is that destination. The case that
+//     existed before, unchanged.
+//
+// Anything else is genuinely per pairing and names both ends of the first, since there is no
+// smaller true statement to make.
+func describeFailures(failures []legFailure, sources, destinations int) string {
+	if len(failures) == 0 {
+		return ""
+	}
+	first := failures[0]
+
+	if len(failures) == sources*destinations && identicalFailures(failures) {
+		return first.Result.Message
+	}
+
+	failingSources := map[int]bool{}
+	failingDestinations := map[string]bool{}
+	for _, failure := range failures {
+		failingSources[failure.SourceIndex] = true
+		failingDestinations[failure.Destination.Endpoint()] = true
+	}
+
+	var prefix string
+	switch {
+	case sources > 1 && len(failingSources) == 1 && len(failures) == destinations:
+		prefix = "source " + first.Source.Describe()
+	case destinations > 1 && len(failingDestinations) == 1 && len(failures) == sources:
+		prefix = "destination " + first.Destination.Endpoint()
+	case sources > 1 && destinations > 1:
+		prefix = first.Source.Describe() + " → " + first.Destination.Endpoint()
+	case sources > 1:
+		prefix = "source " + first.Source.Describe()
+	case destinations > 1:
+		prefix = "destination " + first.Destination.Endpoint()
+	}
+
+	reason := first.Result.Message
+	if prefix != "" {
+		reason = prefix + ": " + reason
+	}
+	if extra := len(failures) - 1; extra > 0 {
+		reason += fmt.Sprintf(" (and %d more)", extra)
+	}
+	return reason
+}
+
+// collectPaths resolves path IDs to their statuses, deduplicated and in a stable order, and counts
+// them by state.
+func collectPaths(result *Result, ids []string) ([]api.PathStatus, map[api.State]int) {
+	unique := slices.Compact(slices.Sorted(slices.Values(ids)))
+
+	statuses := make([]api.PathStatus, 0, len(unique))
+	counts := map[api.State]int{}
+	for _, pid := range unique {
+		path, ok := result.Paths[pid]
+		if !ok {
+			continue
+		}
+		statuses = append(statuses, path.PathStatus)
+		counts[path.State]++
+	}
+	return statuses, counts
+}
+
+func pathIDsOf(statuses []api.PathStatus) []string {
+	out := make([]string, 0, len(statuses))
+	for _, status := range statuses {
+		out = append(out, status.ID)
+	}
+	return out
 }
 
 func sortedKeys[V any](m map[string]V) []string {

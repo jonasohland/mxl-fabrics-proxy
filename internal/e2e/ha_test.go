@@ -188,7 +188,7 @@ func TestALeaderChangeRestartsNoWorkers(t *testing.T) {
 
 	p.request(api.RequestSpec{
 		Name:         "cam2",
-		Source:       api.Source{Node: "studio-a", Domain: p.src.source("cameras"), Select: api.Selector{Flow: second.ID()}},
+		Sources:      []api.Source{{Node: "studio-a", Domain: p.src.source("cameras"), Select: api.Selector{Flow: second.ID()}}},
 		Destinations: []api.Destination{{Node: "edge-01", Domain: api.Domain{Area: "fast", Elements: []string{"ingest"}}}},
 	})
 	p.eventually("a second session under the new leader", func() bool {

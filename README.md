@@ -1,280 +1,614 @@
-# mxl-fabrics-proxy
+# mxl-replicator
 
-[![Docker Image](https://img.shields.io/badge/docker-jonasohland%2Fmxl--fabrics--proxy-blue?logo=docker)](https://hub.docker.com/r/jonasohland/mxl-fabrics-proxy)
+[![Docker Image](https://img.shields.io/badge/docker-jonasohland%2Fmxl--replicator-blue?logo=docker)](https://hub.docker.com/r/jonasohland/mxl-replicator)
 [![Go](https://img.shields.io/badge/Go-1.26+-00ADD8?logo=go)](https://golang.org)
-[![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+[![License](https://img.shields.io/badge/license-Apache--2.0-green)](LICENSE)
+
+Replicate MXL flows between hosts over MXL Fabrics, driven by a central control plane.
 
 ## Disclaimer
 
 **This project is currently considered experimental.**
 
-The `mxl-fabrics-proxy` is provided as-is for evaluation and testing purposes. While it is already being used for example as the central inter-host replication app for the [AWS MXL Interop at NAB 2026](https://www.linkedin.com/posts/tgedwards_come-see-media-exchange-layer-mxl-sdk-interop-share-7452418229056012288-FV2a/), the configuration format, HTTP API, and subscription model are subject to change without notice.
+It is provided as-is for evaluation and testing. Active work is underway on a **standard discovery
+and connection API** for MXL-enabled media functions, and this project is expected to realign with
+it — which is why it is named for what it does rather than as a product. The manifest format and
+the HTTP API are subject to change.
 
-This is intentional: active work is underway on a **standard discovery and connection API** for mxl-enabled media functions. Once that standard matures, this proxy will be updated to align with it. Backward compatibility will be maintained where possible, but breaking changes to the configuration schema or API endpoints may occur in future releases.
+**Use in production at your own risk.** Pin a specific image tag.
 
-**Use in production at your own risk.** We recommend pinning to a specific Docker tag and testing configuration reloads thoroughly before relying on them in critical workflows.
+> `mxl-replicator` replaces `mxl-fabrics-proxy`, which lives on under `legacy/go/` until the new
+> implementation is at parity. There is **no configuration or wire compatibility** between them —
+> see [Migrating](#migrating-from-mxl-fabrics-proxy).
 
 ## Overview
 
-`mxl-fabrics-proxy` enables efficient, low-latency, uncompressed video (and other high-bandwidth flows) to be transferred between hosts with **minimal CPU and memory overhead**. It leverages RDMA-capable network interfaces (verbs, EFA, shm, tcp) via the mxl-fabrics stack.
+MXL flows are ring buffers in memory-mapped files under a *domain* directory. Media functions on
+one host share them with zero copies. **MXL Fabrics** extends that across hosts over libfabric
+(`tcp`, `verbs`, `efa`, `shm`), predominantly by RDMA Remote Write straight into the receiver's
+media buffer.
 
-It acts as a lightweight proxy that:
-- Exposes local MXL domains to remote peers
-- Subscribes to remote MXL flows and maps them into local domains
-- Supports dynamic configuration reload without restarting the process and impacting running flows.
+`mxl-replicator` decides which flows go where, and supervises the `mxl-fabrics-proxy-worker`
+processes that move them. It never touches grain data.
+
+Two roles, one binary:
+
+- **Server** — holds replication requests, aggregates what every node reports, negotiates the
+  fabric each session uses, and hands each agent the complete set of workers it should be running.
+- **Agent** — one per node. Discovers local flows, reports them, runs the workers it is assigned,
+  and exposes their metrics.
+
+Replication is requested **through an API**, not by editing a config file on every host. You write
+the desired set to a manifest and apply it:
+
+```console
+$ mxl-replicator apply -f studio-a.yaml
+nab/cam1-distribution created (3 path(s)) (ESTABLISHING: waiting for the destination agent to start its target worker)
+nab/talkback created (1 path(s))
+
+$ mxl-replicator get requests
+NAMESPACE  NAME               STATE   PATHS  SOURCES                                        DESTINATIONS                             LABELS
+nab        cam1-distribution  ACTIVE  3      studio-a/{role=cameras},studio-b/media/cameras edge-01/fast/ingest,edge-02/fast/ingest  show=nab
+nab        talkback           ACTIVE  1      studio-a/media/audio                           edge-01/fast/ingest                      show=nab
+
+$ mxl-replicator status
+nodes      3 registered, 3 leased
+requests   2  (2 ACTIVE)
+paths      3  (3 ACTIVE)
+sessions   3 running
+
+everything is active
+```
 
 ## Features
 
-- **RDMA-accelerated transfers** with libfabric providers (`tcp`, `verbs`, `shm`, `efa`)
-- **AWS EFA optimized** Docker image with Amazon's tuned libfabric build
-- **Near-zero-copy** path for uncompressed video
-- **Dynamic configuration** via YAML file + HTTP reload endpoint
-- **Rich observability** — Prometheus metrics + structured logfmt tracing
+- **Central control plane.** Agents register and receive assignments; there is no agent-to-agent
+  traffic. Configuration is O(n) in the fleet rather than O(n²).
+- **Declarative.** `apply` / `delete` over a manifest, with `--dry-run` and a scoped `--prune`.
+- **Selectors, not just flow IDs.** Replicate "whatever camera 1 is publishing" by NMOS group hint
+  and let the fleet follow republished flows, or pin a UUID. Domains are selected the same way —
+  by labels an operator attaches through the API, without restarting an agent.
+- **Fan-in and fan-out.** Many sources, many destinations, with one status that aggregates over
+  them and a per-source breakdown beside it.
+- **Fail-static.** A control-plane outage never stops running media. An agent acts only on an
+  assignment set it actually retrieved; a server restart adopts running sessions rather than
+  re-establishing them.
+- **Two storage backends.** sqlite for a single node, etcd for HA behind a plain HTTP proxy — no
+  sticky sessions required.
+- **Prometheus metrics** for every worker, plus the control plane.
 
-## Docker Images
+## Quick start
 
-Two variants are published:
+Both roles in one process, on one host, replicating between two domains over `tcp` — no RDMA
+hardware needed:
 
-| Image                                      | Description                              | Recommended for          |
-|--------------------------------------------|------------------------------------------|--------------------------|
-| `jonasohland/mxl-fabrics-proxy:latest`     | Regular libfabric build                  | On-prem / standard NICs  |
-| `jonasohland/mxl-fabrics-proxy:latest-efa` | AWS EFA-optimized libfabric build        | AWS EC2 with EFA         |
+```bash
+mxl-replicator run \
+    --agent-node loopback \
+    --agent-area media=/dev/shm/mxl0:r \
+    --agent-area fast=/dev/shm/mxl:rw \
+    --agent-fabric provider=tcp,fabric=loopback,address=127.0.0.1
+```
+
+An **area** is a directory this node has designated as somewhere MXL domains live, with two
+independent grants: `r` lets this project discover and observe domains under it, `w` lets
+replication create them. A domain inside one is addressed fleet-wide as `<area>/<elements>` —
+`media/cameras`, `fast/ingest` — and that is its identity for life.
+
+Then, from anywhere that can reach it:
+
+```bash
+mxl-replicator apply -f loopback.yaml
+mxl-replicator status
+mxl-replicator get paths
+```
+
+[`loopback.yaml`](loopback.yaml) is the smallest complete example.
+
+## Manifests
+
+Multi-document YAML, `---` separated, one object per document. `kind:` names the object and
+defaults to `request`. An unknown key — or an unknown kind — is an error, not a warning: a
+misspelled field that silently does nothing is the failure a declarative format exists to prevent.
+
+```yaml
+kind: namespace
+name: nab
+paths: exclusive           # two requests here may not hold one path
+
+---
+
+kind: domain
+node: studio-a
+domain: media/cameras
+labels: {role: cameras, name: cameras}
+
+---
+
+name: cam1-distribution
+namespace: nab
+sources:
+  - node: studio-a
+    domain: {role: cameras}                   # a label set; a scalar would be a name
+    group_hint: {name: "Studio A Camera 1"}   # video + audio, both legs
+  - node: studio-b
+    domain: media/cameras                     # no selector: every flow in the domain
+destinations:
+  - {node: edge-01,    domain: fast/ingest}
+  - {node: edge-02,    domain: fast/ingest}
+  - {node: archive-01, domain: bulk/capture, provider: tcp}
+provider: [verbs, tcp]
+labels:
+  show: nab
+
+---
+
+name: talkback
+namespace: nab
+sources:
+  - node: studio-a
+    domain: media/audio                       # a scalar: this domain, by name
+    flow: 5592a23b-0974-45bb-9388-89ea81c42537
+destinations:
+  - {node: edge-01, domain: fast/ingest}
+idle_teardown_ms: 0        # bursty feed, keep it hot
+```
+
+Documents are applied by kind — namespaces, then domains, then requests — whatever order the file
+is in. The end state does not depend on it; the *intermediate* state does, and a request that
+lands ahead of the labels its selector matches reads as the apply having broken and then fixed
+itself.
+
+| Field | Meaning |
+|---|---|
+| `name` | The request's identity, its ID and its idempotency key. Applying the same name again updates rather than duplicating. |
+| `sources[]` | Where to read from. **Always a list**, and at least one; a request is the cross product of this and `destinations[]`. |
+| `sources[].node` | Which node to read from. Pinned, not selected. |
+| `sources[].domain` | **A scalar is a name and a map is a label set.** `media/cameras` addresses that domain; `{role: cameras}` matches every domain on the node carrying that label. An empty map is refused — it would match everything the node happens to hold. |
+| `sources[].flow` | Pin one flow ID. |
+| `sources[].group_hint` | Select every flow whose `urn:x-nmos:tag:grouphint/v1.0` matches. `{name, type}`; omitting `type` selects every flow sharing the name, which is how a camera's video and audio travel together. At most one of `flow` and `group_hint`. |
+| *(neither)* | A source that names a domain and says nothing else replicates **every flow in it** — the retired proxy's subscription shape. Spelled by omission in a manifest only; on the wire it is `"select": {"all": true}` and an absent selector is an error. |
+| `destinations[]` | Where it goes: `node` and `domain`. |
+| `destinations[].domain` | `<area>/<elements>`: `fast/ingest`, or `fast/studio-a/cam1` to nest. The first segment is the area — which the destination node must advertise **and grant `write` on** — and the rest are path elements, each a plain name, at most 8 of them. On the wire it is `{area, elements}`, and the manifest is the only place it is ever a string. |
+| `destinations[].provider` | Override the request-level pin for this destination alone. |
+| `provider` | `verbs`, or `[verbs, tcp]` for "prefer verbs, tcp acceptable". Omitted, the server negotiates in its configured order (EFA > Verbs > TCP > SHM). **Never silently substituted** — a pin is honoured or the request fails. |
+| `idle_teardown_ms` | Stop this request's workers when its source has been idle this long. `0` keeps them hot. |
+| `sched_prio` | Ask for `SCHED_FIFO`. Rejected at request time if a participating node lacks the capability. |
+| `namespace` | The partition this request belongs to, and half its identity: `(namespace, name)` is the ID, so two requests called `cam1` in two namespaces are two requests. Omitted, it is `default`. Letters, digits, `-` and `_`. |
+| `labels` | Ride into worker metrics as user labels, and narrow `apply --prune` within its namespace. |
+
+### Namespaces
+
+A namespace is a partition of the request set, and a first-class object: it has a record, a
+description, and one rule — whether two of its requests may hold the same path.
+
+**Names are scoped to it.** `(namespace, name)` is a request's ID and its idempotency key, so two
+operators can both have a `cam1`, and a Kubernetes adapter naming requests after pods inherits
+Kubernetes' own namespacing instead of having to prefix.
+
+```yaml
+kind: namespace
+name: nab
+paths: exclusive           # default is `shared`
+```
+
+`paths: shared` — **the default** — lets two requests expand onto one path. That is refcounting
+working as designed: one path, one session, one worker pair, nothing doubled and nothing
+corrupted, and across namespaces it is exactly how fan-in is expressed.
+
+`paths: exclusive` refuses it. The loser reports `INVALID` naming the incumbent, and the path —
+held by the winner — carries on. What overlap costs is not integrity but *legibility*: in a matrix
+of one namespace's requests, two lit cells that are one stream do not sum, and a cell goes dark on
+a click that stopped nothing. So it is opt-in, and the party that needs the guarantee is the party
+that asks for it: a third-party client should not have to know the rule exists in order not to be
+broken by it.
+
+A namespace is created by first reference and is never removed on your behalf; deleting one is
+refused while any request references it, with the count. `default` cannot be deleted.
+
+One namespace is one file, and `--prune` is what makes that literal:
+
+```bash
+mxl-replicator apply -f nab.yaml --prune -n nab [-l show=x]
+```
+
+Everything in the `nab` namespace that the file does not name is cancelled; every other namespace
+is untouched. `-n` is required — a declared partition is a better guard than an ad-hoc tag — and
+`-l` narrows within it.
+
+### Domain labels
+
+A domain's **identity** is `<area>/<elements>`, permanently. Labels are annotation attached to
+`(node, domain)` through the API, and what they are for is *selection*:
+
+```bash
+mxl-replicator label domain studio-a:media/cameras role=cameras name=cameras
+mxl-replicator label domain studio-a:media/cameras site-          # remove a key
+```
+
+Renaming a domain is not on offer, and the reason is worth stating: the domain name is embedded in
+path identity, session identity and the `domain` metric label, so a rename would tear down running
+media and split every series it touches — on a metadata edit. Keeping identity fixed makes
+relabelling free.
+
+**A label can be applied before the domain exists.** It is a pending record, listed by
+`get domains` and `describe domain`, and a request selecting it sits in `WAITING` until a producer
+appears. That is the point: labelling a camera's domain before the camera is switched on is an
+ordinary thing to want.
+
+Two writers, two semantics, one endpoint:
+
+| Gesture | Body | Merge |
+|---|---|---|
+| `kind: domain` in a manifest | an **apply** — the full map it declares | owns the keys it declares: sets them, removes the ones it declared last time and no longer does, and leaves every other key alone |
+| `mxl-replicator label` | a **patch** — keys to set, keys to remove | merges against nothing, and does not change what a future apply believes it owns |
+
+So `label` and `apply` do not fight, because they own different keys: an operator can name a
+domain interactively and keep that name, in a fleet whose requests are applied from git by someone
+else. It is `kubectl apply`'s three-way merge, adopted deliberately — this file format is close
+enough to a Kubernetes manifest that surprising someone who arrives with those expectations costs
+more than internal consistency would buy.
+
+**`--prune` never touches a label.** A file naming three domains would otherwise prune the other
+forty, and a label is a fact about a host rather than intent.
+
+A label write starts and stops media, one level of indirection away, so it takes `--dry-run` and
+prints a **blast radius** on the real write too: for each path that would stop, which requests were
+feeding it. It prints rather than prompts — the CLI is scripted by the same people who use it
+interactively, and a verb that blocks on a tty hangs in a pipeline.
+
+#### What a label selector will not match
+
+**A label selector never matches a flow this project is itself writing.** Left open, replication
+feeds itself: a flow copied to a node becomes visible on that node, a broad selector matches its
+own output, and the path set grows on every pass. It terminates, but the topology it settles into
+is decided by conflict precedence rather than by anything an operator wrote, and an emergent
+routing algorithm is the wrong thing to have.
+
+Naming a domain directly still reaches everything, which is how `A→B→C` is written:
+
+```yaml
+sources: [{node: edge-01, domain: fast/ingest, flow: "…"}]   # explicit: intent
+sources: [{node: edge-01, domain: {role: onward}}]           # matched: never its own output
+```
+
+The signal is per **flow**, not per directory, so a domain holding one replicated flow beside nine
+a local media function produced offers the nine and withholds the one. `get flows` and
+`describe domain` both carry a `REPLICATED` column, and a request whose expansion dropped a flow
+for this reason says so in its status — a silently skipped flow is otherwise undiagnosable.
+
+### Many sources, many destinations
+
+Both ends are lists, and a request is the cross product of them: three studios into two edges is
+six pairings, each expanding its own source's selector. A source's **node** stays pinned, so the
+list is always something the author typed rather than a second selector — which is what keeps the
+cost of a request readable at the moment it is written.
+
+Validation and negotiation are per pairing, and a request can be viable for eleven of them and
+refused for the twelfth. The reason names the end that failed: the source when it is common to
+every destination of one source, the destination when it is common to every source of one, and
+neither when it applies to every pairing. Naming the wrong end sends you to a node where
+everything is fine.
+
+Two things follow from the ends no longer sharing a fate:
+
+- **A request whose paths disagree, with at least one `ACTIVE`, is `PARTIAL`** — one dark camera
+  among twelve is the ordinary state of an ingest wall, and `PAUSED` would be a true statement
+  about one path and a false one about the request. `describe request` prints a row per source,
+  which is what says *which* camera.
+- **Two sources of one flow ID into one destination is refused.** Where both sources pin the UUID
+  it is `duplicate_source_flow` at `POST`; where it arrives later through a selector it is
+  `flow_conflict` on the path, and the loser is torn down.
+
+Fan-in as several documents sharing a destination domain still works and still refcounts to one
+session. What a single request buys is one unit of intent over the set.
+
+## Commands
+
+```
+mxl-replicator run      [--server] [--agent] [flags]    the daemon; both roles by default
+mxl-replicator apply    -f <manifest> [--dry-run] [--prune -n nab [-l k=v]]
+mxl-replicator delete   -f <manifest> | [-n nab] <name>...   only the kinds and names are read
+mxl-replicator label    domain <node>:<area>/<elements> k=v k-   [--dry-run]
+mxl-replicator status   [-o json|yaml]
+mxl-replicator get      nodes|domains|flows|requests|paths|sessions|namespaces [filters] [-o json|yaml]
+mxl-replicator describe node|domain|flow|request|path|session|namespace <name> [-o json|yaml]
+```
+
+`--server` and `--agent` select a role *alone*; naming neither runs both, which is the single-host
+and development case. Both roles in one process still speak HTTP to each other, so there is exactly
+one code path.
+
+### apply
+
+Create-or-update, keyed on each document's `name`. Applying an unchanged request writes nothing and
+says `unchanged` — a controller re-applying on every resync costs the store nothing.
+
+Documents are applied in file order. **This is not atomic**: a failure reports which document
+failed, leaves the earlier ones applied, and exits non-zero. Requests are independent durable
+intent, so a partial apply is a partial success.
+
+`apply` and `delete` print one line per document — the name, then what happened to it. It is a
+list, not a table; `get` and `status` are where the tables are.
+
+`-f` is repeatable and takes a file, a directory of `*.yaml` (flat, sorted, not recursive), or `-`
+for stdin.
+
+`--dry-run` validates and reconciles against the real fleet and reports what would happen, without
+writing. It sees stored state plus the one request, so two *new* documents in one file that
+conflict with each other both pass and the second fails on the real apply.
+
+### delete
+
+`delete -f` reads **only the kinds and names** from a manifest and ignores everything else in it, so
+a document containing nothing but `kind:` and `name:` is a complete instruction — and a file that
+has drifted from what is deployed still removes what it named. That is the case that matters: "delete what this
+file created" is wanted most exactly when the file is no longer an accurate description of
+anything. `delete [-n nab] <name>...` takes names directly. Documents go in reverse apply order —
+requests, then the namespaces they live in — and `kind: domain` documents are skipped, because
+removing labels is `label key-` or an apply that no longer declares them, both of which say what
+they mean.
+
+Deleting something that is not there succeeds. Removing what a manifest names is idempotent by
+nature, so a second run should not fail because the first one worked.
+
+`--prune` cancels requests in `--namespace` that the manifest does not name. **The namespace is
+required**: pruning everything a file does not name would cancel requests it knows nothing about,
+and the object being cancelled is moving video. A declared partition is a better guard than an
+ad-hoc tag, so `-n` is the scope and `-l` narrows within it. There is no confirmation prompt —
+`--dry-run` shows the set.
+
+```bash
+mxl-replicator apply -f studio-a.yaml --prune -n nab -l show=nab
+```
+
+**Prune covers requests only.** It never removes a namespace and never removes a domain label, even
+when the file contains documents of those kinds.
+
+### status, get and describe
+
+Three read verbs, three jobs, no overlap:
+
+| | |
+|---|---|
+| `status` | Counts the fleet, then names **only what is not active**. Not a list — the answer at 3am is "these two things are broken", not a screen to scan. |
+| `get <kind>` | Lists, so you can find the name of the thing you want. |
+| `describe <kind> <name>` | Everything known about one of them. |
+
+```console
+$ mxl-replicator status
+nodes      3 registered, 3 leased
+requests   4  (1 WAITING, 3 ACTIVE)
+paths      7  (1 WAITING, 6 ACTIVE)
+sessions   6 running
+
+KIND     NAME      STATE    REASON
+request  cam3      WAITING  the selector matches no flow in studio-b/media/cameras
+```
+
+States, worst-first: `INVALID`, `FAILED`, `DEGRADED`, `WAITING`, `ESTABLISHING`, `PAUSED`,
+`ACTIVE`. A request aggregates over its paths, and `get requests`' `PATHS` column carries the
+"1 of 3" that a one-flow-per-request model has no way to express.
+
+`PARTIAL` is the one exception and **aggregates only**: a request whose paths disagree, with at
+least one `ACTIVE`, reports it instead of the worst one — because one bad path among twenty must
+not condemn the other nineteen at the line you read first. It never appears on a path, a session or
+a worker, and the detail lives in `describe request`'s per-source rows and in the per-path metrics.
+
+`PAUSED` is the one worth knowing: it separates *the plumbing is broken* from *the source is not
+producing*, which look identical from a "no media at the destination" alarm and have completely
+different owners.
+
+`get` takes the same nouns in the plural (singular works too), with filters that are checked
+rather than ignored — `--node` on domains, flows, paths and sessions, `--domain` on flows, `-n` and
+`-l` on requests. Naming one that cannot apply is an error, because a filter that silently does
+nothing is how you conclude a flow is missing when you only narrowed on the wrong field.
+
+`describe` takes one of seven nouns:
+
+| | |
+|---|---|
+| `node` | What the agent advertises — areas and their grants, fabric attachments, versions — the domains it is currently observing, and every path touching it, with this node's role in each. |
+| `domain` | `<node>:<area>/<elements>`: its labels, whether the node reports it, and for each flow whether **this node is the one writing it**. |
+| `flow` | A flow ID is unique to the media, **not** to a location: after replication the same ID exists on both nodes. So this lists every place it is, whether each is being produced, and which paths carry it. |
+| `request` | The stored intent, its destinations and pins, the per-path breakdown, and **what the expansion excluded** — a flow a label selector skipped has no path to carry a reason, so it is listed here or it is invisible. |
+| `path` | The deduplicated edge, its state, and its **refcount** — which requests share it, and therefore what happens if you cancel one. |
+| `session` | The concrete worker pair: negotiated fabric and interface config, the epoch, and each end's state, bound endpoint, restart count and uptime. |
+| `namespace` | The partition: its `paths` policy, and the requests in it. |
+
+Path and session stay separate even though they are 1:1 in practice, because they are separate
+layers: a path is derived state that outlives any particular session, and a session is ephemeral —
+re-established whenever either end restarts. Collapsing them would suggest a path dies when its
+workers do, which is precisely what this design is built not to do.
+
+```console
+$ mxl-replicator describe path b895e698
+Path      b895e698
+  source        studio-a/media/cameras 5592a23b-0974-45bb-9388-89ea81c42537
+  destination   edge-01/fast/ingest
+  state         ACTIVE
+  requests      cam1-distribution, talkback (refcount 2)
+
+  Session 290fd86a — describe session 290fd86a for its workers
+    fabric      ib-fabric-a / verbs
+    state       target ready on edge-01, initiator ready on studio-a
+```
+
+`-o json` and `-o yaml` emit the API object verbatim, so a script written against them is written
+against the documented API rather than against the command.
+
+## Agent configuration
+
+Flags and YAML, and all of it provisioning-level — it changes when the host is built, not when a
+flow is routed.
+
+| Flag | Meaning |
+|---|---|
+| `--agent-node` | Fleet-wide unique node name. Defaults to the hostname. |
+| `--agent-server` | Control-plane URL. Repeatable for HA. |
+| `--agent-area name=/path:rw` | Declare an area, with its grants: `r` to discover and observe domains under it, `w` to create them. Repeatable. **A node with no readable area offers no sources; one with no writable area accepts no destinations.** |
+| `--agent-fabric provider=,fabric=,interface=` | Declare a fabric attachment. Repeatable. |
+| `--agent-port-range` | Range the agent binds target workers in. Inbound to the *destination* node, so open it there. |
+| `--agent-config` | YAML file supplying any of the above. |
+
+### Areas and domains
+
+**A domain is a place, not a channel.** There is one kind, whichever direction this project uses
+it in: a directory inside an area, holding flows. Several processes routinely write different
+flows into one directory, and the single-writer constraint MXL actually enforces is per *flow* —
+so this project is one participant among a node's media functions rather than the proprietor of
+any directory.
+
+An **area** is a directory an operator designated, with a name and two independent grants:
+
+```yaml
+areas:
+  - {name: media, path: /dev/shm/mxl,            read: true}
+  - {name: fast,  path: /dev/shm/mxl/replicated, read: true, write: true}
+  - {name: bulk,  path: /mnt/nvme/mxl,           read: true, write: true}
+```
+
+`read` is the whole of this project's authority to discover and observe domains under that
+directory; `write` is the whole of its authority to create them and write flows into them. Neither
+implies the other, both default false, and an area granting neither is refused at startup as a
+line that does nothing. Access to a node's filesystem is opt-in, per node and per direction.
+
+**A domain's fleet-wide identity is its area's name followed by its path elements**, and that is
+its identity for life. Under the layout above, `/dev/shm/mxl/studio-a/cam1` is `media/studio-a/cam1`
+and `/dev/shm/mxl/replicated/ingest` is `fast/ingest`.
+
+**Areas may nest, and the innermost containing area names a directory.** Longest prefix wins, so
+`media` being an ancestor of `fast` produces nothing to disambiguate — `fast` contains
+`.../replicated/ingest` more tightly, so it is `fast/ingest` and never `media/replicated/ingest`.
+Two areas on **one** directory are refused at startup, naming both, because that is the one
+arrangement the rule cannot decide. Everything else is legal, and the one-MXL-area-per-host layout
+with a subtree replication writes into is now two ordinary areas rather than an exception to a
+rule.
+
+That one name is what makes the rest work: a directory has exactly one identity whether discovery
+found it or the reconciler created it, so the two cannot disagree.
+
+A destination is **always a name inside an area the operator granted `write` on**. A raw path is
+never accepted from the API — that invariant is what stops the API from being a remote
+arbitrary-filesystem-write on every node in the fleet, and it holds whatever authentication is
+configured. The area is the entire perimeter, it is node-local configuration, and the API cannot
+set it. Both the server and the agent check it, and the agent is the authority about its own
+filesystem.
+
+**Discovery is not pruned.** A domain this project writes into is reported like any other: it
+appears in `get domains`, it can be labelled, and a flow in it that this node is *not* writing —
+one a local media function produced beside the replicated ones — is selectable like any other. What
+it cannot be is matched into a copy of itself, which is a rule about the flow rather than about the
+directory.
+
+A domain may itself be nested — `fast/studio-a/cam1` — which is how you group destinations without
+provisioning an area per group. One materialised domain may not *contain* another, so
+`fast/studio-a` and `fast/studio-a/cam1` cannot both be created on a node.
+
+**Repointing an area's directory keeps every identity on it.** `path: /dev/shm/mxl` →
+`path: /mnt/mxl` under the same area name leaves every domain called what it was, so paths and
+sessions survive the move rather than rebuilding. Moving a domain to a different *area* does
+re-identify it, which is the correct reading: the first is an operator relocating a mount, the
+second is choosing a different destination.
+
+### Fabric attachments
+
+Nodes declare `(provider, fabric, address)` triples, not bare provider names. `fabric` is an
+operator-assigned opaque label, and two nodes may pair on a provider **only if they share its
+label**:
+
+```yaml
+fabrics:
+  - {provider: verbs, fabric: ib-fabric-a, interface: ib0}
+  - {provider: tcp,   fabric: dc1-data,    interface: eth1}
+  - {provider: efa,   fabric: vpc1-subnet-a, interface: efa0}
+```
+
+Provider availability is not reachability. Two nodes both offering `verbs` may be on different
+InfiniBand fabrics; two both offering `efa` may be in different VPCs. Intersecting provider *names*
+would cheerfully assign a session that cannot connect, and it fails invisibly — the target comes up
+clean and the initiator's connect loop spins.
+
+Prefer naming an `interface` over an `address`: the agent resolves it at startup by running the
+worker's `--interfaces` probe and asking libfabric what the node actually has. A configured
+attachment with no matching probe result is a loud startup error, not a silent drop.
+
+## Docker images
 
 ```bash
 # Regular
-docker pull jonasohland/mxl-fabrics-proxy:latest
+docker pull jonasohland/mxl-replicator:latest
 
 # EFA optimized
-docker pull jonasohland/mxl-fabrics-proxy:latest-efa
+docker pull jonasohland/mxl-replicator:latest-efa
 ```
-## Quick Start
+
+Both carry `mxl-replicator` and `mxl-fabrics-proxy-worker`. `make image` / `make image-efa` build
+them; `make image-test` adds `mxl-mock-src` and `mxl-mock-sink` for the end-to-end suite, and must
+not be published as `:latest`.
+
+[`deployment/`](deployment/) has a server Deployment and an agent DaemonSet.
+
+## Building from source
 
 ```bash
-docker run -d \
-  --name mxl-proxy \
-  -p 2283:2283 \
-  -v /dev/shm:/dev/shm \
-  -v $(pwd):/config \
-  jonasohland/mxl-fabrics-proxy:latest \
-  --config /config/config.yaml \
-  --listen 0.0.0.0:2283
+# Requires CMake, a C++20 compiler and Go 1.26+
+make all
+
+# Or just the Go side
+make replicator
 ```
-
-## Configuration
-
-The proxy can be configured entirely via **command-line flags** or a **YAML configuration file** (recommended for complex setups). CLI flags and config file values are merged (CLI takes precedence for simple fields).
-
-### Command-Line Flags
-
-```bash
-mxl-fabrics-proxy [flags]
-```
-
-| Flag                    | Short | Default              | Description |
-|-------------------------|-------|----------------------|-----------|
-| `--config`              |       | —                    | Path to YAML config file(s) or directories (can be repeated) |
-| `--listen`              | `-l`  | `127.0.0.1:2283`     | HTTP listen address for API & metrics |
-| `--node`                |       | `127.0.0.1`          | Local node address (provider dependent) |
-| `--log-level`           |       | `info`               | `debug`, `info`, `warn`, `error` |
-| `--tracing`             | `-t`  | `false`              | Enable verbose logfmt tracing (flow labels, etc.) |
-| `--efa-use-wait`        |       | `false`              | Enable wait objects with EFA provider |
-| `--domain`              | `-d`  | —                    | Add local domain (repeatable) |
-| `--map-domain`          | `-m`  | —                    | Domain alias mapping |
-| `--subscribe`           | `-s`  | —                    | Add subscription (repeatable) |
-
-Example of a domain mapping on the command line:
-```sh
--m domain-1=/dev/shm/domain-1
-```
-
-Example of a subscription on the command line:
-```sh
-# <local-domain-mapped-name>@<remote-flow-url>
--s "domain-1@mxl://remote-engine.dc1.company.net?id=5592a23b-0974-45bb-9388-89ea81c42537&provider=verbs"
-```
-
-Complete example looping back a flow from /dev/shm/mxl0 to /dev/shm/mxl1
-```sh
-mxl-fabrics-proxy --node 127.0.0.1 \
-    -m mxl0=/dev/shm/mxl0 \
-    -m mxl1=/dev/shm/mxl1 \
-    -s "mxl1@mxl://127.0.0.1/dev/shm/mxl0?id=5592a23b-0974-45bb-9388-89ea81c42537&provider=tcp"
-```
-
-### Configuration File (`config.yaml`)
-
-The configuration file supports three main sections (plus an optional `remotes` section for advanced aliasing):
-
-```yaml
-# Defaults applied to all domains and subscriptions
-defaults:
-  node: 127.0.0.1
-  provider: tcp                 # tcp | verbs | shm | efa
-  tracing: true                 # lots of logfmt output
-  labels:
-    local: mxl111
-  # Optional performance tuning
-  # no_network_latency_measurement: false
-  # sched_prio: 0
-
-# Local domains exposed by this proxy
-domains:
-  mxl0:
-    url: mxl:///dev/shm/in0
-    labels:
-      xxx: in0
-  loopback1:
-    url: mxl:///dev/shm/loopback1
-
-# Subscriptions from remote proxies into local domains
-subscriptions:
-  in0:
-    # Full URL with flow ID
-    - url: mxl://remote.my.org:2283/dev/shm/mxl1?id=e929dbcf-1710-4e32-b94f-5345928eb4aa
-
-    # Using remote domain alias (defined in the *remote* proxy's domains section)
-    - url: mxl://remote.my.org/mxl1
-      id: e929dbcf-1710-4e32-b94f-5345928eb4aa
-
-    # Multiple flow IDs
-    - url: mxl://remote.my.org/mxl1
-      ids:
-        - e929dbcf-1710-4e32-b94f-5345928eb4aa
-        - another-flow-uuid
-
-    # Loopback / local testing
-    - url: mxl://localhost/loopback1?id=bdb0229d-b2cb-42e1-8d33-b1f906d35186
-```
-
-#### Optional Advanced Section: `remotes`
-
-For cleaner configuration when talking to many remote proxies:
-
-```yaml
-remotes:
-  production-east:
-    endpoint: remote-east.my.org:2283
-    provider: efa
-    domains:
-      main: /dev/shm/mxl1
-      backup: /dev/shm/mxl2
-    labels:
-      region: us-east-1
-
-subscriptions:
-  in0:
-    - remote: production-east/main
-      id: e929dbcf-1710-4e32-b94f-5345928eb4aa
-```
-
-### Reloading Configuration
-
-Send a `POST` request to reload the configuration at runtime (no restart required):
-
-```bash
-curl -X POST http://localhost:2283/v1/reload
-```
-
-The proxy will atomically apply the new configuration while keeping existing flows running where possible.
-
-### Automatic Reloads (`mxl-fabrics-proxy-reloader`)
-
-The proxy does not watch its configuration files itself. `mxl-fabrics-proxy-reloader`
-is a small companion binary that does: it watches the same files and directories
-you pass to the proxy's `--config` flag and triggers a reload when their contents
-change. It is shipped in the same Docker image, which makes it convenient to run
-as a Kubernetes sidecar next to the proxy container, watching a mounted ConfigMap.
-
-```bash
-mxl-fabrics-proxy-reloader --config /config --server 127.0.0.1:2283
-```
-
-| Flag         | Short | Default          | Description |
-|--------------|-------|------------------|-----------|
-| `--config`   |       | —                | Config file or directory to watch (repeatable), same semantics as the proxy |
-| `--server`   | `-s`  | `127.0.0.1:2283` | Address of the proxy to reload, either `host:port` or a full URL |
-| `--interval` |       | `1s`             | How often the configuration is checked for changes |
-| `--debounce` |       | `2s`             | How long the configuration must stay unchanged before a reload is triggered |
-| `--timeout`  |       | `30s`            | Timeout for a single reload request |
-| `--log-level`|       | `info`           | `debug`, `info`, `warn`, `error` |
-
-Change detection is based on a hash of the contents of every file the proxy would
-load, so it behaves correctly with the atomic symlink swap Kubernetes uses to
-update a mounted ConfigMap. A reload is only triggered once the contents have
-stayed unchanged for the debounce interval, which coalesces multi-file updates
-and rides out reads that race with an update in progress.
-
-A reload is always triggered once at startup. The proxy reads its configuration
-by itself, but there is no ordering guarantee between the two processes — the
-proxy may have started before the current contents were in place — so the
-reloader does not assume the running configuration matches what is on disk. The
-debounce applies to this first reload too, giving a config volume that is still
-being populated time to settle.
-
-If the proxy rejects a configuration, or is not listening yet, the reloader
-retries with an exponential backoff (up to 30s), and retries immediately when
-the files change again.
-
-## Building from Source
-
-```bash
-git clone https://github.com/jonasohland/mxl-fabrics-proxy.git
-cd mxl-fabrics-proxy
-
-# Build (requires CMake + Go 1.26+)
-make
-
-# Or manually
-mkdir build && cd build
-cmake .. -DCMAKE_BUILD_TYPE=Release
-make -j$(nproc)
-```
-
-The resulting binaries are:
-- `mxl-fabrics-proxy` — main proxy
-- `mxl-fabrics-proxy-worker` — internal worker (launched automatically)
-- `mxl-fabrics-proxy-reloader` — optional config file watcher (see [Automatic Reloads](#automatic-reloads-mxl-fabrics-proxy-reloader))
 
 ## Observability
 
-- **Metrics**: Prometheus endpoint at `http://<listen>/metrics`
-- **Health**: `http://<listen>/healthz` (also served at `/v1/health`)
-- **Tracing**: Enable with `--tracing` or `tracing: true` in config for detailed logfmt output including flow labels and descriptions
+Prometheus metrics on the agent's `--agent-listen` (`:2284`) and the server's `--server-listen`
+(`:2283`), at `/metrics`.
 
-### Health Endpoint
+Prefixes split by **what the metric describes**, not by which process emits it:
 
-```bash
-curl http://localhost:2283/healthz
-```
+- `mxl_*` — anything about a flow or a transfer. Unchanged from `mxl-fabrics-proxy`, so existing
+  dashboards keep working.
+- `mxl_repl_*` — control-plane metrics that exist only because of this project: requests by status,
+  sessions, leased agents, epoch transitions per session (an excellent flapping signal), reconcile
+  duration, store latency.
 
-```json
-{
-  "status": "ok",
-  "uptime_seconds": 3812.4,
-  "proxy_version": "0.0.1",
-  "mxl_version": "1.1.0-rc1",
-  "libfabric_version": "2.6",
-  "domains": 2,
-  "subscriptions": 0,
-  "targets": 4
-}
-```
+Worker metrics are scraped on demand, inside the request, through a bounded pool with per-worker
+and overall deadlines. `/healthz` stays green when a transfer is failing — a peer being unreachable
+is no reason to restart and drop every other flow — so use `/readyz` for readiness and watch status
+and metrics for failure.
 
-The endpoint reports whether the proxy process is up and serving. It returns 200
-whenever that is true and does not touch the workers, which makes it cheap enough
-to use as a Kubernetes liveness and readiness probe — unlike `/metrics`, which
-scrapes every worker on each request.
+## Migrating from mxl-fabrics-proxy
 
-It deliberately does **not** go unhealthy when a transfer is failing. Targets and
-workers retry on their own, and a remote peer being unreachable is not a reason to
-restart this proxy and drop every other flow it carries. Use the metrics
-(`mxl_worker_restarts`, `mxl_writer_active`, `mxl_reader_active`) to alert on
-flow-level problems.
+There is **no configuration or wire compatibility**, and no importer. The legacy file is a per-node
+config whose subscriptions are addressed by `mxl://` URL and whose destination is a `-m` mapping —
+three things this design deliberately moved. Re-author the `subscriptions:` block as a manifest.
 
-The counts follow the internal naming: `targets` is the number of flows this proxy
-receives (one per entry in the `subscriptions` config section), while
-`subscriptions` is the number of flows it currently sends to remote proxies that
-have subscribed to it.
+What does carry over:
+
+- **`mxl_*` metric names.** Five label changes do not:
+
+  | Was | Is | Why |
+  |---|---|---|
+  | `flowID="…"` | `flow_id="…"` | Prometheus convention |
+  | `domain="/dev/shm/mxl0"` | `domain="media/cameras"` | The fleet-wide identity, not a path — stable across hosts, and the same value on both ends of a transfer |
+  | `quantile="0.010"` | `quantile="0.01"` | Three fixed decimals are not how anything else renders a quantile |
+  | — | `session="…"` | New; without it two initiators on one flow are one duplicated series |
+  | — | `namespace="…"` | New; which partition a transfer belongs to |
+
+Three things need a decision rather than a translation:
+
+- **`-m name=/path` and the `domains:` block are gone.** They did two jobs at once — granting the
+  agent authority to read a directory, and giving that directory a fleet-wide name — and those
+  separate. The grant becomes an area's `read` bit; the naming becomes the area's own name plus
+  what the filesystem already decided, with anything friendlier expressed as a label. That also
+  means naming a domain no longer costs an agent restart, and an agent restart re-establishes every
+  flow on the node.
+- A legacy mapping used as a subscription **destination** becomes a domain name inside an area the
+  node grants `write` on.
+- `defaults.provider` was a per-side setting; a provider is now negotiated per session against
+  declared fabric attachments. Carry it over as a request-level `provider` pin and relax it
+  deliberately — silently widening what an existing deployment asked for is exactly the
+  substitution this project refuses to make on your behalf.
 
 ## Contributing
 

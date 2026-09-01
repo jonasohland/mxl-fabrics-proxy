@@ -67,7 +67,34 @@ func (s *Server) routes() http.Handler {
 	mux.Handle(api.AgentPrefix+"/", s.authenticate(surfaceAgent, agent))
 	mux.Handle(api.UserPrefix+"/", s.authenticate(surfaceUser, user))
 
-	return s.recoverPanics(mux)
+	return s.recoverPanics(noStore(mux))
+}
+
+// noStore marks every response this server produces as uncacheable.
+//
+// **Nothing this API returns is ever cacheable, and there are no exceptions to police.** Every
+// response is either live fleet state or the result of an operation, and the health endpoints are
+// the liveness of *this process* — a cached `/readyz` is a load balancer routing to a replica that
+// said it was not settled (§7.3). Stating it once for the whole mux is therefore both correct and
+// the cheapest thing to be sure of.
+//
+// It exists for one response in particular. `GET /agent/v1/{node}/assignments` is a GET with a
+// cursor in its query string, and an intermediary that caches it — CloudFront's default cache
+// policy will, since nothing here previously said otherwise — hands an agent a stale assignment
+// set. That is the one failure fail-static cannot defend against: §4.2 protects an agent from *no
+// answer*, not from a successfully-retrieved wrong one, so the set is acted on. If it carries a
+// stale epoch, the result is §5.2's worst case — an initiator running against rkeys that no longer
+// exist, moving no data, with nothing anywhere reporting an error.
+//
+// `no-store` rather than `no-cache`: the latter permits storing the response and revalidating,
+// which is a correct-but-useless distinction here and one more thing for an intermediary to get
+// subtly wrong. It is set before the handler runs so that it covers error responses and panics
+// too, and a handler that wanted to override it still can.
+func noStore(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-store")
+		next.ServeHTTP(w, r)
+	})
 }
 
 // recoverPanics keeps one bad request from taking the process down.

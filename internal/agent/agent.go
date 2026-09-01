@@ -64,6 +64,23 @@ const (
 	// DefaultRegisterBackoffMax bounds retries of a registration that keeps being refused —
 	// most importantly a node name another instance is holding (§7.1).
 	DefaultRegisterBackoffMax = 30 * time.Second
+
+	// DefaultStartRate and DefaultStartBurst pace worker starts (§6.3).
+	//
+	// Not applied here: [Config.StartRate] zero means *no limit*, so an operational default cannot
+	// live in a setDefault the way a duration's does. It is the flag's default
+	// (`--agent-start-rate`), the same place `--agent-flow-idle-after` and `--agent-port-range`
+	// keep theirs, and these constants exist so the two spellings cannot drift.
+	//
+	// **Deliberately conservative, and it costs real re-establishment time.** Two at once and one
+	// every two seconds means a node re-establishing 50 workers is not done for a minute and a
+	// half, where §6.1 budgets 1–2 s for a flow. That is the trade taken on purpose: the failure
+	// being prevented takes out the *whole node* — every worker on it, including the ones that
+	// were already running fine — while what it costs is a slower recovery on a node that is
+	// already recovering. A deployment with headroom should raise it; the number to raise first is
+	// the burst, because that is the one the host is actually measured against.
+	DefaultStartRate  = 0.5
+	DefaultStartBurst = 2
 )
 
 // Config configures an [Agent].
@@ -108,6 +125,19 @@ type Config struct {
 	TargetInfoTimeout time.Duration
 	StopGrace         time.Duration
 
+	// StartRate and StartBurst pace worker starts on this node (§6.3).
+	//
+	// StartRate is starts per second and **zero means no limit** — the sentinel points that way
+	// deliberately, because a zero meaning "admit nothing" would be a typo that silently stops
+	// every flow on the node. StartBurst is how many workers may go into setup at the same
+	// instant, which is the number the exhaustion this exists for is measured against.
+	//
+	// Agent-local, and not a session-level knob like the idle timeouts above (§5.5, §6.2): it
+	// describes what this host can absorb, there is nothing for two nodes to agree about, and the
+	// server could not know the answer for a node it has never run on.
+	StartRate  float64
+	StartBurst int
+
 	// ScrapeConcurrency is how many worker sockets [Agent.Collector] reads at once.
 	ScrapeConcurrency int
 
@@ -133,6 +163,10 @@ type Agent struct {
 	// (§10.6). Derived from the target assignments on every reconcile rather than counted, so it
 	// cannot drift from the workers it exists for.
 	outputs map[string]string
+
+	// starts paces worker starts (§6.3). Read by every supervision goroutine and by the metrics
+	// collector; set once in New and never replaced.
+	starts *startGate
 
 	// notify wakes the report loop. Capacity one and a non-blocking send: it is a "something
 	// changed" edge, and coalescing several into one report is the point.
@@ -173,6 +207,10 @@ func New(cfg Config) (*Agent, error) {
 		return nil, errors.New("agent: no port allocator")
 	case cfg.Probe == nil:
 		return nil, errors.New("agent: no capability probe")
+	case cfg.StartRate < 0:
+		// Zero is a value with a meaning — no rate control at all — so it cannot double as
+		// "unset", and a negative one is a mistake rather than a third mode (§6.3).
+		return nil, errors.New("agent: negative worker start rate")
 	}
 
 	if cfg.Instance == "" {
@@ -203,6 +241,7 @@ func New(cfg Config) (*Agent, error) {
 		log:      cfg.Logger,
 		units:    map[unitKey]*unit{},
 		rejected: map[unitKey]string{},
+		starts:   newStartGate(cfg.StartRate, cfg.StartBurst),
 		notify:   make(chan struct{}, 1),
 	}, nil
 }

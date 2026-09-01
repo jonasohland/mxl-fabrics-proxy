@@ -47,7 +47,7 @@ func fleet() *state.Fleet {
 func spec() api.RequestSpec {
 	return api.RequestSpec{
 		Name:         "studio-a-cam1-to-edge",
-		Source:       api.Source{Node: "studio-a", Domain: named("media/cameras"), Select: api.Selector{Flow: "flow-1"}},
+		Sources:      []api.Source{{Node: "studio-a", Domain: named("media/cameras"), Select: api.Selector{Flow: "flow-1"}}},
 		Destinations: []api.Destination{{Node: "edge-01", Domain: api.Domain{Area: "fast", Elements: []string{"ingest"}}}},
 	}
 }
@@ -56,7 +56,7 @@ func TestSpecAccepts(t *testing.T) {
 	t.Parallel()
 
 	s := spec()
-	result, bad := Destination(s, s.Destinations[0], fleet(), negotiate.Config{})
+	result, bad := Pairing(s, 0, 0, fleet(), negotiate.Config{})
 	require.Nil(t, bad)
 	assert.Equal(t, api.ProviderTCP, result.Provider())
 	assert.Equal(t, "dc1", result.Fabric)
@@ -79,7 +79,7 @@ func TestSpecRejections(t *testing.T) {
 		{
 			name: "same node and domain",
 			mutate: func(s *api.RequestSpec) {
-				s.Source.Domain = named("fast/cameras")
+				s.Sources[0].Domain = named("fast/cameras")
 				s.Destinations[0] = api.Destination{
 					Node: "studio-a", Domain: api.Domain{Area: "fast", Elements: []string{"cameras"}},
 				}
@@ -99,7 +99,7 @@ func TestSpecRejections(t *testing.T) {
 		},
 		{
 			name:   "unknown source node",
-			mutate: func(s *api.RequestSpec) { s.Source.Node = "typo" },
+			mutate: func(s *api.RequestSpec) { s.Sources[0].Node = "typo" },
 			want:   api.ReasonNodeNotRegistered,
 		},
 		{
@@ -167,6 +167,62 @@ func TestSpecRejections(t *testing.T) {
 			want:   api.ReasonSchedPrioUnavailable,
 		},
 		{
+			// A named source resolving to a destination is an operator having written the same
+			// string twice — decidable from the request, and refused (§7.2).
+			name: "source and destination are the same endpoint",
+			mutate: func(s *api.RequestSpec) {
+				s.Sources[0].Domain = named("fast/ingest")
+				s.Sources[0].Node = "edge-01"
+			},
+			want:    api.ReasonSameEndpoint,
+			message: "sources[0] and destinations[0]",
+		},
+		{
+			// Checked over the whole cross product, and the message names **both** indices —
+			// "source and destination are both edge-01/fast/ingest" does not say which of several
+			// sources it is (§7.2, §9.1).
+			//
+			// This is also the test that an intra-request cycle is unwritable: a cycle always puts
+			// some endpoint on both sides, and a self-pair in the cross product is exactly what this
+			// refuses.
+			name: "one bad pairing among several refuses the request",
+			mutate: func(s *api.RequestSpec) {
+				s.Sources = append(s.Sources, api.Source{
+					Node: "edge-01", Domain: named("fast/ingest"), Select: api.Selector{All: true},
+				})
+				s.Destinations = append(s.Destinations, api.Destination{
+					Node: "edge-01", Domain: api.Domain{Area: "fast", Elements: []string{"other"}},
+				})
+			},
+			want:    api.ReasonSameEndpoint,
+			message: "sources[1] and destinations[0]",
+		},
+		{
+			// Two sources pinning one flow UUID into a shared destination is two initiators writing
+			// one ring buffer — flow_conflict's harm from inside a single request, decidable from
+			// the body because both sources pinned rather than selected (§7.2).
+			name: "two sources pinning one flow",
+			mutate: func(s *api.RequestSpec) {
+				s.Sources = append(s.Sources, api.Source{
+					Node: "studio-b", Domain: named("media/cameras"), Select: api.Selector{Flow: "flow-1"},
+				})
+			},
+			want:    api.ReasonDuplicateSourceFlow,
+			message: "both pin flow flow-1",
+		},
+		{
+			// The undecidable form stays per path: a selector may or may not produce that flow, and
+			// refusing on a maybe refuses a request that probably works. It becomes
+			// `flow_conflict` in [Conflicts] if and when the collision actually arrives.
+			name:    "one pinned and one selected is not decidable here",
+			prepare: func(f *state.Fleet) { f.Nodes["studio-b"] = node("studio-b") },
+			mutate: func(s *api.RequestSpec) {
+				s.Sources = append(s.Sources, api.Source{
+					Node: "studio-b", Domain: named("media/cameras"), Select: api.Selector{All: true},
+				})
+			},
+		},
+		{
 			name:   "sched_prio where both nodes can",
 			mutate: func(s *api.RequestSpec) { s.SchedPrio = ptr(50) },
 			prepare: func(f *state.Fleet) {
@@ -206,7 +262,20 @@ func TestSpecRejections(t *testing.T) {
 				tc.mutate(&s)
 			}
 
-			_, bad := Destination(s, s.Destinations[0], f, negotiate.Config{})
+			// Both checks, in the order [reconcile.Compute] runs them: what is wrong with the
+			// request as a whole outranks what is wrong with one of its pairings, because no
+			// pairing's message would name the thing to change (§7.2). And **every** pairing, not
+			// the first — a request viable for eleven pairings and refused for the twelfth is
+			// refused (§9.1).
+			bad := Request(s, f)
+			for i := range s.Sources {
+				for j := range s.Destinations {
+					if bad != nil {
+						break
+					}
+					_, bad = Pairing(s, i, j, f, negotiate.Config{})
+				}
+			}
 			if tc.want == "" {
 				assert.Nil(t, bad)
 				return
@@ -327,7 +396,14 @@ func TestConflictsRejectsTwoSourcesIntoOneDestinationFlow(t *testing.T) {
 	require.Contains(t, out, "p2")
 	assert.Equal(t, api.ReasonFlowConflict, out["p2"].Code)
 	assert.NotContains(t, out, "p1")
+
+	// **Both sources, not the winner alone** (§7.5). Fan-in makes two paths of one request
+	// colliding routine, and there the tie falls through to the path ID — deterministic, and
+	// arbitrary from the operator's point of view, since nothing in the request says which of two
+	// sources of one flow ID was meant. Naming only the incumbent reads as an explanation when it
+	// is really a coin toss.
 	assert.Contains(t, out["p2"].Message, "studio-a/cameras")
+	assert.Contains(t, out["p2"].Message, "studio-b/cameras")
 }
 
 // The same edge appearing twice is deduplication, not a conflict: N requests naming one edge

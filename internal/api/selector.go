@@ -13,6 +13,7 @@ type SelectorKind string
 const (
 	SelectorKindFlow      SelectorKind = "flow"
 	SelectorKindGroupHint SelectorKind = "group_hint"
+	SelectorKindAll       SelectorKind = "all"
 )
 
 // Selector chooses which source flows a request replicates (§9.1).
@@ -56,6 +57,27 @@ type Selector struct {
 	//
 	//	"select": {"group_hint": {"name": "Studio A:Camera 1", "type": "video"}}
 	GroupHint *GroupHintSelector `json:"group_hint,omitempty"`
+
+	// All selects every flow in the source's domain — the retired proxy's subscription shape
+	// (§9.1, §16):
+	//
+	//	"select": {"all": true}
+	//
+	// **A kind like any other on the wire, and an absent `select` is still an error.** Making the
+	// zero value mean "everything" is precisely what the tagged union exists to prevent: a
+	// hand-rolled POST with a mistyped key, or a record stored before this kind existed, would
+	// decode as *replicate the entire domain* rather than failing. That is the wrong direction to
+	// be wrong in for a mechanism that moves uncompressed video between hosts, and it is the same
+	// argument this type already makes about an unknown kind.
+	//
+	// A manifest may spell it by omission — a source that names a domain and says nothing else —
+	// because an unrecognised key is an error there, so a typo cannot reach the default (§9.1).
+	// Nothing else may.
+	//
+	// `"all": false` is not a selector. It decodes to the empty union and is refused by
+	// [Selector.Validate] like any other absent kind, rather than meaning "select nothing" — a
+	// request that deliberately matches nothing is a request nobody should have written.
+	All bool `json:"all,omitempty"`
 }
 
 // GroupHintSelector matches on the NMOS group hint tag (§9.1).
@@ -90,14 +112,29 @@ func (s GroupHintSelector) Matches(hint GroupHint) bool {
 
 // Kind returns the selector's kind, or "" if none or several are set.
 func (s Selector) Kind() SelectorKind {
-	switch {
-	case s.Flow != "" && s.GroupHint == nil:
-		return SelectorKindFlow
-	case s.GroupHint != nil && s.Flow == "":
-		return SelectorKindGroupHint
-	default:
+	set := s.kinds()
+	if len(set) != 1 {
 		return ""
 	}
+	return set[0]
+}
+
+// kinds is every kind this selector has a value for, which is exactly one in a valid selector.
+//
+// Written once and used by both [Selector.Kind] and [Selector.Validate], because the two disagreeing
+// about what "set" means is how a third kind gets added correctly in one of them and not the other.
+func (s Selector) kinds() []SelectorKind {
+	var set []SelectorKind
+	if s.Flow != "" {
+		set = append(set, SelectorKindFlow)
+	}
+	if s.GroupHint != nil {
+		set = append(set, SelectorKindGroupHint)
+	}
+	if s.All {
+		set = append(set, SelectorKindAll)
+	}
+	return set
 }
 
 // Validate enforces exactly-one-of, and that the chosen kind is usable.
@@ -106,13 +143,7 @@ func (s Selector) Kind() SelectorKind {
 // importer, by a test, by the Kubernetes adapter — bypasses the decoder entirely, and an
 // invalid one must not reach the wire in either direction.
 func (s Selector) Validate() error {
-	var set []SelectorKind
-	if s.Flow != "" {
-		set = append(set, SelectorKindFlow)
-	}
-	if s.GroupHint != nil {
-		set = append(set, SelectorKindGroupHint)
-	}
+	set := s.kinds()
 
 	switch len(set) {
 	case 1:
@@ -133,7 +164,7 @@ func (s Selector) Validate() error {
 }
 
 func selectorKindNames() []string {
-	return []string{string(SelectorKindFlow), string(SelectorKindGroupHint)}
+	return []string{string(SelectorKindFlow), string(SelectorKindGroupHint), string(SelectorKindAll)}
 }
 
 // UnmarshalJSON decodes a selector, rejecting both an unknown kind and more than one kind.

@@ -219,7 +219,7 @@ func rid(name string) api.RequestID {
 func flowRequestSpec(name string) api.RequestSpec {
 	return api.RequestSpec{
 		Name:         name,
-		Source:       api.Source{Node: "studio-a", Domain: named("media/cameras"), Select: api.Selector{Flow: "flow-1"}},
+		Sources:      []api.Source{{Node: "studio-a", Domain: named("media/cameras"), Select: api.Selector{Flow: "flow-1"}}},
 		Destinations: []api.Destination{{Node: "edge-01", Domain: api.Domain{Area: "fast", Elements: []string{"ingest"}}}},
 	}
 }
@@ -814,7 +814,7 @@ func TestAValidButUnsatisfiableRequestIsAccepted(t *testing.T) {
 	h.fleet()
 
 	spec := flowRequestSpec("future")
-	spec.Source.Select = api.Selector{Flow: "not-yet-published"}
+	spec.Sources[0].Select = api.Selector{Flow: "not-yet-published"}
 
 	resp := h.do(http.MethodPost, defaultRequests, spec)
 	require.Equal(t, http.StatusCreated, resp.status, "body: %s", resp.body)
@@ -1194,6 +1194,27 @@ func TestHealthAndReadiness(t *testing.T) {
 	assert.Equal(t, http.StatusOK, h.do(http.MethodGet, "/readyz", nil).status)
 }
 
+// Nothing this server returns is cacheable, and the assignment poll is why: it is a GET with a
+// cursor in its query string, so an intermediary with a default cache policy — CloudFront's, for
+// one — will happily serve an agent a stale assignment set. Fail-static does not cover that: §4.2
+// protects an agent from *no answer*, not from a successfully-retrieved wrong one, so a stale
+// epoch reaches a worker and becomes §5.2's silent failure.
+func TestResponsesAreUncacheable(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+
+	for _, path := range []string{
+		api.AssignmentsPath("edge-01"),
+		api.PathRequests,
+		api.PathFlows,
+		"/healthz",
+		"/readyz", // 503 here, and an error is exactly as uncacheable as a success.
+	} {
+		assert.Equal(t, "no-store", h.do(http.MethodGet, path, nil).header.Get("Cache-Control"), "path %s", path)
+	}
+}
+
 func TestMalformedBodies(t *testing.T) {
 	t.Parallel()
 
@@ -1210,8 +1231,9 @@ func TestMalformedBodies(t *testing.T) {
 	// A selector with two kinds set must fail at parse: ignoring the unknown one would silently
 	// *widen* the selection, and for something that moves uncompressed video between hosts that
 	// is the wrong direction to fail in (§9.1).
-	body := `{"name":"x","source":{"node":"a","domain":"d","select":{"flow":"f","group_hint":{"name":"n"}}},` +
-		`"destination":{"node":"b","domain":"e"}}`
+	body := `{"name":"x","sources":[{"node":"a","domain":{"name":{"area":"m","elements":["d"]}},` +
+		`"select":{"flow":"f","group_hint":{"name":"n"}}}],` +
+		`"destinations":[{"node":"b","domain":{"area":"fast","elements":["e"]}}]}`
 	req, err = http.NewRequestWithContext(t.Context(), http.MethodPost, h.http.URL+defaultRequests,
 		bytes.NewReader([]byte(body)))
 	require.NoError(t, err)
@@ -1315,7 +1337,7 @@ func TestTheAutoCreateDoesNotRewriteAnExistingNamespace(t *testing.T) {
 	// A second request in the same namespace writes the request and nothing else.
 	second := flowRequestSpec("cam2")
 	second.Namespace = "nab"
-	second.Source.Select = api.Selector{Flow: "flow-2"}
+	second.Sources[0].Select = api.Selector{Flow: "flow-2"}
 	require.Equal(t, http.StatusCreated, h.do(http.MethodPost, api.NamespaceRequestsPath("nab"), second).status)
 
 	var info api.NamespaceInfo
@@ -1690,7 +1712,7 @@ func TestALabelDryRunWritesNothingAndReportsWhatItWouldStop(t *testing.T) {
 	h.label("studio-a", labelApply("media/cameras", map[string]string{"role": "cameras"}), http.StatusCreated)
 
 	spec := flowRequestSpec("wide")
-	spec.Source.Domain = api.SelectLabels(map[string]string{"role": "cameras"})
+	spec.Sources[0].Domain = api.SelectLabels(map[string]string{"role": "cameras"})
 	require.Equal(t, http.StatusCreated, h.do(http.MethodPost, defaultRequests, spec).status)
 
 	var paths api.PathsResponse
@@ -1737,7 +1759,7 @@ func TestALabelReportsWhatItWouldStart(t *testing.T) {
 		api.FlowInventory{ID: "flow-1", Definition: testFlowDef, Producing: true})
 
 	spec := flowRequestSpec("wide")
-	spec.Source.Domain = api.SelectLabels(map[string]string{"role": "cameras"})
+	spec.Sources[0].Domain = api.SelectLabels(map[string]string{"role": "cameras"})
 	require.Equal(t, http.StatusCreated, h.do(http.MethodPost, defaultRequests, spec).status)
 
 	var paths api.PathsResponse

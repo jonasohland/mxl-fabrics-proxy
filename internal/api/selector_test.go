@@ -22,6 +22,11 @@ func TestSelectorDecodesOneKind(t *testing.T) {
 	require.NotNil(t, hint.GroupHint)
 	assert.Equal(t, "Studio A:Camera 1", hint.GroupHint.Name)
 	assert.Equal(t, "video", hint.GroupHint.Type)
+
+	var all Selector
+	require.NoError(t, json.Unmarshal([]byte(`{"all":true}`), &all))
+	assert.Equal(t, SelectorKindAll, all.Kind())
+	assert.True(t, all.All)
 }
 
 // The rejection is the invariant: without it, "adding a selector kind cannot change the
@@ -37,6 +42,14 @@ func TestSelectorRejectsAnythingButExactlyOneKind(t *testing.T) {
 		"unknown kind":  `{"label":"cam1"}`,
 		"known+unknown": `{"flow":"abc","label":"cam1"}`,
 		"empty name":    `{"group_hint":{"type":"video"}}`,
+
+		// **An absent `select` stays an error on the wire**, which is the whole point of `all`
+		// being a kind rather than the zero value: a hand-rolled POST with a mistyped key, or a
+		// record stored before this kind existed, would otherwise decode as *replicate the entire
+		// domain* rather than failing (§9.1). Only a manifest may fill the omission in, because an
+		// unrecognised key is an error there.
+		"all is false": `{"all":false}`,
+		"all and flow": `{"all":true,"flow":"abc"}`,
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()

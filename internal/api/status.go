@@ -53,6 +53,37 @@ const (
 	// StateFailed means repeated permanent-looking failure. Still retried, but surfaced
 	// loudly.
 	StateFailed State = "FAILED"
+
+	// StatePartial means some of what a request asked for is working and some is not: its paths
+	// disagree and at least one of them is ACTIVE (§11).
+	//
+	// **Aggregates only.** It is the one value in this vocabulary that never appears on a path, a
+	// session or a worker, because it describes disagreement among many things and those are one
+	// thing each. A renderer may show it on a request row and must never expect it on a path row.
+	//
+	// *This supersedes "ACTIVE only when every path is."* That fold was right while every path of a
+	// request shared a source: an idle producer moved them to PAUSED together, so the aggregate
+	// never had to describe disagreement. With [RequestSpec.Sources] a list, disagreement is the
+	// ordinary state — a twelve-camera ingest wall has one camera dark most of the time — and the
+	// old fold called that request PAUSED, which is true of one path and false of the request.
+	//
+	// It is not a fan-in concept. A group-hint request matching three flows of which one is paused
+	// has always been in this condition and always reported PAUSED, carrying "1 of 3 active" in the
+	// counts alone.
+	//
+	// **It outranks INVALID, FAILED and DEGRADED**, which is the surprising half and follows from
+	// §7.2 rather than from taste: that section already settled that a request expanding onto twenty
+	// paths, one of which conflicts, reports nineteen paths and one invalid one rather than being
+	// refused. A fold that promoted the one bad path to the top line would undo that at exactly the
+	// level an operator reads first. The aggregate answers *is this request doing its job*; the loud
+	// detail lives where it is actionable — in Counts, in [RequestStatus.Sources], and in the
+	// per-path gauges of §12, where a fleet alert on failing paths is unaffected by how their
+	// requests fold.
+	//
+	// Reusing DEGRADED was the alternative and is refused: it means flapping (§15.1) and is a state
+	// a path really is in, so a second set-shaped meaning would make
+	// `mxl_repl_requests{state="DEGRADED"}` a sum of two populations needing different responses.
+	StatePartial State = "PARTIAL"
 )
 
 // WorkerState is what an agent reports about one worker it is running (§5.3, §9.2).
@@ -78,16 +109,25 @@ const (
 	WorkerFailed WorkerState = "failed"
 )
 
-// States is the whole operator-facing vocabulary, in the order a path moves through it.
+// States is the vocabulary **one thing** can be in, in the order a path moves through it.
 //
 // Exported because a status count has to be able to report a zero: a state nothing is currently
 // in must export as 0 rather than vanish, or a graph shows a gap where it should show a floor
 // (§12).
+//
+// [StatePartial] is deliberately absent — it aggregates, so `mxl_repl_paths{state="PARTIAL"}` would
+// be a series that is structurally always zero, which reads as a condition being monitored rather
+// than as one that cannot occur. Use [RequestStates] for the request gauge.
 func States() []State {
 	return []State{
 		StateWaiting, StateInvalid, StateEstablishing,
 		StatePaused, StateActive, StateDegraded, StateFailed,
 	}
+}
+
+// RequestStates is the vocabulary a **request** can be in: [States] plus [StatePartial].
+func RequestStates() []State {
+	return append(States(), StatePartial)
 }
 
 // WorkerStates is the whole agent-facing vocabulary. Same reason as [States].

@@ -147,7 +147,7 @@ func printNode(node api.Node, domains *api.DomainList, paths []api.Path) {
 	switch {
 	case domains == nil:
 	case domains.Settling:
-		fmt.Fprintln(out, "    still settling: this node has not reported yet")
+		fmt.Fprintln(out, "    still settling")
 	case len(domains.Domains) == 0:
 		fmt.Fprintln(out, "    none observed")
 	}
@@ -249,7 +249,7 @@ func (c *DescribeCmd) domain(ctx context.Context, user *client.Client) error {
 		}
 	}
 	if found == nil {
-		return fmt.Errorf("node %q has no domain %q, observed or labelled", node, domain)
+		return fmt.Errorf("node %q has no domain %q", node, domain)
 	}
 
 	return c.render(found, func() { printDomain(node, *found, list.Settling) })
@@ -264,17 +264,17 @@ func printDomain(node string, domain api.DomainInfo, settling bool) {
 
 	switch {
 	case settling:
-		fmt.Fprintf(out, "  observed\tstill settling: this node has not reported yet\n")
+		fmt.Fprintf(out, "  observed\tstill settling\n")
 	case domain.Observed:
 		fmt.Fprintf(out, "  observed\tyes\n")
 	default:
 		// A label on a domain the node does not report is accepted and inert — a pending record,
 		// not an error, and it resolves by itself when a producer appears (§10.7).
-		fmt.Fprintf(out, "  observed\tno: labelled but not reported, a request selecting it waits\n")
+		fmt.Fprintf(out, "  observed\tno: labelled but not observed\n")
 	}
 
 	if name := domain.Name(); name != "" {
-		fmt.Fprintf(out, "  name\t%s (the `name` label, rendered as domain_name in metrics)\n", name)
+		fmt.Fprintf(out, "  name\t%s\n", name)
 	}
 
 	if len(domain.Labels) > 0 {
@@ -300,7 +300,7 @@ func printDomain(node string, domain api.DomainInfo, settling bool) {
 		// skipped flow diagnosable.
 		replicated := "no"
 		if flow.Replicated {
-			replicated = "yes: written by this node, so no label selector matches it"
+			replicated = "yes"
 		}
 		fmt.Fprintf(out, "    %s\t%s\t%s\t%s\n", flow.ID, producing, replicated, groupHintText(flow.GroupHint))
 	}
@@ -481,10 +481,10 @@ func printNamespace(info api.NamespaceInfo, requests []api.Request) {
 		fmt.Fprintln(out, "  no requests")
 		return
 	}
-	fmt.Fprintln(out, "  REQUEST\tSOURCE\tSTATE\tPATHS")
+	fmt.Fprintln(out, "  REQUEST\tSOURCES\tSTATE\tPATHS")
 	for _, request := range requests {
-		fmt.Fprintf(out, "  %s\t%s/%s\t%s\t%d\n",
-			request.Name, request.Source.Node, request.Source.Domain,
+		fmt.Fprintf(out, "  %s\t%s\t%s\t%d\n",
+			request.Name, sources(request.Sources),
 			request.Status.State, len(request.Status.Paths))
 	}
 }
@@ -504,7 +504,6 @@ func printRequest(request api.Request) {
 
 	fmt.Fprintf(out, "Request   %s\n", request.ID)
 	fmt.Fprintf(out, "  namespace\t%s\n", request.NamespaceOrDefault())
-	fmt.Fprintf(out, "  source\t%s/%s %s\n", request.Source.Node, request.Source.Domain, selectorText(request.Source.Select))
 	fmt.Fprintf(out, "  created\t%s (%s ago)\n", request.CreatedAt.Format(time.RFC3339), since(request.CreatedAt))
 	if !request.Provider.IsEmpty() {
 		fmt.Fprintf(out, "  provider\t%s (pinned)\n", providerText(request.Provider))
@@ -527,6 +526,22 @@ func printRequest(request api.Request) {
 		for _, key := range sortedKeys(request.Labels) {
 			fmt.Fprintf(out, "    %s\t%s\n", key, request.Labels[key])
 		}
+	}
+
+	// The per-source breakdown, which is the view fan-in needs: a request with twelve sources folds
+	// to one state, and that line cannot say which camera is dark (§9.1, §11).
+	//
+	// Joined against the status rather than printed from the spec alone, so a source that expanded
+	// to nothing still gets a row — that is exactly the source an operator is looking for.
+	heading(out, "  Sources")
+	fmt.Fprintln(out, "  NODE/DOMAIN\tSELECT\tSTATE\tPATHS\tREASON")
+	for i, src := range request.Sources {
+		var row api.SourceStatus
+		if i < len(request.Status.Sources) {
+			row = request.Status.Sources[i]
+		}
+		fmt.Fprintf(out, "  %s\t%s\t%s\t%d\t%s\n",
+			src.Describe(), selectorText(src.Select), row.State, len(row.Paths), row.Reason)
 	}
 
 	heading(out, "  Destinations")

@@ -153,7 +153,7 @@ func (b *fleetBuilder) build() *state.Fleet { return b.fleet }
 func flowRequest(name string) api.RequestSpec {
 	return api.RequestSpec{
 		Name:         name,
-		Source:       api.Source{Node: "studio-a", Domain: named("media/cameras"), Select: api.Selector{Flow: "flow-1"}},
+		Sources:      []api.Source{{Node: "studio-a", Domain: named("media/cameras"), Select: api.Selector{Flow: "flow-1"}}},
 		Destinations: []api.Destination{{Node: "edge-01", Domain: api.Domain{Area: "fast", Elements: []string{"ingest"}}}},
 	}
 }
@@ -173,6 +173,334 @@ func base() *fleetBuilder {
 		node("edge-01").
 		flow("studio-a", "media/cameras", api.FlowInventory{ID: "flow-1", Definition: flowDef, Producing: true}).
 		request("cam1", flowRequest("cam1"))
+}
+
+// --- fan-in: many sources, many destinations (§9.1) --------------------------------------
+
+// wallSource is one studio publishing `flow-<n>` into `media/cameras`.
+func wallSource(node string) api.Source {
+	return api.Source{Node: node, Domain: named("media/cameras"), Select: api.Selector{All: true}}
+}
+
+// wall is the arrangement fan-in exists for: three studios into one ingest domain. Each studio
+// publishes one flow with a distinct ID, because two studios publishing one ID is the corruption
+// case and has its own tests.
+func wall(t *testing.T, producing map[string]bool) *state.Fleet {
+	t.Helper()
+
+	spec := api.RequestSpec{
+		Name:         "wall",
+		Sources:      []api.Source{wallSource("studio-a"), wallSource("studio-b"), wallSource("studio-c")},
+		Destinations: []api.Destination{{Node: "edge-01", Domain: api.Domain{Area: "fast", Elements: []string{"ingest"}}}},
+	}
+
+	b := newFleet().node("edge-01").request("wall", spec)
+	for _, node := range []string{"studio-a", "studio-b", "studio-c"} {
+		b.node(node).flow(node, "media/cameras", api.FlowInventory{
+			ID: "flow-" + node, Definition: flowDef, Producing: true,
+		})
+
+		// A destination flow that is advancing is what makes a path ACTIVE — never the worker
+		// (§11) — so the sessions below only reach ACTIVE for the sources named here.
+		identity := state.PathIdentity{
+			Source:      api.FlowAddress{Node: node, Domain: "media/cameras", Flow: "flow-" + node},
+			Destination: api.Destination{Node: "edge-01", Domain: api.Domain{Area: "fast", Elements: []string{"ingest"}}},
+		}
+		sessionID := state.SessionID(identity, state.FlowDefHash(flowDef))
+
+		b.flow("edge-01", "fast/ingest", api.FlowInventory{
+			ID: "flow-" + node, Definition: flowDef, Producing: producing[node], Replicated: true,
+		})
+		b.session(state.SessionRecord{
+			ID: sessionID, Path: identity, FlowDefHash: state.FlowDefHash(flowDef),
+			Fabric: "dc1", Interface: tcpInterface,
+		})
+		b.sessionStatus("edge-01", api.SessionStatus{
+			SessionID: sessionID, Role: api.RoleTarget, State: api.WorkerReady,
+			Epoch: "epoch-" + node, TargetInfo: `{"id":"x"}`, Address: "10.0.0.1", Service: "24001",
+		})
+		b.sessionStatus(node, api.SessionStatus{
+			SessionID: sessionID, Role: api.RoleInitiator, State: api.WorkerReady, Epoch: "epoch-" + node,
+		})
+	}
+	return b.build()
+}
+
+// A request is the cross product of its two lists: three sources into one destination is three
+// paths, one materialised domain and one target worker each (§9.1).
+func TestARequestFansInFromEverySource(t *testing.T) {
+	t.Parallel()
+
+	result := Compute(wall(t, map[string]bool{"studio-a": true, "studio-b": true, "studio-c": true}), Config{})
+
+	require.Len(t, result.Paths, 3)
+	seen := map[string]bool{}
+	for _, path := range result.Paths {
+		seen[path.Source.Node] = true
+		assert.Equal(t, "edge-01/fast/ingest", path.Destination.Endpoint(),
+			"every path lands in the one destination domain")
+	}
+	assert.Equal(t, map[string]bool{"studio-a": true, "studio-b": true, "studio-c": true}, seen)
+
+	// Three targets on the destination node — 3× ingress there, which is the grouping fan-in makes
+	// legible and the binding direction for an ingest wall (§9.1).
+	assert.Len(t, result.Assignments["edge-01"].Assignments, 3)
+	for _, node := range []string{"studio-a", "studio-b", "studio-c"} {
+		assert.Len(t, result.Assignments[node].Assignments, 1, "one initiator on %s", node)
+	}
+
+	status := result.Requests[rid("wall")]
+	assert.Equal(t, api.StateActive, status.State)
+	require.Len(t, status.Sources, 3, "a row per source, in the order the request lists them")
+	for i, node := range []string{"studio-a", "studio-b", "studio-c"} {
+		assert.Equal(t, node, status.Sources[i].Source.Node)
+		assert.Equal(t, api.StateActive, status.Sources[i].State)
+		assert.Len(t, status.Sources[i].Paths, 1)
+	}
+}
+
+// **The point of validating per pairing.** One unusable pairing makes the request INVALID without
+// stopping its siblings — the fan-in mirror of the fan-out case above.
+func TestOneInvalidPairingDoesNotStopTheOtherSources(t *testing.T) {
+	t.Parallel()
+
+	spec := api.RequestSpec{
+		Name:         "wall",
+		Sources:      []api.Source{wallSource("studio-a"), wallSource("typo")},
+		Destinations: []api.Destination{{Node: "edge-01", Domain: api.Domain{Area: "fast", Elements: []string{"ingest"}}}},
+	}
+	fleet := newFleet().
+		node("studio-a").node("edge-01").
+		flow("studio-a", "media/cameras", api.FlowInventory{ID: "flow-1", Definition: flowDef, Producing: true}).
+		request("wall", spec).build()
+
+	result := Compute(fleet, Config{})
+	status := result.Requests[rid("wall")]
+
+	assert.Equal(t, api.StateInvalid, status.State)
+	assert.Equal(t, api.ReasonNodeNotRegistered, status.ReasonCode)
+
+	// The good source still has a real path with a real assignment.
+	require.Len(t, result.Paths, 1)
+	assert.Len(t, result.Assignments["edge-01"].Assignments, 1)
+	require.Len(t, status.Sources, 2)
+	assert.Equal(t, api.StateEstablishing, status.Sources[0].State)
+	assert.Equal(t, api.StateInvalid, status.Sources[1].State)
+	assert.Empty(t, status.Sources[1].Paths, "a source that expanded to nothing still gets a row")
+}
+
+// Three-way attribution. Naming the wrong end sends an operator to a node where everything is
+// fine, so each case is asserted separately: a message that is merely non-empty passes all three
+// (§9.1, §11).
+func TestTheReasonNamesTheEndThatFailed(t *testing.T) {
+	t.Parallel()
+
+	fast := api.Domain{Area: "fast", Elements: []string{"ingest"}}
+	bulk := api.Domain{Area: "bulk", Elements: []string{"ingest"}}
+
+	base := func() *fleetBuilder {
+		return newFleet().node("studio-a").node("studio-b").node("edge-01").node("edge-02").
+			flow("studio-a", "media/cameras", api.FlowInventory{ID: "flow-a", Definition: flowDef, Producing: true}).
+			flow("studio-b", "media/cameras", api.FlowInventory{ID: "flow-b", Definition: flowDef, Producing: true})
+	}
+	spec := func(sources []api.Source, destinations []api.Destination) api.RequestSpec {
+		return api.RequestSpec{Name: "wall", Sources: sources, Destinations: destinations}
+	}
+
+	// One source failed against every destination: blame the source. `studio-z` has never
+	// registered, and both destinations are perfectly healthy.
+	t.Run("common to one source", func(t *testing.T) {
+		t.Parallel()
+
+		status := Compute(base().request("wall", spec(
+			[]api.Source{wallSource("studio-a"), wallSource("studio-z")},
+			[]api.Destination{{Node: "edge-01", Domain: fast}, {Node: "edge-02", Domain: fast}},
+		)).build(), Config{}).Requests[rid("wall")]
+
+		assert.Equal(t, api.ReasonNodeNotRegistered, status.ReasonCode)
+		assert.Contains(t, status.Reason, "studio-z")
+		assert.NotContains(t, status.Reason, "destination edge-01", "the destinations are fine")
+		assert.NotContains(t, status.Reason, "destination edge-02")
+	})
+
+	// One destination failed against every source: blame the destination. `edge-02` advertises no
+	// `bulk` area, and both sources are fine.
+	t.Run("common to one destination", func(t *testing.T) {
+		t.Parallel()
+
+		status := Compute(base().request("wall", spec(
+			[]api.Source{wallSource("studio-a"), wallSource("studio-b")},
+			[]api.Destination{{Node: "edge-01", Domain: fast}, {Node: "edge-02", Domain: bulk}},
+		)).build(), Config{}).Requests[rid("wall")]
+
+		assert.Equal(t, api.ReasonUnknownArea, status.ReasonCode)
+		assert.Contains(t, status.Reason, "destination edge-02/bulk/ingest")
+		assert.NotContains(t, status.Reason, "studio-a")
+		assert.NotContains(t, status.Reason, "studio-b")
+	})
+
+	// Every pairing failed identically: blame neither end. `sched_prio` is a property of the host
+	// and no fixture node has the capability, so all four pairings fail the same way — and
+	// "(and 3 more)" would suggest three further problems rather than one counted four times.
+	t.Run("common to every pairing", func(t *testing.T) {
+		t.Parallel()
+
+		prio := 10
+		request := spec(
+			[]api.Source{wallSource("studio-a"), wallSource("studio-b")},
+			[]api.Destination{{Node: "edge-01", Domain: fast}, {Node: "edge-02", Domain: fast}},
+		)
+		request.SchedPrio = &prio
+
+		status := Compute(base().request("wall", request).build(), Config{}).Requests[rid("wall")]
+
+		assert.Equal(t, api.ReasonSchedPrioUnavailable, status.ReasonCode)
+		assert.NotContains(t, status.Reason, "and 3 more")
+		assert.NotContains(t, status.Reason, "destination edge-")
+	})
+}
+
+// --- PARTIAL: the aggregate-only state (§11) ---------------------------------------------
+
+// One dark camera among three is the ordinary state of an ingest wall, and the old fold called
+// that request PAUSED — a true statement about one path and a false one about the request.
+func TestOneDarkSourceMakesTheRequestPartial(t *testing.T) {
+	t.Parallel()
+
+	result := Compute(wall(t, map[string]bool{"studio-a": true, "studio-b": true}), Config{})
+	status := result.Requests[rid("wall")]
+
+	assert.Equal(t, api.StatePartial, status.State)
+	assert.Equal(t, 2, status.Counts[api.StateActive])
+	assert.Equal(t, 1, status.Counts[api.StatePaused])
+	assert.Contains(t, status.Reason, "2 of 3")
+
+	// The per-source breakdown is what says *which* studio is dark. The aggregate cannot.
+	require.Len(t, status.Sources, 3)
+	assert.Equal(t, api.StateActive, status.Sources[0].State)
+	assert.Equal(t, api.StateActive, status.Sources[1].State)
+	assert.Equal(t, api.StatePaused, status.Sources[2].State)
+	assert.Equal(t, "studio-c", status.Sources[2].Source.Node)
+}
+
+// The surprising half, and the property a worst-wins fold passes every other test without having:
+// PARTIAL outranks INVALID. §7.2 already settled that one bad path among twenty does not condemn
+// the other nineteen, and promoting it to the top line would undo that where it is read first.
+func TestPartialOutranksAnInvalidLeg(t *testing.T) {
+	t.Parallel()
+
+	fleet := wall(t, map[string]bool{"studio-a": true, "studio-b": true, "studio-c": true})
+
+	// A fourth source that can never work, alongside three that are carrying media.
+	record := fleet.Requests[rid("wall")]
+	record.Value.Spec.Sources = append(record.Value.Spec.Sources, wallSource("studio-z"))
+	fleet.Requests[rid("wall")] = record
+
+	status := Compute(fleet, Config{}).Requests[rid("wall")]
+
+	assert.Equal(t, api.StatePartial, status.State)
+	assert.Equal(t, api.ReasonNodeNotRegistered, status.ReasonCode, "the code still says what is wrong")
+	assert.Contains(t, status.Reason, "studio-z")
+	assert.Equal(t, 3, status.Counts[api.StateActive])
+
+	// Still refused at POST: the aggregate softening is a *display* decision and must not change
+	// what admission does (§7.2).
+	assert.Contains(t, Compute(fleet, Config{}).Structural, rid("wall"))
+}
+
+// PARTIAL claims something is working, so it must not be said when nothing is.
+func TestARequestWithNoActivePathIsNeverPartial(t *testing.T) {
+	t.Parallel()
+
+	status := Compute(wall(t, nil), Config{}).Requests[rid("wall")]
+
+	assert.Equal(t, api.StatePaused, status.State)
+	assert.Equal(t, 3, status.Counts[api.StatePaused])
+}
+
+// PARTIAL is the one aggregate-only value in the vocabulary: it describes disagreement among many
+// things, and a path, a session and a worker are one thing each (§11).
+func TestPartialNeverAppearsBelowTheRequest(t *testing.T) {
+	t.Parallel()
+
+	result := Compute(wall(t, map[string]bool{"studio-a": true}), Config{})
+	require.Equal(t, api.StatePartial, result.Requests[rid("wall")].State)
+
+	for _, path := range result.Paths {
+		assert.NotEqual(t, api.StatePartial, path.State)
+		if path.Session != nil {
+			for _, endpoint := range []*api.SessionEndpoint{path.Session.Target, path.Session.Initiator} {
+				if endpoint != nil {
+					assert.NotEqual(t, api.WorkerState(api.StatePartial), endpoint.State)
+				}
+			}
+		}
+	}
+	assert.NotContains(t, api.States(), api.StatePartial, "not a state one thing can be in")
+	assert.Contains(t, api.RequestStates(), api.StatePartial)
+}
+
+// --- the `all` selector (§9.1) -----------------------------------------------------------
+
+// A source that names a domain and says nothing else replicates every flow in it, and gains a path
+// when a producer adds one.
+func TestAllSelectsEveryFlowInTheDomain(t *testing.T) {
+	t.Parallel()
+
+	spec := api.RequestSpec{
+		Name:         "whole",
+		Sources:      []api.Source{{Node: "studio-a", Domain: named("media/cameras"), Select: api.Selector{All: true}}},
+		Destinations: []api.Destination{{Node: "edge-01", Domain: api.Domain{Area: "fast", Elements: []string{"ingest"}}}},
+	}
+
+	build := func(flows ...string) *state.Fleet {
+		b := newFleet().node("studio-a").node("edge-01").request("whole", spec)
+		for _, id := range flows {
+			b.flow("studio-a", "media/cameras", api.FlowInventory{ID: id, Definition: flowDef, Producing: true})
+		}
+		return b.build()
+	}
+
+	assert.Len(t, Compute(build("flow-1", "flow-2"), Config{}).Paths, 2)
+	assert.Len(t, Compute(build("flow-1", "flow-2", "flow-3"), Config{}).Paths, 3,
+		"a new producer joins the expansion, like a group hint and unlike a pinned flow")
+
+	// Matching nothing is a request with zero paths, which composes with WAITING at no extra cost.
+	empty := Compute(build(), Config{}).Requests[rid("whole")]
+	assert.Equal(t, api.StateWaiting, empty.State)
+	assert.Equal(t, api.ReasonFlowNotFound, empty.ReasonCode)
+}
+
+// `all` against a *label-matched* domain is filtered by provenance like any other matched
+// selector: it must not pick up what this project is itself writing, or a receiver that forwards
+// what it receives is an amplifier (§10.7).
+func TestAllAgainstALabelSelectorStillExcludesOwnOutput(t *testing.T) {
+	t.Parallel()
+
+	spec := api.RequestSpec{
+		Name: "onward",
+		Sources: []api.Source{{
+			Node:   "edge-01",
+			Domain: api.SelectLabels(map[string]string{"role": "onward"}),
+			Select: api.Selector{All: true},
+		}},
+		Destinations: []api.Destination{{Node: "edge-02", Domain: api.Domain{Area: "fast", Elements: []string{"ingest"}}}},
+	}
+
+	result := Compute(newFleet().
+		node("edge-01").node("edge-02").
+		label("edge-01", "fast/ingest", map[string]string{"role": "onward"}).
+		flow("edge-01", "fast/ingest", api.FlowInventory{ID: "replicated", Definition: flowDef, Producing: true, Replicated: true}).
+		flow("edge-01", "fast/ingest", api.FlowInventory{ID: "local", Definition: flowDef, Producing: true}).
+		request("onward", spec).build(), Config{})
+
+	require.Len(t, result.Paths, 1, "the locally produced flow still matches")
+	assert.Equal(t, "local", onlyPath(t, result).Source.Flow)
+
+	excluded := result.Requests[rid("onward")].Excluded
+	require.Len(t, excluded, 1)
+	assert.Equal(t, "replicated", excluded[0].Flow)
+	assert.Equal(t, api.ExclusionSelfOutput, excluded[0].Reason)
 }
 
 // --- fan-out: one source, many destinations (§9.1, 8a) -----------------------------------
@@ -257,7 +585,7 @@ func TestARequestWideFailureDoesNotBlameADestination(t *testing.T) {
 	t.Parallel()
 
 	spec := flowRequest("cam1")
-	spec.Source.Node = "typo" // never registered: nothing about any destination is wrong
+	spec.Sources[0].Node = "typo" // never registered: nothing about any destination is wrong
 	spec.Destinations = []api.Destination{
 		{Node: "edge-01", Domain: api.Domain{Area: "fast", Elements: []string{"ingest"}}},
 		{Node: "edge-02", Domain: api.Domain{Area: "fast", Elements: []string{"ingest"}}},
@@ -280,7 +608,7 @@ func TestAnUnusableDestinationIsInvalidEvenWithNothingToExpandOnto(t *testing.T)
 	t.Parallel()
 
 	spec := flowRequest("cam1")
-	spec.Source.Select = api.Selector{Flow: "flow-does-not-exist-yet"}
+	spec.Sources[0].Select = api.Selector{Flow: "flow-does-not-exist-yet"}
 	spec.Destinations = []api.Destination{{Node: "edge-01", Domain: api.Domain{Area: "bulk", Elements: []string{"ingest"}}}}
 
 	result := Compute(base().request("cam1", spec).build(), Config{})
@@ -695,7 +1023,7 @@ func TestAGroupHintRequestDoesNotCollapseWhenItsSourceAgentIsGone(t *testing.T) 
 	t.Parallel()
 
 	spec := flowRequest("cam1")
-	spec.Source.Select = api.Selector{GroupHint: &api.GroupHintSelector{Name: "Studio A:Camera 1"}}
+	spec.Sources[0].Select = api.Selector{GroupHint: &api.GroupHintSelector{Name: "Studio A:Camera 1"}}
 
 	fleet := base().build()
 	sessionID := sessionIDFor(fleet)
@@ -749,7 +1077,7 @@ func TestGroupHintExpansion(t *testing.T) {
 	t.Parallel()
 
 	spec := flowRequest("camera-1")
-	spec.Source.Select = api.Selector{GroupHint: &api.GroupHintSelector{Name: "Studio A:Camera 1"}}
+	spec.Sources[0].Select = api.Selector{GroupHint: &api.GroupHintSelector{Name: "Studio A:Camera 1"}}
 
 	fleet := newFleet().
 		node("studio-a").
@@ -779,7 +1107,7 @@ func TestGroupHintExpansion(t *testing.T) {
 	assert.Len(t, result.Assignments["edge-01"].Assignments, 2)
 	assert.Len(t, result.Requests[rid("camera-1")].Paths, 2)
 
-	spec.Source.Select.GroupHint.Type = "video"
+	spec.Sources[0].Select.GroupHint.Type = "video"
 	narrowed := Compute(newFleetFrom(fleet, "camera-1", spec), Config{})
 	assert.Len(t, narrowed.Paths, 1)
 }
@@ -975,7 +1303,7 @@ func TestTwoSourcesIntoOneDestinationFlowIsRejected(t *testing.T) {
 	t.Parallel()
 
 	second := flowRequest("from-b")
-	second.Source.Node = "studio-b"
+	second.Sources[0].Node = "studio-b"
 
 	fleet := base().
 		node("studio-b").
@@ -997,6 +1325,53 @@ func TestTwoSourcesIntoOneDestinationFlowIsRejected(t *testing.T) {
 	assert.Len(t, result.Sessions, 1)
 }
 
+// The undecidable half of the corruption case (§7.2, §7.5). Two sources of *one* request select
+// rather than pin, and the fleet then publishes one flow UUID from both — which cannot be caught at
+// POST, because the second producer may appear months later.
+//
+// It is `flow_conflict` on the path, resolved by §7.5 and torn down there, not
+// `duplicate_source_flow`: a code has one disposition, and this one tears the loser down.
+func TestOneFlowIDFromTwoSelectedSourcesIsAFlowConflict(t *testing.T) {
+	t.Parallel()
+
+	spec := api.RequestSpec{
+		Name:         "wall",
+		Sources:      []api.Source{wallSource("studio-a"), wallSource("studio-b")},
+		Destinations: []api.Destination{{Node: "edge-01", Domain: api.Domain{Area: "fast", Elements: []string{"ingest"}}}},
+	}
+
+	// Both studios publish `flow-1`, which neither source named.
+	fleet := newFleet().
+		node("studio-a").node("studio-b").node("edge-01").
+		flow("studio-a", "media/cameras", api.FlowInventory{ID: "flow-1", Definition: flowDef, Producing: true}).
+		flow("studio-b", "media/cameras", api.FlowInventory{ID: "flow-1", Definition: flowDef, Producing: true}).
+		request("wall", spec).build()
+
+	result := Compute(fleet, Config{})
+
+	// One winner, one loser, one session: two initiators into one ring buffer is the corruption
+	// this exists to stop, and nothing downstream would detect it.
+	assert.Len(t, result.Sessions, 1)
+
+	var loser api.Path
+	for _, path := range result.Paths {
+		if path.ReasonCode == api.ReasonFlowConflict {
+			loser = path
+		}
+	}
+	require.NotEmpty(t, loser.ID, "one of the two paths must lose")
+	assert.Equal(t, api.StateInvalid, loser.State)
+
+	// Both sources named, because the tie between two paths of one request falls through to the
+	// path ID and is arbitrary from the operator's point of view (§7.5).
+	assert.Contains(t, loser.Reason, "studio-a/media/cameras")
+	assert.Contains(t, loser.Reason, "studio-b/media/cameras")
+
+	// Not refused at POST: this is not the decidable form, and refusing it would refuse a request
+	// that worked perfectly well until a producer somewhere else republished (§7.2).
+	assert.NotContains(t, result.Structural, rid("wall"))
+}
+
 // --- aggregation and determinism ---------------------------------------------------------
 
 // "1 of 3 active" is the answer an operator needs from a group-hint request, and it has no
@@ -1005,7 +1380,7 @@ func TestRequestStatusAggregatesOverItsPaths(t *testing.T) {
 	t.Parallel()
 
 	spec := flowRequest("camera-1")
-	spec.Source.Select = api.Selector{GroupHint: &api.GroupHintSelector{Name: "Studio A:Camera 1"}}
+	spec.Sources[0].Select = api.Selector{GroupHint: &api.GroupHintSelector{Name: "Studio A:Camera 1"}}
 
 	fleet := newFleet().
 		node("studio-a").
@@ -1035,7 +1410,7 @@ func TestASelectorMatchingNothingWaits(t *testing.T) {
 	t.Parallel()
 
 	spec := flowRequest("camera-9")
-	spec.Source.Select = api.Selector{GroupHint: &api.GroupHintSelector{Name: "nothing"}}
+	spec.Sources[0].Select = api.Selector{GroupHint: &api.GroupHintSelector{Name: "nothing"}}
 
 	result := Compute(base().request("camera-9", spec).build(), Config{})
 	assert.Equal(t, api.StateWaiting, result.Requests[rid("camera-9")].State)
@@ -1055,7 +1430,7 @@ func TestComputeIsDeterministic(t *testing.T) {
 	t.Parallel()
 
 	spec := flowRequest("camera-1")
-	spec.Source.Select = api.Selector{GroupHint: &api.GroupHintSelector{Name: "Studio A:Camera 1"}}
+	spec.Sources[0].Select = api.Selector{GroupHint: &api.GroupHintSelector{Name: "Studio A:Camera 1"}}
 
 	fleet := newFleet().
 		node("studio-a").
@@ -1335,7 +1710,7 @@ func TestAnOverlapCanArriveWhenAProducerRetagsAFlow(t *testing.T) {
 	t.Parallel()
 
 	hint := flowRequest("camera-1")
-	hint.Source.Select = api.Selector{GroupHint: &api.GroupHintSelector{Name: "Studio A:Camera 1"}}
+	hint.Sources[0].Select = api.Selector{GroupHint: &api.GroupHintSelector{Name: "Studio A:Camera 1"}}
 
 	build := func(tag *api.GroupHint) *state.Fleet {
 		b := newFleet().
@@ -1392,8 +1767,8 @@ func (b *fleetBuilder) label(node, domain string, labels map[string]string) *fle
 // selects returns a request whose source selects domains by label.
 func labelRequest(name string, labels map[string]string) api.RequestSpec {
 	spec := flowRequest(name)
-	spec.Source.Domain = api.SelectLabels(labels)
-	spec.Source.Select = api.Selector{GroupHint: &api.GroupHintSelector{Name: "Studio A:Camera 1"}}
+	spec.Sources[0].Domain = api.SelectLabels(labels)
+	spec.Sources[0].Select = api.Selector{GroupHint: &api.GroupHintSelector{Name: "Studio A:Camera 1"}}
 	return spec
 }
 
@@ -1461,8 +1836,8 @@ func TestNamingADomainDirectlyReachesItsReplicatedFlows(t *testing.T) {
 	t.Parallel()
 
 	spec := flowRequest("chain")
-	spec.Source.Domain = named("fast/ingest")
-	spec.Source.Select = api.Selector{Flow: "flow-replicated"}
+	spec.Sources[0].Domain = named("fast/ingest")
+	spec.Sources[0].Select = api.Selector{Flow: "flow-replicated"}
 
 	fleet := newFleet().
 		node("studio-a").
@@ -1542,7 +1917,7 @@ func TestASelectorMatchingItsOwnDestinationIsElided(t *testing.T) {
 	// Both domains are on the destination node, and both carry the label. One of them *is* the
 	// destination.
 	spec := labelRequest("wide", map[string]string{"role": "cameras"})
-	spec.Source.Node = "edge-01"
+	spec.Sources[0].Node = "edge-01"
 	spec.Destinations = []api.Destination{{Node: "edge-01", Domain: api.Domain{Area: "fast", Elements: []string{"ingest"}}}}
 
 	fleet := newFleet().
@@ -1565,9 +1940,9 @@ func TestASelectorMatchingItsOwnDestinationIsElided(t *testing.T) {
 
 	// The named form of the same pairing is refused, which is the other half of the cut.
 	named := flowRequest("typo")
-	named.Source.Node = "edge-01"
-	named.Source.Domain = api.SelectDomain(api.Domain{Area: "fast", Elements: []string{"ingest"}})
-	named.Source.Select = api.Selector{Flow: "flow-a"}
+	named.Sources[0].Node = "edge-01"
+	named.Sources[0].Domain = api.SelectDomain(api.Domain{Area: "fast", Elements: []string{"ingest"}})
+	named.Sources[0].Select = api.Selector{Flow: "flow-a"}
 	named.Destinations = spec.Destinations
 
 	refused := Compute(newFleet().node("edge-01").node("edge-02").request("typo", named).build(), Config{})

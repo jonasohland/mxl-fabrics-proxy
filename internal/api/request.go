@@ -87,6 +87,9 @@ func (p ProviderPin) MarshalJSON() ([]byte, error) {
 }
 
 // Source names where to replicate from (§9.1).
+//
+// A request carries a *list* of these, symmetrically with [Destination] — see
+// [RequestSpec.Sources].
 type Source struct {
 	// Node is pinned, not selected. Keeping the expansion one node wide is what stops §10.8's
 	// cross-product hazards arriving with domain selectors, and node labels do not exist.
@@ -105,16 +108,45 @@ type Source struct {
 	Select Selector `json:"select"`
 }
 
+// Endpoint is the (node, domain) pair a **named** source resolves to, which is what makes a source
+// and a destination the same place.
+//
+// Only meaningful when the domain selector is a name. A label selector has no endpoint until the
+// expansion resolves it, which is why the pairing it produces is elided in the reconciler rather
+// than refused here (§7.2, §10.7).
+func (s Source) Endpoint() string {
+	if s.Domain.Kind() != DomainSelectorKindName {
+		return ""
+	}
+	return s.Node + DomainSeparator + s.Domain.Name.String()
+}
+
+// Describe renders a source as `<node>/<domain>` for a message or a status row. A label selector
+// renders its labels, because "studio-a/{role=cameras}" is what the operator wrote and a resolved
+// domain list would be a different question's answer.
+func (s Source) Describe() string { return s.Node + DomainSeparator + s.Domain.String() }
+
 // Destination names where to replicate to.
 //
 // There is no selector here: a destination is a (node, domain) pair, and the flow keeps its
 // ID across the replication — the same flow ID existing on both nodes is the point (§3).
 //
-// A request carries a *list* of these (§9.1). That asymmetry with [Source] is deliberate: the
-// source side already has a selector and the destination side cannot have one, every path in a
-// fan-out shares a source and therefore a fate, and grouping several sources into one
-// destination is the arrangement that produces the two-producers-one-ring-buffer conflict §7.2
-// exists to reject.
+// A request carries a *list* of these, and a list of [Source] beside it: it fans in as well as out
+// (§9.1).
+//
+// *There used to be an asymmetry here, argued for at length: the source side already had a selector
+// and this side could not have one, every path in a fan-out shared a source and therefore a fate,
+// and grouping several sources into one destination was said to be the arrangement that produces
+// the two-producers-one-ring-buffer conflict §7.2 exists to reject.* Two of those did not survive.
+// A source's node is still *pinned*, so a list of sources is a list of things the author typed
+// rather than a second selector, and the cross-product hazard §10.8 warns about is not entered. And
+// the fan-out grouping inverts: twelve sources into one domain is 12× ingress on the destination
+// node, which is the binding direction for the ingest wall that motivates fan-in at all.
+//
+// The two that survived became requirements and are discharged rather than argued away: shared fate
+// is genuinely gone, so the aggregate grew [StatePartial] and a per-source breakdown; and the
+// corruption case is real, so its decidable form is refused at POST as
+// [ReasonDuplicateSourceFlow] and its undecidable form stays [ReasonFlowConflict] on the path.
 type Destination struct {
 	Node string `json:"node"`
 
@@ -194,8 +226,8 @@ type RequestID struct {
 // and the server's request-name rule does the same (§9.1).
 func (id RequestID) String() string { return id.Namespace + "/" + id.Name }
 
-// RequestSpec is durable user intent: "replicate what this selector matches, from here to
-// there" (§3, §9.1).
+// RequestSpec is durable user intent: "replicate what these selectors match, from these places to
+// those places" (§3, §9.1).
 //
 // A request is never cancelled because its session is failing. Failure is made *observable*
 // (§11) — a peer being unreachable is no reason to drop the intent, any more than it is a
@@ -223,14 +255,27 @@ type RequestSpec struct {
 	// mapping. Anything hand-rolling a POST has the same problem on retry.
 	Name string `json:"name"`
 
-	Source Source `json:"source"`
-
-	// Destinations is where the source goes. One source, many destinations — see [Destination]
-	// for why the list is on this side and not the other.
+	// Sources is where to replicate from. **Always a list, with no singular `source:` beside it**
+	// (§9.1).
 	//
-	// At least one is required. A request with three destinations and a selector matching two
-	// flows owns six paths, each with its own state, and the request's status aggregates over
-	// them (§11).
+	// The scalar-or-list spelling [ProviderPin] uses was the alternative and is refused. It earns
+	// its keep there because the scalar is the *rare* case and the list is the interesting one; here
+	// it is the other way round, so nearly every request would be written in the singular and the
+	// list would be the shape nobody has seen. Two spellings of the common case is two shapes to
+	// read, two to test and two for a UI to render, bought to save four characters.
+	//
+	// The cost is that this invalidates every stored request and every manifest written against the
+	// previous field name. That is a real migration and it rides the major version (§16).
+	//
+	// At least one is required. A request with two sources and three destinations owns six
+	// *pairings*, and each pairing's selector expands to its own set of paths — so the path count is
+	// the sum over pairings, not the product of two path counts.
+	Sources []Source `json:"sources"`
+
+	// Destinations is where the sources go. At least one is required.
+	//
+	// A request with three destinations and a selector matching two flows owns six paths, each with
+	// its own state, and the request's status aggregates over them (§11).
 	Destinations []Destination `json:"destinations"`
 
 	Provider ProviderPin `json:"provider,omitempty"`
@@ -345,15 +390,46 @@ func (s RequestSpec) Validate() error {
 		}
 	}
 
-	if s.Source.Node == "" {
-		return fmt.Errorf("source.node is required")
+	if len(s.Sources) == 0 {
+		return fmt.Errorf("at least one source is required")
 	}
-	if err := s.Source.Domain.Validate(); err != nil {
-		return err
+
+	// Two *identical* sources are one source written twice: they expand to the same addresses, and
+	// every path they produce is the same path. Same argument as the destination rule below —
+	// deduplicating silently would hide a copy-paste error in a manifest.
+	//
+	// The whole source is the key, not its endpoint, because two sources sharing a `(node, domain)`
+	// with different selectors is an ordinary thing to write: `{group_hint: cam1}` and
+	// `{group_hint: cam2}` out of one domain is a request with two legs, not a duplicate.
+	//
+	// Overlap short of equality is deliberately not chased. Two group hints or two label selectors
+	// can match the same flow without being equal, which is not decidable from the request body and
+	// is not an error anyway — the expansion collapses them by path identity, which is where overlap
+	// has always been resolved (§9.1).
+	sourceSeen := make(map[string]int, len(s.Sources))
+	for i, src := range s.Sources {
+		where := fmt.Sprintf("sources[%d]", i)
+
+		if src.Node == "" {
+			return fmt.Errorf("%s.node is required", where)
+		}
+		if err := src.Domain.Validate(); err != nil {
+			return fmt.Errorf("%s.domain: %w", where, err)
+		}
+		if err := src.Select.Validate(); err != nil {
+			return fmt.Errorf("%s.select: %w", where, err)
+		}
+
+		key, err := json.Marshal(src)
+		if err != nil {
+			return fmt.Errorf("%s: %w", where, err)
+		}
+		if first, dup := sourceSeen[string(key)]; dup {
+			return fmt.Errorf("%s and sources[%d] are the same source, %s", where, first, src.Describe())
+		}
+		sourceSeen[string(key)] = i
 	}
-	if err := s.Source.Select.Validate(); err != nil {
-		return fmt.Errorf("source.select: %w", err)
-	}
+
 	if len(s.Destinations) == 0 {
 		return fmt.Errorf("at least one destination is required")
 	}
@@ -415,11 +491,14 @@ type Request struct {
 // RequestStatus aggregates over the request's paths (§9.1, §11).
 //
 // A request owns a *set* of paths, including in the pinned-flow case where the set has size
-// one. That is why the API returns both the summary and the breakdown: "1 of 3 active" is the
-// answer an operator needs from a group-hint request, and it has no meaning in a
-// one-flow-per-request model.
+// one. That is why the API returns the summary, the per-path breakdown and — since both ends are
+// lists — a per-source breakdown beside it. "1 of 3 active" is the answer an operator needs from a
+// group-hint request and has no meaning in a one-flow-per-request model; "studio-c is dark, the
+// other two studios are fine" is the answer they need from a fan-in and has no meaning in a
+// one-source model.
 type RequestStatus struct {
-	// State is the aggregate. ACTIVE only when every path is.
+	// State is the aggregate. ACTIVE only when every path is, and [StatePartial] when they
+	// disagree with at least one of them ACTIVE.
 	State State `json:"state"`
 
 	// Reason and ReasonCode explain a non-ACTIVE aggregate. For an INVALID request they are
@@ -431,7 +510,19 @@ type RequestStatus struct {
 	// without the client having to fold Paths itself.
 	Counts map[State]int `json:"counts,omitempty"`
 
-	// Paths is the expansion of the selector against the current inventory, recomputed on
+	// Sources is the same fold done per source, in the order the request lists them (§9.1, §11).
+	//
+	// It is what makes a failure attributable to the right *end*. A request with twelve sources and
+	// one destination folds to one line, and that line cannot say which camera is dark — but the
+	// per-source row can, and the node an operator has to go and look at is the source's, not the
+	// destination's.
+	//
+	// Always present and always the full list, including sources contributing no paths at all: a
+	// source that expanded to nothing is exactly the one an operator is looking for, and omitting it
+	// would hide it behind eleven that worked.
+	Sources []SourceStatus `json:"sources,omitempty"`
+
+	// Paths is the expansion of the selectors against the current inventory, recomputed on
 	// every reconcile. A selector matching nothing is simply a request with zero paths, which
 	// composes with WAITING at no extra cost (§9.1).
 	Paths []PathStatus `json:"paths"`
@@ -455,6 +546,31 @@ type RequestStatus struct {
 	// ExcludedDropped is how many entries the cap discarded. A silent cap here reads as "nothing
 	// else was excluded", which is the one thing this list must not say when it is untrue (§9.1).
 	ExcludedDropped int `json:"excluded_dropped,omitempty"`
+}
+
+// SourceStatus is one source of a request, folded over the paths that source produced (§9.1, §11).
+//
+// The same fold as the request's own, which is deliberate — an operator reading a source row is
+// asking the same question one level down, and two different folds would answer it two different
+// ways. [StatePartial] therefore appears here too: a source whose flows disagree is partial in
+// exactly the sense the request is.
+type SourceStatus struct {
+	// Source is the entry as the request wrote it, not as it resolved. A label selector renders its
+	// labels — the operator is looking for the line they typed, and a resolved domain list is a
+	// different question's answer.
+	Source Source `json:"source"`
+
+	State      State      `json:"state"`
+	Reason     string     `json:"reason,omitempty"`
+	ReasonCode ReasonCode `json:"reason_code,omitempty"`
+
+	// Counts is this source's per-state breakdown, and Paths the IDs it expanded onto.
+	//
+	// IDs rather than a second copy of [PathStatus]: a request with twelve sources into three
+	// destinations would otherwise carry every path's full status twice, and the paths are already
+	// in [RequestStatus.Paths] to be joined against.
+	Counts map[State]int `json:"counts,omitempty"`
+	Paths  []string      `json:"paths,omitempty"`
 }
 
 // MaxExclusions bounds [RequestStatus.Excluded].
