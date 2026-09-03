@@ -1,0 +1,22 @@
+<!-- SPDX-FileCopyrightText: 2025 Contributors to the Media eXchange Layer project. -->
+<!-- SPDX-License-Identifier: CC-BY-4.0 -->
+
+# Configuration
+
+## Domain level configuration
+
+Domain level configuration is stored in an optional 'options.json' files stored at the root of the MXL domain.  If present, the MXL SDK will look for specific options defined in the table below and configure itself accordingly.
+
+| Option        | Description                | Default Value |
+|----------------|---------------------------|---------------|
+| `urn:x-mxl:option:history_duration/v1.0"`         | Depth, in nanoseconds, of a ringbuffer         | 200'000'000ns   |
+
+### Example 'options.json' file
+
+This options file will configure the depth of the ringbuffers to 500'000'000ns (500ms)
+
+```json
+{
+    "urn:x-mxl:option:history_duration/v1.0": 500000000
+}
+```
