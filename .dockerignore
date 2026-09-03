@@ -1,13 +1,20 @@
 # The Dockerfile copies exactly what it builds — CMakeLists.txt, src, go.mod, go.sum, cmd,
-# internal — so everything else is context the daemon transfers and never reads.
+# internal, and the UI sources — so everything else is context the daemon transfers and never
+# reads.
 #
-# `build/` and `ui/node_modules/` are the two that matter: together they are an order of magnitude
+# `build/` and the node_modules trees are the ones that matter: each is an order of magnitude
 # larger than the source, and `build/` also carries a host-toolchain CMake cache that would be
 # actively wrong inside the image if anything ever copied it.
 .git
 .cache
 build
-ui
+node_modules
+ui/node_modules
+ui/app/node_modules
+ui/prototype
+# The image builds the app itself, in its own stage. Excluding a local build here is what keeps a
+# stale `npm run build` on somebody's laptop from being what ships.
+ui/app/dist
 docs
 legacy
 testing

@@ -170,7 +170,10 @@ describe('the matrix over an exclusive namespace', () => {
     const lit = wrapper.findAll('.cell').filter((cell) => cell.classes().includes('lit'))
     expect(lit.length).toBe(7)
     expect(lit.every((cell) => cell.findAll('.line').length === 2)).toBe(true)
-    expect(lit.some((cell) => (cell.attributes('title') ?? '').includes('—'))).toBe(true)
+    // And the reason really is *in* the tooltip: a lit cell's title carries a line per path —
+    // shortened id, shortened flow, state — which is the detail two fixed lines cannot hold. Matched
+    // on that shape rather than on a separator character, which is prose and has moved once already.
+    expect(lit.some((cell) => /\w{8}… \w{8}… [A-Z]+/.test(cell.attributes('title') ?? ''))).toBe(true)
   })
 
   // Nothing conditional may resize what surrounds it: every one of these is always in the DOM and
@@ -214,6 +217,21 @@ describe('the matrix over an exclusive namespace', () => {
     expect(wall.text()).toContain('6 paths')
   })
 
+  // The list is bounded by what the namespace holds rather than by the window, and it sits under the
+  // grid — which is the thing the screen is for. So it folds, and the header keeps the count that
+  // says what was folded away.
+  it('folds the request list away and still says how many there are', async () => {
+    const fold = () => wrapper.find('.requests .fold')
+
+    await fold().trigger('click')
+    expect(wrapper.findAll('.request')).toHaveLength(0)
+    expect(wrapper.find('.requests h2').text()).toContain(`${FIXTURE.length} requests`)
+    expect(fold().attributes('aria-expanded')).toBe('false')
+
+    await fold().trigger('click')
+    expect(wrapper.findAll('.request')).toHaveLength(FIXTURE.length)
+  })
+
   // The counts sum, which is the property the exclusive partition exists to buy: every lit cell is a
   // distinct claim, so what the cells report is what the namespace holds.
   it('accounts in its cells for every path the namespace holds', () => {
@@ -230,13 +248,15 @@ describe('the matrix over an exclusive namespace', () => {
 
   // Nothing in the ledger requires `shared`, and it is the plain path list `describe path` gives
   // when every in-namespace refcount is 1. One component, both modes — so it is offered here too.
+  // The tabs are links now, so which screen is on is in the URL and a navigation is asynchronous
+  // even when nothing guards it — waited on rather than asserted after a tick.
   it('offers the ledger beside the grid', async () => {
-    await wrapper.findAll('.view').find((button) => button.text() === 'claims')!.trigger('click')
+    await wrapper.findAll('.view').find((tab) => tab.text() === 'claims')!.trigger('click')
+    await until(() => wrapper.find('.claims').exists())
     expect(wrapper.find('.matrix').exists()).toBe(false)
-    expect(wrapper.find('.claims').exists()).toBe(true)
 
-    await wrapper.findAll('.view').find((button) => button.text() === 'grid')!.trigger('click')
-    expect(wrapper.find('.matrix').exists()).toBe(true)
+    await wrapper.findAll('.view').find((tab) => tab.text() === 'grid')!.trigger('click')
+    await until(() => wrapper.find('.matrix').exists())
   })
 })
 
@@ -255,8 +275,11 @@ describe('the matrix over a shared namespace', () => {
   // either would cancel a request and stop nothing while going dark exactly as if it had. The
   // control is shown and disabled rather than omitted — omission produces "where is the grid?".
   it('declines to be a grid, and says why', () => {
-    const grid = wrapper.findAll('.view').find((button) => button.text() === 'grid')!
-    expect(grid.attributes('disabled')).toBeDefined()
+    const grid = wrapper.findAll('.view').find((tab) => tab.text() === 'grid')!
+    // Not a link, because there is nowhere to go — a disabled anchor is still an anchor, and the
+    // route it would name is one this namespace corrects away from anyway.
+    expect(grid.element.tagName).toBe('SPAN')
+    expect(grid.classes()).toContain('off')
     expect(grid.attributes('title')).toContain('shared namespace')
 
     expect(wrapper.find('.matrix').exists()).toBe(false)

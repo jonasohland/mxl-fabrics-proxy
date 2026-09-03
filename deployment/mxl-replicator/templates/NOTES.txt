@@ -1,6 +1,6 @@
-{{ .Chart.Name }} {{ .Chart.Version }} — release {{ .Release.Name }} in {{ .Release.Namespace }}
+{{ .Chart.Name }} {{ .Chart.Version }}, release {{ .Release.Name }} in {{ .Release.Namespace }}
 
-Nothing is being replicated yet. This chart provisions the fleet; what it carries is requested
+Nothing is being replicated yet. This chart provisions the fleet. What it carries is requested
 through the API.
 
 1. Wait for the fleet to come up.
@@ -31,6 +31,13 @@ through the API.
 {{- end }}
      mxl-replicator status
 
+{{- if and .Values.server.enabled .Values.server.ui.enabled }}
+
+   The web UI is on the same port, at `/`. The port-forward above reaches it too:
+
+     http://127.0.0.1:{{ .Values.server.service.port }}/
+{{- end }}
+
 3. Check that the nodes you expect registered, with the areas and fabrics you configured.
 
      mxl-replicator get nodes
@@ -47,7 +54,7 @@ through the API.
 {{- if and (not $a.fabrics) (not $a.detectDefaultFabric) }}
 
 WARNING: agent pool "{{ default "default" (get $pool "name") }}" declares no fabric attachment. It will
-assume `shm`, which only ever pairs with itself — nothing will replicate to another host. Set
+assume `shm`, which only ever pairs with itself, so nothing will replicate to another host. Set
 agent.fabrics, or agent.detectDefaultFabric on a flat network.
 {{- end }}
 {{- end }}
@@ -66,9 +73,9 @@ WARNING: the store is ephemeral. Every replication request is lost when the serv
 replaced. Set server.persistence.enabled and a type other than emptyDir.
 {{- end }}
 
-{{- if and .Values.server.enabled (eq .Values.server.store.backend "sqlite") (has .Values.server.persistence.type (list "hostPath" "local")) }}
+{{- if and .Values.server.enabled (eq .Values.server.store.backend "sqlite") (eq .Values.server.persistence.type "hostPath") }}
 
 The store is on node {{ .Values.server.persistence.node }} at {{ .Values.server.persistence.hostPath }}, and the server is
-pinned there. Draining that node takes the control plane down until it comes back — which does not
-stop running media, but does stop reconciliation. Move to the etcd backend when that matters.
+pinned there. Draining that node takes the control plane down until it comes back. That does not
+stop running media, but it does stop reconciliation. Move to the etcd backend when that matters.
 {{- end }}

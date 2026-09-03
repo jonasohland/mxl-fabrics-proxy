@@ -71,6 +71,8 @@ type CLI struct {
 	Status   StatusCmd   `cmd:"" help:"Summarise the fleet and name anything that is not active."`
 	Get      GetCmd      `cmd:"" help:"List nodes, flows, requests, paths, sessions or namespaces."`
 	Describe DescribeCmd `cmd:"" help:"Show everything known about one node, flow, request, path, session or namespace."`
+	Events   EventsCmd   `cmd:"" help:"Show what happened to one path, request or node."`
+	Logs     LogsCmd     `cmd:"" help:"Show the last failing worker's output for one path."`
 }
 
 // commandNames are the verb names, for [guardDefaultCommand].

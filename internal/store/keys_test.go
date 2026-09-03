@@ -27,6 +27,39 @@ func TestKeysLandInTheRightLayer(t *testing.T) {
 	}
 }
 
+// TestSnapshotPrefixCoversEveryLayerAndNothingElse is the test [PrefixSnapshot] names.
+//
+// The fleet snapshot is one List over that prefix (§7.3), so a layer outside it would be silently
+// absent from every snapshot — which is indistinguishable from a wiped store, and is the failure
+// §4.2 exists to prevent. A fourth layer prefix belongs in this test before it belongs in a key.
+//
+// The other half matters just as much and in the other direction: the event log and leader
+// election must stay **out**, or a diagnostic write lands in the reconciler's snapshot and wakes
+// its watch (§12.1).
+func TestSnapshotPrefixCoversEveryLayerAndNothingElse(t *testing.T) {
+	t.Parallel()
+
+	for _, prefix := range []string{PrefixDesired, PrefixObserved, PrefixDerived} {
+		assert.True(t, strings.HasPrefix(prefix, PrefixSnapshot),
+			"layer %s is outside the snapshot prefix %s — it would be invisible to every reconcile",
+			prefix, PrefixSnapshot)
+	}
+	for _, key := range []string{KeyPolicy, KeyReconciler} {
+		assert.True(t, strings.HasPrefix(key, PrefixSnapshot), "%s is outside the snapshot", key)
+	}
+
+	for _, prefix := range []string{PrefixEvents, PrefixElection} {
+		assert.False(t, strings.HasPrefix(prefix, PrefixSnapshot),
+			"%s is inside the snapshot prefix %s", prefix, PrefixSnapshot)
+	}
+	for _, key := range []string{
+		PathEventsKey("p-1"), RequestEventsKey("nab", "r-1"), NodeEventsKey("edge-01"), LogKey("p-1"),
+	} {
+		assert.False(t, strings.HasPrefix(key, PrefixSnapshot), "%s is inside the snapshot", key)
+		assert.True(t, strings.HasPrefix(key, PrefixEvents), "%s is not an event key", key)
+	}
+}
+
 func TestKeysAreUnderTheirListPrefix(t *testing.T) {
 	t.Parallel()
 
@@ -105,7 +138,7 @@ func TestADomainNameWithASeparatorStaysOneKeySegment(t *testing.T) {
 	prefix := DomainLabelsPrefix("edge-01")
 
 	assert.True(t, strings.HasPrefix(key, prefix), "%s is not under %s", key, prefix)
-	assert.Equal(t, "/desired/domains/edge-01/fast%2Fingest", key)
+	assert.Equal(t, PrefixDesired+"domains/edge-01/fast%2Fingest", key)
 
 	// One segment past the prefix, which is what makes the two-level scan split where it is meant
 	// to. Three would put `ingest` under a node called `fast`.
@@ -113,6 +146,6 @@ func TestADomainNameWithASeparatorStaysOneKeySegment(t *testing.T) {
 
 	// And a node name with a separator in it is escaped for the same reason (§7.1).
 	nested := DomainLabelsKey("rack/edge-01", "fast/ingest")
-	assert.Equal(t, "/desired/domains/rack%2Fedge-01/fast%2Fingest", nested)
+	assert.Equal(t, PrefixDesired+"domains/rack%2Fedge-01/fast%2Fingest", nested)
 	assert.NotEqual(t, DomainLabelsPrefix("rack"), DomainLabelsPrefix("rack/edge-01"))
 }

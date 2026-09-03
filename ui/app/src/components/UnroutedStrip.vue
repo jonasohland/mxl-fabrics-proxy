@@ -36,11 +36,20 @@ import { buildUnrouted } from '@/model/unrouted'
 import { domainRoute, flowRoute, nodeRoute } from '@/router'
 import { useFleetStore } from '@/stores/fleet'
 import { useRead } from '@/stores/read'
+import { useSectionStore } from '@/stores/sections'
 
 const props = defineProps<{ namespace: string }>()
 const emit = defineEmits<{ route: [SourcePrefill] }>()
 
 const fleet = useFleetStore()
+const sections = useSectionStore()
+
+/**
+ * Folded away, because a fleet's inventory is unbounded and this sits under the thing the screen is
+ * for. The *header* stays either way — the unclaimed count is what says whether opening it is worth
+ * anything — and so does the read behind it, which rides the poll's own clock.
+ */
+const folded = computed(() => sections.folded('unrouted'))
 
 // No subject: the fleet's inventory is not namespace-scoped and neither is this read — only the
 // question asked of it is. A constant means one read on mount and one per poll thereafter, which is
@@ -109,23 +118,42 @@ const flowTitle = (flow: UnroutedFlow) =>
   <section class="strip">
     <header class="strip-head">
       <h2 title="Fleet inventory this namespace is not carrying">
-        Unrouted
+        <!-- The title *is* the control, so the whole line is a target rather than a caret the width
+             of a character. Fixed-width caret, because a section header that shifted by a glyph on
+             every fold would move the counts beside it. -->
+        <button
+          type="button"
+          class="fold"
+          :aria-expanded="!folded"
+          :title="folded
+            ? 'Show the unrouted list'
+            : 'Hide the unrouted list and give the grid the room. The counts stay.'"
+          @click="sections.toggle('unrouted')"
+        >
+          <span class="caret" aria-hidden="true">{{ folded ? '▸' : '▾' }}</span>Unrouted
+        </button>
       </h2>
 
+      <!-- Counted whether or not the list is drawn: these are read off everything the fleet reports
+           and not off what is on screen, so they are what a folded strip has to say for itself. -->
       <span class="counts">
         <span :class="{ work: strip.unclaimed > 0 }">{{ strip.unclaimed }} unclaimed</span>
         <span class="dim"> · {{ strip.routed }} routed here</span>
       </span>
 
       <!-- A silent cap reads as "nothing else was unrouted", which is exactly what the API's own
-           `excluded_dropped` exists to prevent. Same treatment. -->
-      <span v-if="strip.dropped > 0" class="dropped">
+           `excluded_dropped` exists to prevent. Same treatment. Folded away with the list it is
+           about — a cap on nothing drawn is not a cap on anything. -->
+      <span v-if="!folded && strip.dropped > 0" class="dropped">
         {{ plural(strip.dropped, 'more') }} not shown
       </span>
 
       <span class="spacer" />
 
+      <!-- The filter decides which rows are listed, so it goes with them. The counts it does not
+           touch, which is what keeps the folded header true. -->
       <label
+        v-if="!folded"
         class="filter"
         title="Hides entries routed by another namespace or written here by this project"
       >
@@ -134,59 +162,61 @@ const flowTitle = (flow: UnroutedFlow) =>
       </label>
     </header>
 
-    <p v-if="read.error.value" class="fail">{{ read.error.value.message }}</p>
-    <p v-else-if="read.loading.value" class="empty">Reading the fleet's flows…</p>
-    <p v-else-if="strip.domains.length === 0" class="empty">
-      <template v-if="unclaimedOnly && hidden > 0">
-        Nothing unclaimed. {{ plural(hidden, 'entry', 'entries') }} accounted for, hidden by the
-        filter.
-      </template>
-      <template v-else-if="strip.routed > 0">
-        Every flow the fleet reports is a source of something in {{ namespace }}.
-      </template>
+    <template v-if="!folded">
+      <p v-if="read.error.value" class="fail">{{ read.error.value.message }}</p>
+      <p v-else-if="read.loading.value" class="empty">Reading the fleet's flows…</p>
+      <p v-else-if="strip.domains.length === 0" class="empty">
+        <template v-if="unclaimedOnly && hidden > 0">
+          Nothing unclaimed. {{ plural(hidden, 'entry', 'entries') }} accounted for, hidden by the
+          filter.
+        </template>
+        <template v-else-if="strip.routed > 0">
+          Every flow the fleet reports is a source of something in {{ namespace }}.
+        </template>
+        <template v-else>
+          No flows in the fleet's inventory.
+        </template>
+      </p>
+
+      <!-- `v-else` on a wrapper rather than beside the `v-for`: the two on one element is a Vue
+           warning and the `v-for` wins, so the list would render under every branch above. -->
       <template v-else>
-        No flows in the fleet's inventory.
+        <div v-for="group in strip.domains" :key="group.key" class="group">
+          <div class="group-head">
+            <RouterLink class="mono node link" :to="nodeRoute(group.node)">{{ group.node }}</RouterLink>
+            <RouterLink class="mono link" :to="domainRoute(group.node, group.domain)">
+              {{ group.domain }}
+            </RouterLink>
+            <span class="dim tally">{{ plural(group.flows.length, 'flow') }}</span>
+            <!-- Next to what it is about, not at the far edge: the rows below put their own control at
+                 a fixed column for the same reason, and a header whose control sat somewhere else
+                 would be the only thing on the strip that moved with the window. -->
+            <button
+              type="button"
+              class="route"
+              :title="`Open the source editor on ${group.node} ${group.domain} with the whole domain selected. Nothing is written.`"
+              @click="routeDomain(group.node, group.domain)"
+            >route domain</button>
+          </div>
+
+          <div v-for="flow in group.flows" :key="flow.key" class="row" :class="{ marked: !flow.unclaimed }">
+            <span class="dot" :class="{ on: flow.producing }"></span>
+            <RouterLink class="mono link flow" :to="flowRoute(flow.flow)" :title="flowTitle(flow)">
+              {{ shortId(flow.flow) }}…
+            </RouterLink>
+            <span class="hint" :title="groupText(flow)">{{ groupText(flow) }}</span>
+            <span class="producing" :class="flow.producing ? 'state-ACTIVE' : 'dim'">
+              {{ flow.producing ? 'producing' : 'idle' }}
+            </span>
+            <button type="button" class="route" :title="flowTitle(flow)" @click="routeFlow(flow)">
+              route
+            </button>
+            <!-- Last, and rendered unconditionally: it is the only thing on the row whose length may
+                 vary, so it is the only thing that may sit in the track that depends on content. -->
+            <span class="mark" :title="markTitle(flow)">{{ mark(flow) }}</span>
+          </div>
+        </div>
       </template>
-    </p>
-
-    <!-- `v-else` on a wrapper rather than beside the `v-for`: the two on one element is a Vue
-         warning and the `v-for` wins, so the list would render under every branch above. -->
-    <template v-else>
-      <div v-for="group in strip.domains" :key="group.key" class="group">
-        <div class="group-head">
-          <RouterLink class="mono node link" :to="nodeRoute(group.node)">{{ group.node }}</RouterLink>
-          <RouterLink class="mono link" :to="domainRoute(group.node, group.domain)">
-            {{ group.domain }}
-          </RouterLink>
-          <span class="dim tally">{{ plural(group.flows.length, 'flow') }}</span>
-          <!-- Next to what it is about, not at the far edge: the rows below put their own control at
-               a fixed column for the same reason, and a header whose control sat somewhere else
-               would be the only thing on the strip that moved with the window. -->
-          <button
-            type="button"
-            class="route"
-            :title="`Open the source editor on ${group.node} ${group.domain} with the whole domain selected. Nothing is written.`"
-            @click="routeDomain(group.node, group.domain)"
-          >route domain</button>
-        </div>
-
-        <div v-for="flow in group.flows" :key="flow.key" class="row" :class="{ marked: !flow.unclaimed }">
-          <span class="dot" :class="{ on: flow.producing }"></span>
-          <RouterLink class="mono link flow" :to="flowRoute(flow.flow)" :title="flowTitle(flow)">
-            {{ shortId(flow.flow) }}…
-          </RouterLink>
-          <span class="hint" :title="groupText(flow)">{{ groupText(flow) }}</span>
-          <span class="producing" :class="flow.producing ? 'state-ACTIVE' : 'dim'">
-            {{ flow.producing ? 'producing' : 'idle' }}
-          </span>
-          <button type="button" class="route" :title="flowTitle(flow)" @click="routeFlow(flow)">
-            route
-          </button>
-          <!-- Last, and rendered unconditionally: it is the only thing on the row whose length may
-               vary, so it is the only thing that may sit in the track that depends on content. -->
-          <span class="mark" :title="markTitle(flow)">{{ mark(flow) }}</span>
-        </div>
-      </div>
     </template>
   </section>
 </template>
@@ -206,6 +236,30 @@ h2 {
   align-items: baseline;
   gap: 12px;
   margin-bottom: 8px;
+}
+
+/* The header title, which is also the fold control. A button reset that changes no geometry: the
+   heading's own type stays, so folding cannot move the counts sitting beside it. */
+.fold {
+  background: none;
+  border: 0;
+  color: inherit;
+  cursor: pointer;
+  font: inherit;
+  letter-spacing: inherit;
+  padding: 0;
+  text-transform: inherit;
+}
+
+.fold:hover { color: var(--fg); }
+.fold:focus-visible { outline: 1px solid var(--accent); }
+
+/* Fixed width, because `▸` and `▾` are not: a caret sized by its own glyph would shift the word
+   beside it every time the section is folded. */
+.caret {
+  display: inline-block;
+  width: 10px;
+  color: var(--fg-faint);
 }
 
 .counts, .dropped, .filter { font-size: 12px; }

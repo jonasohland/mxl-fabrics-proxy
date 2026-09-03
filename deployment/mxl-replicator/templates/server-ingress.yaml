@@ -1,6 +1,6 @@
 {{- if and .Values.server.enabled .Values.server.ingress.enabled }}
 {{- /*
-Only the user API is worth exposing this way. Agents reach the server over the Service — and if
+Only the user API is worth exposing this way. Agents reach the server over the Service, and if
 they are outside the cluster they reach it through this, in which case set `agent.servers` to the
 external URL and read §13 first: the agent API can claim to be a node and read other nodes' RDMA
 rkeys, so `auth.enabled` is not optional on a route anyone else can take.

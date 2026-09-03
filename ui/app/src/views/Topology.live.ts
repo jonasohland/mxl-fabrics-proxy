@@ -137,10 +137,19 @@ describe('the topology view', () => {
     expect(wrapper.find('.panel').exists()).toBe(false)
   })
 
-  // Fleet-wide with a namespace *highlight*, never a namespace filter: a chain may cross namespaces,
-  // and a filtered graph would cut it in half — which is the one thing this view exists to show.
+  /**
+   * Fleet-wide with a namespace *highlight*, never a namespace filter: a chain may cross namespaces,
+   * and a filtered graph would cut it in half — which is the one thing this view exists to show.
+   *
+   * The highlight is the **current namespace** and is set from the header, which is why this drives
+   * the picker rather than a control of this view's own: a second namespace picker on the one screen
+   * that already has one in its header is two answers to the same question. Setting it here must
+   * also *not* navigate — this is a fleet-wide screen, and an operator reading the graph should not
+   * be thrown onto a workspace by asking which of it is theirs.
+   */
   it('highlights a namespace without filtering the graph', async () => {
-    await wrapper.find('.pick select').setValue(NS)
+    await wrapper.find('.bar select').setValue(NS)
+    expect(window.location.pathname).toBe('/topology')
 
     expect(edge('edge-01', 'archive-01')!.classes()).not.toContain('dim')
     // Still drawn, and still in the same place. Only the emphasis moved.
@@ -148,7 +157,7 @@ describe('the topology view', () => {
     expect(foreign.length).toBeGreaterThan(0)
     expect(edges().length).toBeGreaterThan(foreign.length)
 
-    await wrapper.find('.pick select').setValue('')
+    await wrapper.find('.bar select').setValue('')
     expect(edges().every((entry) => !entry.classes().includes('dim'))).toBe(true)
   })
 

@@ -6,19 +6,23 @@
  * a base-URL setting is the thing that makes someone reach for CORS six months later. Development
  * is a dev-server proxy (see `vite.config.ts`), so both speak the same relative URLs.
  *
- * Authentication is likewise absent by design. Auth is one optional shared bearer token that also
- * guards the privileged agent API, so a token the browser holds hands whoever loads the page the
- * ability to claim to be a node and read every node's RDMA rkeys. The supported answer is that the
- * proxy or the server injects the header on the way through, which needs nothing from here.
+ * Authentication is one optional shared bearer token, and the preferred answer is still that the
+ * proxy or the server injects the header on the way through so the browser never holds a credential
+ * that also opens the privileged agent API. That deployment needs nothing from here and gets nothing
+ * from here: the token in `auth.ts` is attached only if one has been entered, and it is only ever
+ * *asked* for after a 401. See that module for what the fallback costs.
  */
 
+import { authHeaders, noteStatus } from './auth'
 import type {
   ApiErrorBody,
   DomainLabelResult,
   DomainLabelWrite,
   DomainList,
   ErrorCode,
+  EventList,
   FlowList,
+  LogTail,
   Namespace,
   NamespaceInfo,
   NamespaceList,
@@ -63,6 +67,18 @@ export class ApiError extends Error {
   /** The server has not run its first reconcile. Not an outage. */
   get notReady(): boolean {
     return this.status === 503 && this.code === 'not_ready'
+  }
+
+  /**
+   * A token is configured on the server and the browser is not carrying it — or is carrying the
+   * wrong one, which is the same refusal and deliberately indistinguishable (the server will not
+   * tell an unauthenticated caller which of the two it got).
+   *
+   * The status alone, not the body: this is the one refusal the middleware answers before any
+   * handler runs, so there may be no JSON at all if something in front of the server produced it.
+   */
+  get unauthorized(): boolean {
+    return this.status === 401
   }
 }
 
@@ -160,12 +176,19 @@ async function call(path: string, options: RequestOptions = {}): Promise<Respons
     credentials: 'same-origin',
   }
   if (options.signal) init.signal = options.signal
+
+  // Every call, including the reads, because the token guards both prefixes wholesale and there is
+  // no anonymous subset of `/v1` to keep it off. Empty where none is held, which is the ordinary
+  // case: no token configured, or a proxy injecting the header in front of this browser.
+  const headers: Record<string, string> = authHeaders()
   if (options.body !== undefined) {
     init.body = JSON.stringify(options.body)
-    init.headers = { 'Content-Type': 'application/json' }
+    headers['Content-Type'] = 'application/json'
   }
+  if (Object.keys(headers).length > 0) init.headers = headers
 
   const response = await fetch(path, init)
+  noteStatus(path, response.status)
   if (!response.ok) {
     const body = (await readBody(response)) as Partial<ApiErrorBody> | undefined
     throw new ApiError(response.status, body, `${init.method} ${path} failed: ${response.status}`)
@@ -237,6 +260,51 @@ export const api = {
     get<DomainList>(`/v1/nodes/${encodeURIComponent(node)}/domains`, signal),
 
   readyz: (signal?: AbortSignal) => get<Readyz>('/readyz', signal),
+
+  // -- events --------------------------------------------------------------
+  //
+  // **The only reads here that do not cost a full reconcile.** Every other one goes through the
+  // server's `view()`, which loads the whole store and reconciles it whatever was asked for; an
+  // event read is one `Get` on one key, because a ring is a record of what already happened and
+  // there is nothing to recompute (`internal/server/eventsapi.go`).
+  //
+  // **None of them takes a cursor, deliberately.** The endpoints accept `?since=` and this UI never
+  // sends one: coalescing *rewrites the last entry in place with a new sequence number*, so an
+  // incremental poll is handed the same row twice and the only way to dedup it is to reimplement
+  // `Event.coalescesWith`'s key in TypeScript. That is the same second-implementation-of-a-Go-rule
+  // trap `docs/open-items.md` §3.4 argues against for the manifest grammar, and the thing it would
+  // buy is re-fetching at most fifty entries. Read the whole ring; replace what is on screen.
+
+  pathEvents: (id: string, signal?: AbortSignal) =>
+    get<EventList>(`/v1/paths/${encodeURIComponent(id)}/events`, signal),
+
+  /**
+   * A request's own ring merged with those of the paths it **currently** expands onto — the server
+   * does the merge, and it is the one event read that does pay for a fleet load, because which paths
+   * a request expands onto is derived and there is nowhere else to learn it from.
+   */
+  requestEvents: (namespace: string, name: string, signal?: AbortSignal) =>
+    get<EventList>(`${requestPath(namespace, name)}/events`, signal),
+
+  /** Answered for a node with no registration: a node's log outlives its paths and its lease. */
+  nodeEvents: (node: string, signal?: AbortSignal) =>
+    get<EventList>(`/v1/nodes/${encodeURIComponent(node)}/events`, signal),
+
+  /**
+   * The tail behind a `has_log` marker. **Fetched on a deliberate act and never on a poll** — that
+   * split is the whole reason the marker exists rather than the bytes (§12.2).
+   *
+   * A 404 is the ordinary answer for a path nothing has captured a log for, so it is `undefined`
+   * here rather than a throw.
+   */
+  async pathLogs(id: string, signal?: AbortSignal): Promise<LogTail | undefined> {
+    try {
+      return await get<LogTail>(`/v1/paths/${encodeURIComponent(id)}/logs`, signal)
+    } catch (error) {
+      if (error instanceof ApiError && error.status === 404) return undefined
+      throw error
+    }
+  },
 
   // -- mutations -----------------------------------------------------------
 

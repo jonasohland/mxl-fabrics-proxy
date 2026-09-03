@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"time"
 
@@ -10,6 +11,7 @@ import (
 	"github.com/jonasohland/mxl-replicator/internal/server"
 	"github.com/jonasohland/mxl-replicator/internal/server/negotiate"
 	"github.com/jonasohland/mxl-replicator/internal/server/reconcile"
+	"github.com/jonasohland/mxl-replicator/ui"
 )
 
 // ServerOptions runs the central connection management server.
@@ -25,6 +27,12 @@ type ServerOptions struct {
 	Auth  AuthFlags  `embed:""`
 	TLS   TLSFlags   `embed:"" prefix:"tls-"`
 
+	// Off by default, because the assets are the one part of this server that something else may
+	// already be serving: the supported deployments are this binary, or a proxy fronting both the
+	// app and the API on one origin, and turning it on unasked would put a second copy behind the
+	// second shape (`ui.md` §6).
+	UI bool `help:"Serve the bundled web UI at /. Requires a binary built with the UI assets (make ui)." env:"MXL_REPLICATOR_UI"`
+
 	HeartbeatInterval time.Duration `help:"Interval at which agents are expected to renew their liveness lease." default:"5s"`
 	LeaseTTL          time.Duration `help:"Liveness lease TTL. Should be a small multiple of --heartbeat-interval." default:"15s"`
 
@@ -38,6 +46,14 @@ type ServerOptions struct {
 	ProviderOrder []string `help:"Provider preference order used when a request does not pin a provider." default:"efa,verbs,tcp,shm"`
 
 	MaxLongPollWait time.Duration `help:"Upper bound on the assignment long-poll hold time (§9.2). Must stay below any intermediate proxy's idle timeout." default:"30s"`
+
+	EventRingSize int `help:"Event-log entries kept per path, request and node (§12.1). Bounded by count, never by age: an age bound expires the overnight failure exactly when someone arrives to read it." default:"50"`
+	LogTailBytes  int `help:"Largest worker log tail this server will store per path (§12.2). Anything over it is truncated at the head, keeping the fatal line." default:"8192"`
+
+	// The one part of the event log whose volume is set by the fleet rather than by the control
+	// plane, and therefore the one part with a switch (§12.1). Entries are batched per reconcile
+	// pass, so a churning node costs one entry per kind per pass rather than one per flow.
+	InventoryEvents bool `help:"Record flows and domains appearing and disappearing on each node's event log (§12.1). Off with --no-server-inventory-events, for a fleet whose producers churn constantly." default:"true" negatable:""`
 
 	// The session-level worker settings. They live here rather than on the agent because the
 	// library performs no negotiation of its own and both ends of a session must be handed
@@ -64,6 +80,14 @@ func (c *ServerOptions) Validate() error {
 		return err
 	}
 	if _, err := c.Auth.Token(); err != nil {
+		return err
+	}
+
+	// Refused at startup rather than serving an empty `/`. Whether a binary carries the app is
+	// decided by whether the node build ran before the go one, which is not something an operator
+	// staring at a blank page can see — so the flag either has assets behind it or the process
+	// does not start.
+	if _, err := c.uiAssets(); err != nil {
 		return err
 	}
 
@@ -107,6 +131,19 @@ func (c *ServerOptions) providerOrder() []api.Provider {
 	return out
 }
 
+// uiAssets returns the embedded app when --server-ui asked for it, nil when it did not, and an
+// error when it was asked for and this binary has none.
+func (c *ServerOptions) uiAssets() (fs.FS, error) {
+	if !c.UI {
+		return nil, nil
+	}
+	assets, ok := ui.Assets()
+	if !ok {
+		return nil, fmt.Errorf("--server-ui: this binary was built without the web UI; run `make ui` and build again")
+	}
+	return assets, nil
+}
+
 // SettlingWindow is the delay before the first reconcile (§7.3).
 func (c *ServerOptions) SettlingWindow() time.Duration {
 	return time.Duration(c.SettlingHeartbeats) * c.HeartbeatInterval
@@ -137,6 +174,13 @@ func (c *ServerOptions) build(ctx context.Context, logger *slog.Logger) (*instan
 		return nil, err
 	}
 
+	// Validate has already rejected --server-ui on a binary without assets; this is the same call
+	// for its value, so that build stands on its own when it is used outside the CLI.
+	assets, err := c.uiAssets()
+	if err != nil {
+		return nil, err
+	}
+
 	replica := server.ReplicaName()
 
 	backing, elector, closeStore, err := c.Store.Open(ctx, replica, c.LeaseTTL, logger)
@@ -149,6 +193,7 @@ func (c *ServerOptions) build(ctx context.Context, logger *slog.Logger) (*instan
 		"store", c.Store.Backend,
 		"tls", c.TLS.Enabled(),
 		"auth", token != "",
+		"ui", assets != nil,
 		"replica", replica,
 		"heartbeat", c.HeartbeatInterval,
 		"lease_ttl", c.LeaseTTL,
@@ -170,6 +215,11 @@ func (c *ServerOptions) build(ctx context.Context, logger *slog.Logger) (*instan
 		LeaseTTL:           c.LeaseTTL,
 		SettlingHeartbeats: c.SettlingHeartbeats,
 		MaxLongPollWait:    c.MaxLongPollWait,
+		EventRingSize:      c.EventRingSize,
+		LogTailBytes:       c.LogTailBytes,
+		UI:                 assets,
+
+		NoInventoryEvents: !c.InventoryEvents,
 		Reconcile: reconcile.Config{
 			Negotiate:                   negotiate.Config{Order: c.providerOrder()},
 			IdleTimeout:                 c.Idle.IdleTimeout,

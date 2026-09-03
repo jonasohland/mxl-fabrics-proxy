@@ -77,6 +77,27 @@ describe('the unrouted strip', () => {
     expect(strip().find('.work').text()).toContain('unclaimed')
   })
 
+  // The fleet's inventory is unbounded and this sits under the grid, so on a large fleet the strip
+  // is what pushes the board off the screen. Folded, the list goes and the counts stay — the
+  // unclaimed number is what says whether opening it again is worth anything, and a section that hid
+  // its own reason to exist would be one an operator folds once and never opens.
+  it('folds the list away and keeps the counts', async () => {
+    const counts = () => strip().find('.counts').text()
+    const fold = () => strip().find('.fold')
+    const before = counts()
+
+    await fold().trigger('click')
+    expect(rows()).toHaveLength(0)
+    expect(fold().attributes('aria-expanded')).toBe('false')
+    // The filter decides which rows are listed, so it goes with them — and it is not what the counts
+    // are computed from, which is what keeps a folded header true.
+    expect(strip().find('.filter').exists()).toBe(false)
+    expect(counts()).toBe(before)
+
+    await fold().trigger('click')
+    await listed(LOCAL)
+  })
+
   // The attention filter defaults on, and the two accounted-for kinds are *hidden*, never dropped:
   // the toggle has to be able to say how many it is holding back.
   it('hides this project\'s own output behind the filter and counts it', async () => {
@@ -89,7 +110,11 @@ describe('the unrouted strip', () => {
     // Legitimately a source — that is how a chain A→B→C is written — but not *unrouted*.
     expect(row(ONWARD)!.text()).toContain('written here by this project')
     expect(row(ONWARD)!.classes()).toContain('marked')
-    expect(row(ONWARD)!.find('.mark').attributes('title')).toContain('self_output')
+    // The mark explains itself in prose rather than by naming `self_output`: the code is the
+    // server's word for it and appears on the request's exclusion list, where it can be matched on.
+    // Here the question is why this row is dimmed, and the answer is a sentence.
+    expect(row(ONWARD)!.find('.mark').attributes('title'))
+      .toContain('own target workers')
   })
 
   // Namespaces partition requests, not nodes. Fleet-wide this entry would vanish from the one view

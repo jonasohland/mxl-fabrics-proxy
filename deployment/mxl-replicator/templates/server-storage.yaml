@@ -4,70 +4,21 @@
 {{- /*
 Where the sqlite store lives.
 
-Two of the five types put a directory on one named node, and both need `persistence.node`: the
-data is on that node's disk and the server has to be scheduled back onto it every time. `hostPath`
-lets kubelet create the directory; `local` will not, but it is a real PersistentVolume with node
-affinity the scheduler honours, which is the better object once someone has provisioned the mount.
+`hostPath` puts a directory on one named node and needs `persistence.node`, because the data is on
+that node's disk and the server has to be scheduled back onto it every time. It creates no PV and
+no PVC at all: the pod names the directory. A PV/PVC pair around a hostPath would be two more
+objects saying the same thing, and the claim would outlive `helm uninstall` while the data it
+points at is not cluster state anyway.
 
-`hostPath` creates no PV and no PVC at all — the pod names the directory directly. A PV/PVC pair
-around a hostPath would be two more objects saying the same thing, and the PVC would outlive
-`helm uninstall` while the data it points at is not cluster state anyway.
+`pvc` is the other durable option, either a claim you manage or one the chart creates against a
+provisioner.
 */}}
 
-{{- if or (eq $p.type "hostPath") (eq $p.type "local") }}
-{{- if not $p.node }}
-{{- fail (printf "server.persistence.type=%q needs server.persistence.node: the store is a directory on one node's disk, and the server has to be scheduled back onto that node on every restart. Set it to the node's %s label." $p.type $p.nodeLabel) }}
-{{- end }}
+{{- if and (eq $p.type "hostPath") (not $p.node) }}
+{{- fail (printf "server.persistence.type=hostPath needs server.persistence.node") }}
 {{- end }}
 
-{{- if not (hasPrefix (printf "%s/" (trimSuffix "/" $p.mountPath)) .Values.server.store.sqlite.path) }}
-{{- fail (printf "server.store.sqlite.path (%q) is not inside server.persistence.mountPath (%q); the store would be written to the container's ephemeral filesystem and lost on every restart." .Values.server.store.sqlite.path $p.mountPath) }}
-{{- end }}
-
-{{- if eq $p.type "local" }}
----
-apiVersion: v1
-kind: PersistentVolume
-metadata:
-  # PersistentVolumes are cluster-scoped, so the namespace is part of the name: two releases in
-  # two namespaces must not collide on it.
-  name: {{ include "mxl-replicator.storePVName" . }}
-  labels:
-    {{- include "mxl-replicator.labels" . | nindent 4 }}
-    app.kubernetes.io/component: server
-  {{- with .Values.commonAnnotations }}
-  annotations:
-    {{- toYaml . | nindent 4 }}
-  {{- end }}
-spec:
-  capacity:
-    storage: {{ $p.size }}
-  accessModes:
-    {{- toYaml $p.accessModes | nindent 4 }}
-  # Retain, not Delete: the store is the fleet's declared intent, and a `helm uninstall` that took
-  # every replication request with it would be a surprising way to lose them. The PV and the claim
-  # are still ordinary chart resources and go with the release — what survives is the directory,
-  # which a reinstall binds straight back to.
-  persistentVolumeReclaimPolicy: Retain
-  # Empty string, not the cluster default: this volume is pre-provisioned and no provisioner
-  # should be involved. The claim below opts out the same way.
-  storageClassName: ""
-  # Named explicitly so the claim cannot bind to some other unclaimed volume that happens to fit.
-  claimRef:
-    namespace: {{ .Release.Namespace }}
-    name: {{ include "mxl-replicator.storeClaimName" . }}
-  local:
-    path: {{ $p.hostPath }}
-  nodeAffinity:
-    required:
-      nodeSelectorTerms:
-        - matchExpressions:
-            - key: {{ $p.nodeLabel }}
-              operator: In
-              values: [{{ $p.node | quote }}]
-{{- end }}
-
-{{- if or (eq $p.type "local") (eq $p.type "storageClass") }}
+{{- if and (eq $p.type "pvc") (not $p.pvc.existingClaim) }}
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -82,9 +33,8 @@ metadata:
     {{- toYaml . | nindent 4 }}
   {{- end }}
 {{- /*
-`size` and `accessModes` are immutable once the claim exists: changing either needs the claim
-deleted and recreated, which for `type: local` costs nothing but a rebind — the data is the
-directory, not the object.
+`size` and `accessModes` are immutable once the claim exists. Changing either needs the claim
+deleted and recreated.
 */}}
 spec:
   accessModes:
@@ -92,13 +42,10 @@ spec:
   resources:
     requests:
       storage: {{ $p.size }}
-  {{- if eq $p.type "local" }}
+  {{- if eq $p.pvc.storageClass "-" }}
   storageClassName: ""
-  volumeName: {{ include "mxl-replicator.storePVName" . }}
-  {{- else if eq $p.storageClass "-" }}
-  storageClassName: ""
-  {{- else if $p.storageClass }}
-  storageClassName: {{ $p.storageClass }}
+  {{- else if $p.pvc.storageClass }}
+  storageClassName: {{ $p.pvc.storageClass }}
   {{- end }}
 {{- end }}
 {{- end }}

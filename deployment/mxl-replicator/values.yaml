@@ -1,12 +1,16 @@
 # mxl-replicator
 #
-# Two roles, one binary, two workloads: a control-plane `server` (Deployment) and a per-node
-# `agent` (DaemonSet). The server rolls *first* — it must tolerate agents a version or more
+# One binary, two workloads. The control-plane `server` runs as a Deployment and a per-node `agent`
+# runs as a DaemonSet. The server rolls first on an upgrade: it tolerates agents a version or more
 # behind, and it refuses an agent newer than itself.
 #
-# Nothing here routes a flow. Replication is requested through the API with
-# `mxl-replicator apply -f <manifest>`; what this chart configures is provisioning — which nodes
+# This chart provisions the fleet. It does not decide what gets replicated. That is requested
+# through the API with `mxl-replicator apply -f <manifest>`. What is configured here is which nodes
 # participate, what filesystem authority they grant, and what they can be reached on.
+#
+# Most of the binary's tuning flags are not surfaced as values. The binary's own defaults apply,
+# and anything else goes through `server.extraArgs` or `agent.extraArgs`. Run
+# `mxl-replicator run --help` for the full list.
 
 # -- Override the name used for the chart's objects.
 nameOverride: ""
@@ -16,8 +20,8 @@ fullnameOverride: ""
 image:
   registry: docker.io
   repository: jonasohland/mxl-replicator
-  # Empty means `.Chart.AppVersion`. **Pin it.** The manifest format and the HTTP API are subject
-  # to change and there is no compatibility guarantee across versions.
+  # Empty means `.Chart.AppVersion`. Pin it. The manifest format and the HTTP API can change
+  # between versions and there is no compatibility guarantee.
   tag: ""
   pullPolicy: IfNotPresent
   # Names of imagePullSecrets in this namespace.
@@ -25,15 +29,14 @@ image:
 
 # The shared bearer token, and the whole of the v1 auth surface.
 #
-# No-auth is supported on a trusted network, but the user API is a fleet-wide bandwidth
-# exhaustion primitive and the agent API can claim to be a node and read other nodes' RDMA
-# rkeys — so it is on by default here.
+# No-auth works on a trusted network. It is on by default because the user API can saturate the
+# fleet's bandwidth, and the agent API can claim to be a node and read other nodes' RDMA rkeys.
 auth:
   enabled: true
   # A literal token. Left empty with `existingSecret` unset, the chart generates one on first
   # install and reads it back on upgrade, so `helm upgrade` does not rotate it out from under a
-  # running fleet. `helm template` has no cluster to read, so it emits a fresh token every time —
-  # do not pipe `helm template` into `kubectl apply` for an existing release.
+  # running fleet. `helm template` has no cluster to read and emits a fresh token every time, so do
+  # not pipe `helm template` into `kubectl apply` for an existing release.
   token: ""
   # Use a Secret you manage instead. The chart then creates none.
   existingSecret: ""
@@ -41,7 +44,7 @@ auth:
 
 serviceAccount:
   create: true
-  # Empty means the fullname. Both workloads share one; neither needs any RBAC.
+  # Empty means the fullname. Both workloads share one and neither needs any RBAC.
   name: ""
   annotations: {}
 
@@ -50,14 +53,14 @@ commonLabels: {}
 commonAnnotations: {}
 
 # ---------------------------------------------------------------------------------------------
-# Server — the control plane.
+# Server, the control plane.
 # ---------------------------------------------------------------------------------------------
 server:
   enabled: true
 
-  # sqlite is single-node and always the leader; etcd is required for more than one replica.
-  # This is clamped: with the sqlite backend the chart renders one replica whatever is set here,
-  # because the PVC is ReadWriteOnce and sqlite has one writer.
+  # sqlite is single-node and always the leader. etcd is required for more than one replica.
+  # With the sqlite backend the chart renders one replica whatever is set here, because the volume
+  # has one writer and so does sqlite.
   replicas: 1
 
   listenPort: 2283
@@ -66,15 +69,10 @@ server:
     # sqlite | etcd
     backend: sqlite
 
-    sqlite:
-      # Must sit inside `persistence.mountPath`.
-      path: /var/lib/mxl-replicator/store.db
-
     etcd:
       endpoints: []
-      prefix: /mxl-replicator
-      # Credentials, if the cluster has authentication enabled. `existingSecret` is preferred;
-      # it must carry `username` and `password` keys.
+      # Credentials, if the cluster has authentication enabled. `existingSecret` is preferred and
+      # must carry `username` and `password` keys.
       username: ""
       password: ""
       existingSecret: ""
@@ -82,85 +80,78 @@ server:
         # A Secret with any of `ca.crt`, `tls.crt`, `tls.key`. Mounted at /etc/mxl-replicator/etcd.
         existingSecret: ""
 
-  # Where the sqlite store lives.
-  #
-  # **The default is a directory on one named node**, which is the shape asked for: no storage
-  # class, no provisioner, no CSI driver. Set `persistence.node` to the node that should hold it
-  # — the server pod is pinned there, and it has to be, because the data is on that node's disk.
+  # Where the sqlite store lives. The default is a directory on one named node, which needs no
+  # storage class, no provisioner and no CSI driver. Set `persistence.node` to the node that should
+  # hold it. The server pod is pinned there, because the data is on that node's disk.
   persistence:
     enabled: true
 
-    # hostPath | local | existingClaim | storageClass | emptyDir
+    # hostPath | pvc | emptyDir
     #
-    #   hostPath        A directory on `node`, created if missing. No PV, no PVC. The
-    #                   least-friction option and the default.
-    #   local           A pre-provisioned `local` PersistentVolume on `node`, bound to a PVC the
-    #                   chart creates. The directory must already exist — the local volume plugin
-    #                   will not create it — but the volume is a real cluster object with node
-    #                   affinity the scheduler honours.
-    #   existingClaim   A PVC you manage. `node` is then not used.
-    #   storageClass    A PVC the chart creates against a provisioner.
-    #   emptyDir        Ephemeral. The request set does not survive a restart. Development only.
+    #   hostPath   A directory on `node`, created if missing. No PV and no PVC, so nothing
+    #              outlives `helm uninstall` except the directory. This is the default.
+    #   pvc        A PersistentVolumeClaim. Set `pvc.existingClaim` to use one you manage, or
+    #              leave it empty and the chart creates one against `pvc.storageClass`.
+    #   emptyDir   Ephemeral. The request set does not survive a restart. Development only.
     type: hostPath
 
-    # **Required for `hostPath` and `local`.** The value of `nodeLabel` on the node that holds
-    # the volume. With the default label that is the node's name as `kubectl get nodes` prints it.
+    # Required for `hostPath`. The value of `nodeLabel` on the node that holds the directory. With
+    # the default label that is the node's name as `kubectl get nodes` prints it.
     node: ""
     nodeLabel: kubernetes.io/hostname
 
-    # The directory on the node, for `hostPath` and `local`.
+    # The directory on the node, for `hostPath`.
     hostPath: /var/lib/mxl-replicator
 
-    # Where it is mounted in the container. `store.sqlite.path` must be inside it.
+    # Where the volume is mounted in the container. The store file is `<mountPath>/store.db`.
     mountPath: /var/lib/mxl-replicator
 
-    # Desired state is small and low-churn by design and observed state is leased, so it collects
-    # itself. This is generous.
+    # For a claim the chart creates. Both are immutable once it exists. Desired state is small and
+    # low-churn, and observed state is leased so it collects itself, so this is generous.
     size: 1Gi
     accessModes: [ReadWriteOnce]
 
-    # type: existingClaim
-    existingClaim: ""
-
-    # type: storageClass. Empty selects the cluster default; "-" opts out of dynamic provisioning.
-    storageClass: ""
+    pvc:
+      # A claim you manage. The chart then creates none and `storageClass` is unused.
+      existingClaim: ""
+      # Empty selects the cluster default. "-" opts out of dynamic provisioning.
+      storageClass: ""
 
     # The image runs as a non-root user and a directory kubelet creates is owned by root, so a
-    # short root init container takes ownership before the server starts. hostPath volumes get no
-    # fsGroup treatment from Kubernetes, which is why this exists rather than a pod securityContext.
-    initChown:
-      enabled: true
-      # Resolved inside the image with `id -u`, so it follows the image rather than a number
-      # hardcoded here.
-      user: mxl
+    # short root init container takes ownership before the server starts.
+    initChown: true
 
-  # Control-plane timings. The defaults are the binary's own; they are surfaced because a fleet
-  # on a slow or lossy network is the case that needs them.
-  heartbeatInterval: 5s
-  leaseTTL: 15s
-  # Heartbeat intervals to wait before the first reconcile, so a restart adopts running sessions
-  # rather than re-establishing them. Ends early once every leased agent has reported.
-  settlingHeartbeats: 3
-  maxLongPollWait: 30s
-
-  # The order used when a request does not pin a provider. An explicit pin is honoured or the
-  # request fails — it is never silently substituted — so this only decides the unpinned case.
-  providerOrder: [efa, verbs, tcp, shm]
-
-  # Session-level worker settings. They live on the server because both ends of a session must be
-  # handed identical values.
-  idleTimeout: 0s
-  idleTeardown: 5m
-  connectTimeout: 60s
-  noNetworkLatencyMeasurement: false
-
-  degradedRestarts: 3
-  failedRestarts: 10
+  # Control-plane timings. Empty takes the binary's default, shown beside each one. They are
+  # surfaced because a fleet on a slow or lossy network is the case that needs them.
+  #
+  # The reconciler's provider order, idle policy, restart thresholds and settling window are left
+  # to the binary. Use `extraArgs` to change any of them.
+  heartbeatInterval: ""  # 5s
+  leaseTTL: ""           # 15s
+  maxLongPollWait: ""    # 30s
 
   logLevel: info
 
-  # TLS terminated by the server itself. Terminating in a proxy in front of it is equally
-  # supported — leave this off and point the agents at the proxy.
+  # The web UI, served by the server itself at `/`, on the same port and the same origin as the
+  # API. Off by default, for two independent reasons:
+  #
+  #   - The image has to carry it. Every image built from this repository's Dockerfile does — it
+  #     builds the app in a stage of its own — but the assets are compiled into the binary, so a
+  #     custom image built without them refuses to start with this flag rather than serving a blank
+  #     page. That fails the rollout, which is the intended way to find out.
+  #   - **The browser is given no token.** With `auth.enabled` (the default) the page loads and
+  #     every API call it makes comes back 401: the UI deliberately has no login, because the same
+  #     token opens the agent API, which can claim to be a node and read other nodes' RDMA rkeys.
+  #     Something in front has to inject `Authorization` — see the chart README, "Web UI".
+  #
+  # Leave it off where a proxy already serves the app beside the API. That is the other supported
+  # shape, and turning this on as well means two copies of it, one of them whichever binary is
+  # oldest.
+  ui:
+    enabled: false
+
+  # TLS terminated by the server itself. Terminating in a proxy in front of it works too. Leave
+  # this off and point the agents at the proxy.
   tls:
     enabled: false
     # A Secret with `tls.crt` and `tls.key`.
@@ -207,54 +198,65 @@ server:
     capabilities:
       drop: [ALL]
 
-  # Appended verbatim to the server's argument list.
+  # Appended verbatim to the server's argument list. Any flag the chart does not surface goes
+  # here, for example `[--server-idle-teardown, 10m]`.
   extraArgs: []
   extraEnv: []
   extraVolumes: []
   extraVolumeMounts: []
 
 # ---------------------------------------------------------------------------------------------
-# Agent — one per node.
+# Agent, one per node.
 # ---------------------------------------------------------------------------------------------
 #
-# Everything under here is provisioning: it changes when the host is built, not when a flow is
-# routed. There is no ConfigMap of subscriptions and no reloader — that state lives in the API.
+# Everything here is provisioning. It changes when the host is built, not when a flow is routed.
+# There is no ConfigMap of subscriptions and no reloader, because that state lives in the API.
 agent:
   enabled: true
 
-  # Which nodes run an agent. Label them, rather than running one everywhere: an agent grants
-  # this project authority over the node's filesystem.
+  image:
+    # Empty follows `image.tag`. Set it when the agent needs a different build from the server.
+    # EFA is that case: the EFA image carries a libfabric with the provider compiled in and the
+    # stock image does not. The server never touches a fabric and keeps the stock image.
+    tag: ""
+
+  # Which nodes run an agent. Label them rather than running one everywhere, because an agent
+  # grants this project authority over the node's filesystem.
   #
-  # Helm deep-merges maps, so a key you set here is *added* to this default rather than replacing
-  # it — and a DaemonSet requiring a label no node carries schedules nowhere and reports
-  # `0 desired`, which reads as nothing having happened. Set this key to `null` to drop it.
+  # Helm deep-merges maps, so a key set here is added to this default rather than replacing it. A
+  # DaemonSet requiring a label no node carries schedules nowhere and reports `0 desired`, which
+  # reads as nothing having happened. Set this key to `null` to drop it.
   nodeSelector:
     mxl.ebu.org/mxl-replicator: "true"
 
   listenPort: 2284
-  # Expose the metrics port on the host. Redundant under hostNetwork, which is the default, and
-  # kept for the case where hostNetwork is turned off.
+  # Bind the metrics port on the host. Under hostNetwork the port is already on the host, so this
+  # only matters when hostNetwork is off.
   hostPort: true
 
-  # The fabric connection is inbound to the *destination* node on a port the agent allocates from
+  # The fabric connection is inbound to the destination node on a port the agent allocates from
   # `portRange`, so that range has to be reachable on the host. hostNetwork is how it is by
-  # default; turning it off means arranging that reachability some other way.
+  # default. Turning it off means arranging that reachability some other way.
   hostNetwork: true
   dnsPolicy: ClusterFirstWithHostNet
+
+  # Inbound to the destination node, so open it there. This matches the binary's default and is
+  # kept as a value because it is the number that goes in a firewall rule.
+  portRange: 24000-24999
 
   # Control-plane URLs. Empty means the in-cluster Service this chart creates. Set it explicitly
   # for agents outside the cluster, or list every replica of an HA deployment.
   servers: []
 
-  # **Areas: the whole of this project's authority over this node's filesystem.**
+  # Areas: the whole of this project's authority over this node's filesystem.
   #
-  # `read` grants discovering and observing domains under the directory; `write` grants creating
+  # `read` grants discovering and observing domains under the directory. `write` grants creating
   # them and writing flows into them. Neither implies the other, both default false, and an area
   # granting neither is refused at startup.
   #
-  # A domain inside an area is addressed fleet-wide as `<area>/<elements>` — so a directory
+  # A domain inside an area is addressed fleet-wide as `<area>/<elements>`. A directory
   # `/dev/shm/mxl/ingest` under the `fast` area below is `fast/ingest`, and that is its identity
-  # for life. Areas may nest; the innermost containing one names a directory.
+  # for life. Areas may nest, and the innermost containing one names a directory.
   #
   # Every path here must be inside one of `hostMounts` or the container cannot see it. The chart
   # checks that and refuses to render otherwise.
@@ -267,51 +269,19 @@ agent:
       read: true
       write: true
 
-  # **What this node can be reached on.** `(provider, fabric, selector)` triples, where `fabric`
-  # is an operator-assigned opaque label: two nodes may pair on a provider only if they share it.
+  # What this node can be reached on: `(provider, fabric, selector)` triples, where `fabric` is an
+  # operator-assigned opaque label. Two nodes may pair on a provider only if they share it.
   #
   # Provider availability is not reachability. Two nodes both offering `verbs` may be on different
   # InfiniBand fabrics and two both offering `efa` may be in different VPCs, so intersecting
-  # provider *names* would assign a session that cannot connect and fail invisibly.
+  # provider names would assign a session that cannot connect and fail invisibly.
   #
-  # Selectors come in two kinds. A **naming** selector — `address`, `interface` or `device`, at
-  # most one — says which interface is meant. **Narrowing** selectors — `network` and
-  # `ip_version` — say which of its addresses counts, and compose with a name and with each other.
-  # Exactly one probe entry must survive the conjunction; zero or several is a loud startup error
-  # rather than a guess.
+  # A naming selector (`address`, `interface` or `device`, at most one) says which interface is
+  # meant. Narrowing selectors (`network` and `ip_version`) say which of its addresses counts, and
+  # compose with a name and with each other. Exactly one probe entry must survive the conjunction.
+  # Zero or several is a startup error rather than a guess.
   #
-  # For verbs, `device` is the libfabric device name — `mlx5_0` for the first port of a Mellanox
-  # HCA, which is what `ls /sys/class/infiniband` on the node prints — and *not* a netdev name.
-  # `interface` is the netdev (`ib0`, or the RoCE port's `ensXnpY`), resolved through the addresses
-  # the kernel reports for it.
-  #
-  # **A name alone is often ambiguous.** An HCA with both an IPv4 address and a link-local IPv6
-  # one reports two probe entries under the same device, and the agent says so at startup:
-  #
-  #   dropping a configured fabric attachment  reason="device: mlx5_0 matches 2 verbs interfaces"
-  #
-  # That is what the narrowing selectors are for, and why they matter *here* in particular: every
-  # value in this list is fleet-wide. `address:` is exact and always unique, but it costs a
-  # `pools:` entry or a per-node overlay to state something ("we are on v4") that is true of the
-  # whole fleet — where `device` plus `ip_version` says it once:
-  #
-  #   fabrics:
-  #     - provider: verbs
-  #       fabric: ib-fabric-a
-  #       device: mlx5_0
-  #       ip_version: 4
-  #
-  # `network` goes one further and names no hardware at all: it picks each node's own address
-  # inside a CIDR prefix, which is the same value on every node even where the netdev is `eth1`
-  # here and `ens5f0` there. It is usually the right selector for tcp.
-  #
-  #   fabrics:
-  #     - provider: tcp
-  #       fabric: dc1-data
-  #       network: 10.1.0.0/16
-  #
-  # Neither narrowing selector says anything about reachability, and neither can: two nodes inside
-  # one prefix may still have no route between them. Deciding that is what the `fabric` label is.
+  # README.md covers which selector suits which provider, and why a name alone is often ambiguous.
   fabrics:
     - provider: verbs
       fabric: ib-fabric-a
@@ -330,60 +300,45 @@ agent:
       mountPath: /dev/shm
       type: Directory
 
-  # RDMA character devices. Needed by `verbs` and by `efa` — an EFA adapter presents as
+  # RDMA character devices. Needed by `verbs` and by `efa`, since an EFA adapter presents as
   # /dev/infiniband/uverbs*.
   devices:
     infiniband:
       enabled: true
       path: /dev/infiniband
-      # `Directory` refuses to start on a node with no RDMA hardware, which is the right answer
-      # on a fleet that is supposed to have some. Set `DirectoryOrCreate` on a mixed cluster, or
-      # turn this off entirely for a tcp/shm-only pool.
+      # `Directory` refuses to start on a node with no RDMA hardware, which is the right answer on
+      # a fleet that is supposed to have some. Use `DirectoryOrCreate` on a mixed cluster, or turn
+      # this off entirely for a tcp/shm-only pool.
       type: Directory
 
   # AWS Elastic Fabric Adapter.
   #
-  # EFA is requested as an extended resource, advertised by the `aws-efa-k8s-device-plugin`
-  # DaemonSet, which must already be installed on the cluster — this chart does not install it.
-  # Requesting it is what attaches the adapter to the pod; without the request the device is
-  # present on the node and invisible in the container.
+  # EFA is requested as an extended resource advertised by the `aws-efa-k8s-device-plugin`
+  # DaemonSet, which must already be installed on the cluster. This chart does not install it.
+  # Requesting the resource is what attaches the adapter to the pod. Without the request the device
+  # is present on the node and invisible in the container.
   #
-  # Turning this on also needs three things that are *not* implied by it, because each is a claim
-  # only an operator can make:
-  #   - an EFA-capable image (`efa.image.tag`, default `latest-efa`), built on the EFA-enabled
-  #     libfabric base;
-  #   - an `efa` entry in `fabrics` with the label shared by every node in the same subnet —
-  #     EFA does not route, so nodes in different subnets must not share a label;
-  #   - `nodeSelector` narrowed to instance types that have an adapter.
+  # Turning this on also needs three things it does not imply, because each is a claim only an
+  # operator can make:
+  #   - an EFA-capable image, set through `agent.image.tag`
+  #   - an `efa` entry in `fabrics` with the label shared by every node in the same subnet, since
+  #     EFA does not route and nodes in different subnets must not share a label
+  #   - `nodeSelector` narrowed to instance types that have an adapter
+  #
+  # EFA registers large memory regions and pins them, which is why the container is privileged by
+  # default. On a cluster where that is not acceptable, request hugepages through `resources` and
+  # mount them through `extraVolumes` and `extraVolumeMounts`.
   efa:
     enabled: false
     # The extended resource the device plugin advertises. Requests and limits are set to the same
     # value, as Kubernetes requires for extended resources.
     resourceName: vpc.amazonaws.com/efa
     count: 1
-    # Empty means `<image.tag>-efa`. Set to a full tag to pin one, or to "-" to keep the tag
-    # `image.tag` already names.
-    image:
-      tag: ""
-    # EFA registers large memory regions and pins them. Anything but "unlimited" here will show up
-    # as workers failing to register memory rather than as a configuration error, so the chart
-    # leaves the container privileged by default and this is here for the case where it is not.
-    hugepages:
-      enabled: false
-      size: 2Mi
-      amount: 512Mi
 
-  workDir: /run/mxl-replicator
-  # Inbound to the destination node, so open it there.
-  portRange: 24000-24999
-
-  # Rate control on worker *starts*: how many may go into setup at once, and how fast after that.
+  # Rate control on worker starts: how many may go into setup at once, and how fast after that.
   # Agent-local, because it describes what this host can absorb. `startRate: 0` means no limit.
-  startRate: 0.5
-  startBurst: 2
-
-  # Report a flow as no longer producing after its head index has stood still this long.
-  flowIdleAfter: 3s
+  startRate: 1
+  startBurst: 1
 
   logLevel: info
   # MXL_LOG_LEVEL for worker processes. Empty follows `logLevel`.
@@ -392,8 +347,8 @@ agent:
   updateStrategy:
     type: RollingUpdate
     rollingUpdate:
-      # An agent restart glitches every flow on that node. One at a time keeps the blast radius
-      # to one node's flows.
+      # An agent restart glitches every flow on that node. One at a time keeps the blast radius to
+      # one node's flows.
       maxUnavailable: 1
 
   resources:
@@ -406,28 +361,26 @@ agent:
       memory: 1Gi
 
   # The RDMA providers need IPC_LOCK and SYS_RESOURCE, and the worker needs to mmap the domain
-  # files. `privileged` is the reference posture; dropping it and keeping the capabilities works
-  # on some clusters and is worth trying, but it is not what this is tested with.
+  # files. `privileged` is the reference posture. Dropping it and keeping the capabilities works on
+  # some clusters and is worth trying, but it is not what this is tested with.
   privileged: true
   capabilities:
     - IPC_LOCK
     - SYS_RESOURCE
 
-  # Run the agent as uid 0.
+  # Run the agent as uid 0. Required for the RDMA providers on a stock cluster.
   #
-  # **Required for the RDMA providers, and not really optional.** The image's own user is `mxl`
-  # (uid 1000), and a container that starts as a non-root uid gets an *empty effective capability
-  # set* whatever `privileged` says — the caps are in the bounding set and do nothing. So
-  # CAP_IPC_LOCK is not held, RLIMIT_MEMLOCK stays at the runtime's default (8 KiB on containerd),
-  # and the worker dies at `fi_mr_reg` with "Failed to register memory region: Cannot allocate
-  # memory" on the first flow it tries to register — a 1080p v210 ring is ~60 MiB.
+  # The image's own user is `mxl` (uid 1000), and a container that starts as a non-root uid gets an
+  # empty effective capability set whatever `privileged` says. The capabilities are in the bounding
+  # set and do nothing, so CAP_IPC_LOCK is not held, RLIMIT_MEMLOCK stays at the runtime's default
+  # of 8 KiB on containerd, and the worker dies at `fi_mr_reg` on the first flow it registers. A
+  # 1080p v210 ring is about 60 MiB.
   #
-  # It presents as a session that establishes, restarts three times and reports DEGRADED, which
-  # reads as a fabric problem rather than a uid one.
+  # What that looks like from outside is a session that establishes, restarts three times and
+  # reports DEGRADED, which reads as a fabric problem rather than a uid one.
   #
-  # Kubernetes has no ulimit field and no GA ambient-capability support, so raising the limit for
-  # a non-root uid is a node-level containerd change rather than something a chart can express.
-  # Set this false only once you have made it.
+  # Kubernetes has no ulimit field and no GA ambient-capability support, so raising the limit for a
+  # non-root uid is a node-level containerd change. Set this false once you have made it.
   runAsRoot: true
 
   podAnnotations: {}
@@ -437,25 +390,28 @@ agent:
   priorityClassName: ""
   terminationGracePeriodSeconds: 30
 
+  # Appended verbatim to the agent's argument list. Any flag the chart does not surface goes here,
+  # for example `[--agent-flow-idle-after, 5s]`.
   extraArgs: []
   extraEnv: []
   extraVolumes: []
   extraVolumeMounts: []
 
-  # A fleet whose nodes are not alike — an EFA pool beside a verbs pool, or a rack whose areas
-  # live on NVMe.
+  # A fleet whose nodes are not alike, such as an EFA pool beside a verbs pool, or a rack whose
+  # areas live on NVMe.
   #
-  # **Non-empty, this replaces the single DaemonSet with one per pool**, rather than adding to it:
-  # a default pool left running beside these would put a second agent on the nodes they select,
-  # and two agents claiming one node name is a real failure mode — both receive the same
-  # assignments, both start workers, and they fight over ports.
+  # Non-empty, this replaces the single DaemonSet with one per pool rather than adding to it. A
+  # default pool left running beside these would put a second agent on the nodes they select, and
+  # two agents claiming one node name both receive the same assignments, both start workers, and
+  # fight over ports.
   #
   # Each entry is merged over everything above, so a pool states only what differs. Lists replace
-  # rather than append: a pool declaring `fabrics` declares all of them.
+  # rather than append, so a pool declaring `fabrics` declares all of them.
   #
   #   pools:
   #     - name: efa
   #       nodeSelector: {mxl.ebu.org/fabric: efa}
+  #       image: {tag: v0.3.0-efa}
   #       efa: {enabled: true}
   #       fabrics: [{provider: efa, fabric: vpc1-subnet-a, device: rdmap0s6-rdm}]
   #     - name: verbs
@@ -463,7 +419,7 @@ agent:
   #       fabrics: [{provider: verbs, fabric: ib-fabric-a, device: mlx5_0}]
   #
   # `name` is required and becomes the DaemonSet's suffix. Selectors must not overlap, for the
-  # reason above; the chart cannot check that and the server will reject the second claimant.
+  # reason above. The chart cannot check that and the server will reject the second claimant.
   pools: []
 
 # ---------------------------------------------------------------------------------------------
@@ -472,9 +428,9 @@ agent:
 metrics:
   # prometheus.io/scrape annotations on both pods, for a Prometheus that discovers by annotation.
   annotations: true
-  # A prometheus-operator ServiceMonitor for the server. The agents are scraped through the
-  # annotations above or through a PodMonitor; they have no Service, deliberately — hostNetwork
-  # with a hostPort is how a node's metrics are reachable.
+  # A prometheus-operator ServiceMonitor for the server. The agents have no Service, because
+  # hostNetwork with a hostPort is how a node's metrics are reachable, so they are scraped through
+  # the annotations above or through the PodMonitor below.
   serviceMonitor:
     enabled: false
     interval: 30s

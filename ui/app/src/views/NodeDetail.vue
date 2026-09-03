@@ -25,6 +25,7 @@ import { RouterLink } from 'vue-router'
 
 import { api } from '@/api/client'
 import { renderDomain } from '@/api/types'
+import EventLog from '@/components/EventLog.vue'
 import { byteSize, capFlagsText, grantText, pathsTouching } from '@/model/detail'
 import { plural, shortId } from '@/model/labels'
 import { domainRoute, flowRoute, nodeRoute, pathRoute } from '@/router'
@@ -233,6 +234,15 @@ const touching = computed(() => pathsTouching(props.node, fleet.paths))
         </table>
       </section>
     </template>
+
+    <!-- **Outside the `v-else`, deliberately.** The endpoint answers for a node with no registration
+         at all, because a node's log outlives its paths and its lease — after a deregistration it is
+         the only place left that says what happened, which is exactly the page an operator lands on
+         holding a name that is no longer in `/v1/nodes`.
+
+         It is also the log that answers "why did every path on edge-01 re-establish at 12:04" in one
+         line instead of in fifty identical path entries. -->
+    <EventLog :subject="{ kind: 'node', node: props.node }" />
   </main>
 </template>
 

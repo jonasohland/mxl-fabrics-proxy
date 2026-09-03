@@ -4,23 +4,26 @@
 #       ./deployment/mxl-replicator -f examples/efa.yaml
 #
 # Prerequisites this chart does not install:
-#   - the `aws-efa-k8s-device-plugin` DaemonSet, which advertises vpc.amazonaws.com/efa;
+#   - the `aws-efa-k8s-device-plugin` DaemonSet, which advertises vpc.amazonaws.com/efa
 #   - EFA-capable instances, with the adapter attached and the security group allowing all
-#     traffic to and from itself (EFA traffic is not IP and does not match a port rule);
-#   - the `-efa` image, built on the EFA-enabled libfabric base — `make image-efa`.
+#     traffic to and from itself (EFA traffic is not IP and does not match a port rule)
+#   - the `-efa` image, built on the EFA-enabled libfabric base with `make image-efa`.
 
 image:
-  # The agent gets v0.3.0-efa; the server keeps v0.3.0, because it never touches a fabric.
+  # The server never touches a fabric and keeps the stock image.
   tag: v0.3.0
 
 server:
   persistence:
-    type: local
+    type: hostPath
     node: ip-10-0-1-14.eu-central-1.compute.internal
-    # Must already exist on that node: the local volume plugin will not create it.
     hostPath: /mnt/mxl-replicator
 
 agent:
+  # The EFA build, which carries a libfabric with the provider compiled in.
+  image:
+    tag: v0.3.0-efa
+
   # Only instances that have an adapter. Without this the DaemonSet schedules pods that sit
   # Pending on a resource their node does not advertise.
   nodeSelector:

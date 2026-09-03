@@ -36,6 +36,7 @@ import { namespaceOfId } from '@/model/staging'
 import type { TopologyEdge, TopologyNode } from '@/model/topology'
 import { buildTopology } from '@/model/topology'
 import { nodeRoute, pathRoute, requestRoute } from '@/router'
+import { useCurrentStore } from '@/stores/current'
 import { useFleetStore } from '@/stores/fleet'
 
 const fleet = useFleetStore()
@@ -204,8 +205,14 @@ const label = (name: string) => (name.length > 21 ? `${name.slice(0, 20)}…` : 
  *
  * Both dim rather than hide. A topology that removed what it was not about would be a different
  * graph on every click, and the operator would lose the shape they were reading.
+ *
+ * The highlight is the **current namespace** and no longer a control of its own. This view asked
+ * for one before there was anywhere to keep it, and a second namespace picker on the one screen
+ * that already has one in its header is two answers to the same question — an operator who set the
+ * header to `nab` and found the graph undimmed would be right to conclude the header did nothing.
  */
-const highlight = ref('')
+const current = useCurrentStore()
+const highlight = computed(() => current.namespace)
 
 type Selection = { kind: 'node'; name: string } | { kind: 'edge'; key: string }
 
@@ -317,16 +324,14 @@ const edgeTitle = (edge: TopologyEdge) =>
 
       <!-- A highlight, never a filter. Fleet-wide is the whole point: a chain may cross namespaces —
            hop one in `production` writes into edge-01, hop two in `archive` reads from it — so a
-           scoped topology draws two unrelated stubs and loses the thing the view is for. -->
-      <label class="pick" title="Dim everything no request of this namespace holds">
-        highlight
-        <select v-model="highlight">
-          <option value="">all namespaces</option>
-          <option v-for="entry in fleet.namespaces" :key="entry.name" :value="entry.name">
-            {{ entry.name }}
-          </option>
-        </select>
-      </label>
+           scoped topology draws two unrelated stubs and loses the thing the view is for. Set in the
+           header, because it is the same current namespace the rest of the app marks with; said
+           here anyway, since dimming without a legend is the one place it needs explaining. -->
+      <span
+        v-if="highlight"
+        class="pick"
+        title="Everything no request of this namespace holds is dimmed"
+      >highlighting <span class="mono">{{ highlight }}</span></span>
     </header>
 
     <p v-if="topology.layers.length === 0" class="empty">

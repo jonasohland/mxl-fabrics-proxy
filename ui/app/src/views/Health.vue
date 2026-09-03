@@ -7,9 +7,16 @@
  * but not leased, and nodes advertising no writable area — the first thing to check behind a
  * refused request.
  *
- * **Fleet-wide, never namespace-scoped.** Health is a fleet fact; scoped to a namespace, "is
- * anything wrong" answers "is anything wrong in the namespace I happen to have selected", which is
- * the wrong answer at 3am (`ui.md` §7b).
+ * **Fleet-wide, never namespace-scoped, and it is the one screen the current namespace does not
+ * mark.** Health is a fleet fact; scoped — or even tinted — by a namespace, "is anything wrong"
+ * starts answering "is anything wrong in the namespace I happen to have selected", which is the
+ * wrong answer at 3am (`ui.md` §7b). That is the trap `stores/current.ts` introduces and this is
+ * where it would bite, so the rule is written down in both places.
+ *
+ * **Every count is a link into the table it counts.** That is the whole reason a filter lives in
+ * the URL rather than in a component: `12 FAILED` and `/paths?state=FAILED` are the same sentence,
+ * and the screen that says "something is wrong" should be one click from the list of what. A count
+ * of zero is not a link — there is nothing behind it but an empty table with a filter on.
  */
 import { computed } from 'vue'
 import { RouterLink } from 'vue-router'
@@ -18,7 +25,7 @@ import { PATH_STATES, REQUEST_STATES, writableAreas } from '@/api/types'
 import type { RequestState } from '@/api/types'
 import { byWorstFirst } from '@/model/state'
 import { plural } from '@/model/labels'
-import { nodeRoute, requestRoute } from '@/router'
+import { nodeRoute, nodesRoute, pathsRoute, requestRoute, requestsRoute } from '@/router'
 import { useFleetStore } from '@/stores/fleet'
 
 const fleet = useFleetStore()
@@ -73,21 +80,39 @@ const disabledCount = computed(
   <main class="page">
     <section class="counts">
       <div class="group">
-        <h2>Requests <span class="dim">{{ fleet.requests.length }}</span></h2>
+        <h2>
+          <RouterLink class="link" :to="requestsRoute()">Requests</RouterLink>
+          <span class="dim">{{ fleet.requests.length }}</span>
+        </h2>
         <ul>
           <li v-for="entry in requestCounts" :key="entry.state" :class="{ zero: entry.count === 0 }">
-            <span :class="`state-${entry.state}`">{{ entry.state }}</span>
-            <span class="mono">{{ entry.count }}</span>
+            <component
+              :is="entry.count ? RouterLink : 'span'"
+              class="link row"
+              :to="entry.count ? requestsRoute({ state: entry.state }) : undefined"
+            >
+              <span :class="`state-${entry.state}`">{{ entry.state }}</span>
+              <span class="mono">{{ entry.count }}</span>
+            </component>
           </li>
         </ul>
       </div>
 
       <div class="group">
-        <h2>Paths <span class="dim">{{ fleet.paths.length }}</span></h2>
+        <h2>
+          <RouterLink class="link" :to="pathsRoute()">Paths</RouterLink>
+          <span class="dim">{{ fleet.paths.length }}</span>
+        </h2>
         <ul>
           <li v-for="entry in pathCounts" :key="entry.state" :class="{ zero: entry.count === 0 }">
-            <span :class="`state-${entry.state}`">{{ entry.state }}</span>
-            <span class="mono">{{ entry.count }}</span>
+            <component
+              :is="entry.count ? RouterLink : 'span'"
+              class="link row"
+              :to="entry.count ? pathsRoute({ state: entry.state }) : undefined"
+            >
+              <span :class="`state-${entry.state}`">{{ entry.state }}</span>
+              <span class="mono">{{ entry.count }}</span>
+            </component>
           </li>
         </ul>
       </div>
@@ -95,10 +120,26 @@ const disabledCount = computed(
       <div class="group">
         <h2>Fleet</h2>
         <ul>
-          <li><span>nodes registered</span><span class="mono">{{ fleet.nodes.length }}</span></li>
-          <li><span>agents leased</span><span class="mono">{{ leased }}</span></li>
-          <li><span>sessions</span><span class="mono">{{ sessions }}</span></li>
-          <li><span>namespaces</span><span class="mono">{{ fleet.namespaces.length }}</span></li>
+          <li>
+            <RouterLink class="link row" :to="nodesRoute()">
+              <span>nodes registered</span><span class="mono">{{ fleet.nodes.length }}</span>
+            </RouterLink>
+          </li>
+          <li>
+            <RouterLink class="link row" :to="nodesRoute({ lease: 'leased' })">
+              <span>agents leased</span><span class="mono">{{ leased }}</span>
+            </RouterLink>
+          </li>
+          <!-- Sessions are counted off the path list and have no page of their own: every session
+               is some path's session, so the paths table filtered to the ones running *is* the
+               session index (`ui.md` §7 keeps the two apart at the detail level, which it still
+               does). -->
+          <li>
+            <RouterLink class="link row" :to="pathsRoute({ session: 'running' })">
+              <span>sessions</span><span class="mono">{{ sessions }}</span>
+            </RouterLink>
+          </li>
+          <li><span class="row"><span>namespaces</span><span class="mono">{{ fleet.namespaces.length }}</span></span></li>
         </ul>
       </div>
     </section>
@@ -170,7 +211,13 @@ const disabledCount = computed(
   flex-wrap: wrap;
 }
 
+/* Flex rather than inline: Vue's template compiler condenses whitespace containing a newline away
+   entirely, so a heading whose two parts sit on two lines of the template would render them run
+   together. The gap is declared rather than typed. */
 h2 {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
   font-size: 12px;
   font-weight: 600;
   text-transform: uppercase;
@@ -186,15 +233,22 @@ h2 {
   min-width: 190px;
 }
 
-.group li {
+.group li { padding: 2px 0; }
+
+/* The flex lives on the row rather than the `li`, because the row is a link and a link has to be
+   the thing with the width — a count in the far column that was not inside the anchor would be
+   beside the target rather than in it. */
+.group .row {
   display: flex;
   justify-content: space-between;
   gap: 20px;
-  padding: 2px 0;
 }
 
 .group li.zero { color: var(--fg-faint); }
 .group li.zero span { color: inherit !important; }
+
+/* A count of zero is a `span`, so this only ever reaches the ones with something behind them. */
+.group h2 .link { color: inherit; }
 
 .dim { color: var(--fg-dim); font-weight: 400; }
 .ok { color: var(--s-active); }

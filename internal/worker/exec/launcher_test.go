@@ -318,6 +318,23 @@ func TestWorkerOutputIsTranslated(t *testing.T) {
 	assert.Contains(t, out, "MXL_LOG_LEVEL=debug")
 }
 
+// The tail is captured from the same pump that translates the output, and it holds the **raw**
+// lines rather than what the parser made of them (§12.2).
+//
+// That is the half worth pinning: a tail holding only what this parser understood would omit
+// whatever a library on the link line printed on its way out, which is the case where the parser is
+// least likely to be right and the output most likely to matter.
+func TestTheWorkerLogTailIsCaptured(t *testing.T) {
+	launcher, logs := newLauncher(t, nil)
+	handle := start(t, launcher, initiatorSpec())
+	waitReady(t, logs)
+
+	tail := handle.LogTail()
+	require.NotEmpty(t, tail, "the tail must hold what the worker printed")
+	assert.Contains(t, tail, "[", "raw spdlog lines, not the agent's rendering of them")
+	assert.NotContains(t, tail, "module=worker", "the agent's own log format must not leak in")
+}
+
 func TestSweepRemovesOnlyWorkDirectories(t *testing.T) {
 	root := t.TempDir()
 	stale := filepath.Join(root, workDirPrefix+"123")

@@ -72,27 +72,15 @@ The server image.
 {{- end -}}
 
 {{/*
-The agent image, which differs from the server's only when EFA is on: the EFA build carries a
-libfabric with the provider compiled in, and the stock image does not.
-
-`efa.image.tag` empty derives `<tag>-efa`; "-" keeps whatever `image.tag` already names, for a
-deployment whose single image has everything.
+The agent image. Same as the server's unless `agent.image.tag` names another, which is what an EFA
+deployment does: the EFA build carries a libfabric with the provider compiled in and the stock
+image does not.
 
 Usage: include "mxl-replicator.agentImage" (dict "root" $ "agent" $agent)
 */}}
 {{- define "mxl-replicator.agentImage" -}}
 {{- $root := .root -}}
-{{- $tag := default $root.Chart.AppVersion $root.Values.image.tag -}}
-{{- if .agent.efa.enabled -}}
-{{- $override := (default "" (dig "image" "tag" "" .agent.efa)) -}}
-{{- if eq $override "-" -}}
-{{- /* keep $tag */ -}}
-{{- else if $override -}}
-{{- $tag = $override -}}
-{{- else -}}
-{{- $tag = printf "%s-efa" $tag -}}
-{{- end -}}
-{{- end -}}
+{{- $tag := default (default $root.Chart.AppVersion $root.Values.image.tag) (dig "image" "tag" "" .agent) -}}
 {{- if $root.Values.image.registry -}}
 {{- printf "%s/%s:%s" $root.Values.image.registry $root.Values.image.repository $tag -}}
 {{- else -}}
@@ -135,7 +123,7 @@ The token itself, for the Secret the chart creates.
 
 An explicit value wins. Otherwise the existing Secret is read back, so an upgrade does not rotate
 the token out from under a running fleet, and only a first install generates one. `helm template`
-has no cluster to read and so emits a fresh token on every render — which is why the values file
+has no cluster to read and so emits a fresh token on every render, which is why the values file
 says not to pipe it into `kubectl apply` for an existing release.
 */}}
 {{- define "mxl-replicator.authToken" -}}
@@ -167,7 +155,7 @@ variable.
 {{- end -}}
 
 {{/*
-The control-plane URL an agent points at. Explicitly configured servers win; otherwise the
+The control-plane URL an agent points at. Explicitly configured servers win, and otherwise the
 in-cluster Service, with the scheme following whether the server terminates TLS itself.
 */}}
 {{- define "mxl-replicator.serverURLs" -}}
@@ -180,26 +168,31 @@ in-cluster Service, with the scheme following whether the server terminates TLS 
 {{- end -}}
 
 {{/*
-The name of the PVC the server uses, when it uses one.
+The name of the PVC the server uses, when it uses one. An existing claim is named as given, and
+otherwise the chart creates one under its own name.
 */}}
 {{- define "mxl-replicator.storeClaimName" -}}
-{{- if eq .Values.server.persistence.type "existingClaim" -}}
-{{- .Values.server.persistence.existingClaim -}}
+{{- if .Values.server.persistence.pvc.existingClaim -}}
+{{- .Values.server.persistence.pvc.existingClaim -}}
 {{- else -}}
 {{- printf "%s-store" (include "mxl-replicator.fullname" .) -}}
 {{- end -}}
 {{- end -}}
 
-{{- define "mxl-replicator.storePVName" -}}
-{{- printf "%s-%s-store" .Release.Namespace (include "mxl-replicator.fullname" .) -}}
+{{/*
+The sqlite store file, always inside the mounted volume so it cannot be written to the container's
+ephemeral filesystem and lost on restart.
+*/}}
+{{- define "mxl-replicator.storePath" -}}
+{{- printf "%s/store.db" (trimSuffix "/" .Values.server.persistence.mountPath) -}}
 {{- end -}}
 
 {{/*
 The agent's configuration file.
 
-Areas and fabric attachments are lists of records, which is exactly what does not fit on a
-command line — so they go in a file and everything else stays a flag. `node` is deliberately
-absent: it comes from MXL_REPLICATOR_NODE, which is the pod's own spec.nodeName.
+Areas and fabric attachments are lists of records, which is what does not fit on a command line, so
+they go in a file. `node` is deliberately absent. It comes from MXL_REPLICATOR_NODE, which is the
+pod's own spec.nodeName.
 
 Usage: include "mxl-replicator.agentConfig" (dict "root" $ "agent" $agent)
 */}}
@@ -218,8 +211,8 @@ fabrics:
 
 {{/*
 Every area path must be inside a host mount, or the agent advertises a directory the container
-cannot see — which presents as a node that discovers no domains and accepts no destinations,
-a long way from the line that caused it.
+cannot see. That presents as a node which discovers no domains and accepts no destinations, a long
+way from the line that caused it.
 
 Usage: include "mxl-replicator.checkAreaMounts" (dict "root" $ "agent" $agent "pool" $name)
 */}}
@@ -234,7 +227,7 @@ Usage: include "mxl-replicator.checkAreaMounts" (dict "root" $ "agent" $agent "p
 {{- end -}}
 {{- end -}}
 {{- if not $covered -}}
-{{- fail (printf "agent pool %q: area %q has path %q, which is not inside any agent.hostMounts entry — the container cannot see it. Add a hostMounts entry covering it, or correct the path." $.pool $area.name $area.path) -}}
+{{- fail (printf "agent pool %q: area %q has path %q, which is not inside any agent.hostMounts entry, so the container cannot see it. Add a hostMounts entry covering it, or correct the path." $.pool $area.name $area.path) -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}

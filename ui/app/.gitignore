@@ -1,6 +1,12 @@
 node_modules/
-dist/
 *.tsbuildinfo
+
+# The build output stays out of the repository, but the directory itself does not: `ui/embed.go`
+# embeds `app/dist`, and go:embed of a missing directory is a compile error — committing nothing
+# here would mean `go build ./...` required a working npm first. The placeholder is what keeps the
+# Go build and the node build independent of each other.
+dist/*
+!dist/.gitkeep
 
 # The repository root ignores `*.json` — aimed at build artefacts like `compile_commands.json` —
 # which would otherwise take this project's manifests with it and leave a checkout that cannot

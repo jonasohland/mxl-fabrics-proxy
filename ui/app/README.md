@@ -3,18 +3,30 @@
 A Vue 3 SPA for the control plane. `ui.md` is the design and the reasoning; `docs/architecture.md`
 is the specification. This file is how to run it and what the code is arranged to protect.
 
-**Status: the landing page, the matrix and the ledger — the matrix's cell gesture, the two editors
-that author its axes, and `duplicate` and `split`.** What is left is the detail views and
-domain-label writes.
+**Status: all three of `ui.md` §7's read verbs, the workspace, and the writes around it.** What is
+left is the manifest pane, which is postponed rather than pending — see the end of this section.
 
-- **The landing page** — `ui.md` §7's fleet health. Counts, then only what is not active, worst-first,
-  each with its reason. Fleet-wide, never namespace-scoped.
+- **Health** — §7's `status`. Counts, then only what is not active, worst-first, each with its
+  reason. Fleet-wide, never namespace-scoped, and the one screen the current namespace does not even
+  mark. Every count links into the table it counts.
+- **The three tables** — §7's `get`: `/nodes`, `/paths`, `/requests`, fleet-wide and read-only, with
+  their filters in the URL. They cost no reads — all three lists are already on the single poll —
+  and they are what makes the detail views reachable at all, which until they existed they were not
+  unless some other screen happened to mention the thing.
+- **The six detail views** — §7's `describe`, a route per noun, with `path` and `session` kept apart.
+- **The topology** — §7's fourth item, and the view an operator cannot assemble from a terminal.
 - **The matrix** — §7a's workspace, over an `exclusive` namespace. Rows are sources, columns are
   destinations, a request is a **rectangle** over them; both axes are read out of the requests, both
-  are banded by node, and a parked destination keeps its column.
+  are banded by node, and a parked destination keeps its column. The cell gesture, the two editors
+  that author its axes, and `duplicate` and `split`.
 - **The ledger** — §7c's claims view. Grouped by destination, one row per path, every claim carrying
   the selector that made it, `sole`/`shared` per request, and a rectangle per request so parked legs
   are drawable.
+
+**The navigation is two kinds of destination in one bar, and the split is real rather than
+cosmetic.** The namespace picker is scoped and writes; `health nodes paths requests topology` are
+fleet-wide and read. The picker goes first because the workspace is where an operator spends the day
+and was, until this arrangement, the one screen with no control in the header at all.
 
 A namespace's `paths` mode decides which of the two the workspace opens on, because a `shared`
 namespace **is not a matrix**: two requests may hold one path there, so two cells would be one
@@ -58,8 +70,7 @@ cell, and a control rather than a mode of the click because **it creates a name*
 entries whole — a parked leg stays parked, a per-destination `provider` override comes along — and
 the request-level settings with them.
 
-What is not built: domain-label writes with their `stopped[]`/`started[]` preview, and the detail
-views. `ui/prototype/` is no longer the only implementation of anything on screen. The
+`ui/prototype/` is no longer the only implementation of anything on screen. The
 **manifest pane** `ui.md` §7a asks for is postponed rather than pending — `docs/open-items.md` §3.4,
 where it turned into a question about the system: nothing in this tree renders a manifest at all, so
 the first thing that does should probably not be a second implementation of the grammar in
@@ -95,6 +106,33 @@ path touching that node. Paths reach `ESTABLISHING` and stop, because nothing ru
 the useful fixture rather than a limitation — it is the state an operator watches while something
 comes up.
 
+## Ship it
+
+The built app is compiled into the server binary and served at `/`, which is the first of `ui.md`
+§6's two same-origin shapes — the other being a proxy fronting both, which needs nothing from here.
+
+```bash
+make ui           # npm ci && npm run build, into ui/app/dist
+make replicator   # go build; ui/embed.go embeds whatever is in that directory
+build/mxl-replicator run --server --server-ui
+```
+
+`make replicator-ui` is the two in order, and `docker build` does both in stages of its own.
+
+Three things worth knowing about the seam:
+
+- **`--server-ui` is off by default and fails loudly rather than serving nothing.** Whether a binary
+  carries the app depends on whether the node build ran before the Go one, which is not something an
+  operator looking at a blank page can see — so a binary without assets refuses to start with the
+  flag rather than answering `/` with a 404.
+- **`ui/app/dist` is not committed, but the directory is.** A `go:embed` of a missing directory is a
+  compile error, so `dist/.gitkeep` is tracked to keep `go build ./...` working without npm. Do not
+  delete it.
+- **The assets are served outside the bearer-token middleware, and no route can shadow an API one.**
+  The mount is bare `/`, matched only after every API pattern, with an index fallback for the
+  router's own paths — and none for a miss under `assets/`, which is a stale bundle reference and
+  deserves the 404 it gets. `internal/server/static.go` is the whole of it.
+
 ## Tests
 
 ```bash
@@ -120,7 +158,10 @@ the reason the prototype's harness gave: a fixture left behind by an earlier run
 assertions a statement about the store's history rather than about the rule. `Staging.live.ts` seeds
 and then deletes a `staged` namespace of its own, routed clear of every other fixture, and drives the
 gesture end to end: click, stage, dry-run, apply, and the server agreeing that the leg is parked and
-its paths gone. `Editors.live.ts` seeds an `authored` namespace and drives the other half — name a
+its paths gone. `Index.live.ts` seeds `idx` (exclusive) and `idxs` (shared) and drives the
+navigation: that a filter survives being the only thing in the address bar, that a facet counts
+against the other facets, that the current namespace marks rows without removing any, and that a URL
+naming a screen a namespace cannot have corrects itself rather than lying. `Editors.live.ts` seeds an `authored` namespace and drives the other half — name a
 destination, author a source, route them with a cell click, apply, add a second source to the request
 that made, then duplicate that rectangle and split a source back out of it. The `k8s` fixture `Ledger.live.ts` reads is the one in `ui.md` §9 and is seeded by
 hand.
@@ -132,9 +173,11 @@ of the API's answer alone is a race, and this suite has lost it once.
 **jsdom does no layout, so the suites are structurally blind to geometry.** Every alignment bug in
 this app so far was found by screenshotting the real page — a `th` given `display: flex` stopping
 being a table cell, a header row taking its widths from the node bands above it, a two-fact line
-running its two facts together, and a line class named `head` inheriting `flex-wrap: wrap` from the
-page header's own `.head` so a hidden `×` wrapped onto a second row. Keep this in the loop for
-anything visual:
+running its two facts together, a line class named `head` inheriting `flex-wrap: wrap` from the
+page header's own `.head` so a hidden `×` wrapped onto a second row, and the nodes table rendering
+`bulkread+write` because Vue's compiler condenses away a whitespace text node containing a newline —
+so a space written between two elements in a template is not a space. Declare the gap; do not type
+it. Keep this in the loop for anything visual:
 
 ```bash
 google-chrome-stable --headless --disable-gpu --no-sandbox --hide-scrollbars \
@@ -147,6 +190,49 @@ google-chrome-stable --headless --disable-gpu --no-sandbox --hide-scrollbars \
 Things here that are load-bearing rather than incidental. Each mirrors a rule in `ui.md`, and most
 have a test named after them.
 
+- **A filter is a predicate applied at render, never a stored subset.** The fleet is replaced
+  wholesale every poll, so a list filtered once and held is a torn read wearing a filter — rows from
+  this poll beside rows from the last, with no banner to say so. `model/filters.ts` is pure and takes
+  the rows as an argument for exactly that reason.
+- **The filter is in the URL and the current namespace is not, and the line between them is what
+  each changes.** A filter changes which rows *exist*, so `/paths?state=FAILED` has to render the
+  same list for whoever opens it — which a component-local `ref` cannot promise, and which is what
+  makes a health count and a chip the same sentence. A highlight changes only which rows are
+  *marked*; the page is about the same thing either way, so it is a viewing preference and stays out.
+- **`/paths` has no namespace filter, and that is the model rather than an omission.** A namespace is
+  not a property of an edge: a path can be claimed by requests in several at once, which is what
+  `requests[]` is. `?ns=` could therefore only mean *claimed by at least one request in*, which is
+  the ledger's question and is answered there properly, with the selector that made each claim and
+  `sole`/`shared` beside it. So the current namespace marks rows there and hides none.
+  `/requests?ns=` **is** legal, for the mirror reason: `namespace` is a field on a spec and a request
+  is in exactly one.
+- **The picker sets the current namespace, and that is its only rule.** On a namespace-scoped route
+  the current namespace *is* the URL, so setting it navigates; on a fleet-wide one it re-marks and
+  must not yank an operator off the list they were reading. That looks like two behaviours and is
+  one. It used to have a null option — `⟨fleet health⟩`, which was how you *left* a namespace — and
+  once health had a page of its own that option was a page reached by choosing "not a namespace"
+  from a namespace picker.
+- **So the picker is a pair, and the link half is not optional.** Not navigating from a fleet-wide
+  screen is right and on its own it left the workspace with **no entry point at all** from four of
+  the five screens in the bar — the select would mark rows and offer nothing onward. The `workspace`
+  link beside it is the way in, and it goes to the *bare* `/ns/:namespace`, the route that means
+  "whichever screen this namespace has": a link naming `grid` would be wrong for every `shared`
+  namespace in the list and would read as a third tab beside the two the workspace already has.
+- **Health never takes the mark**, which is the trap the current namespace introduces. Scoped, or
+  even tinted, by a namespace, "is anything wrong" starts answering "is anything wrong in the
+  namespace I happen to have selected" — the wrong answer at 3am. The rule is written in
+  `stores/current.ts` and again in `views/Health.vue`, because it is the kind that gets helpfully
+  undone.
+- **Which of the workspace's two screens is on lives in the URL.** It was a local `ref`, so `/ns/nab`
+  named the namespace and not the screen and the claims view could not be linked at all. Bare
+  `/ns/nab` is still legal and means *whichever screen this namespace has* — the mode-agnostic link,
+  and not something a redirect could produce, since routing happens before the first poll knows the
+  mode. A URL asking for the grid of a `shared` namespace is corrected rather than rendered: the
+  whole point of putting the view in the URL is that the URL names what is on screen.
+- **A facet counts against the other facets and not against its own.** Counted after its own facet
+  had been applied, every chip but the selected one would read 0 and the row would stop being a way
+  to move between them. A selected value that has stopped matching stays on screen at zero, or there
+  is no way to click it off.
 - **Relative URLs only, and no API base.** The UI is always same-origin with the API — served by the
   server binary, or behind a proxy fronting both. A configurable base is what leads to CORS, and
   production will not have CORS. Development fakes the origin with Vite's proxy (`vite.config.ts`).
@@ -154,9 +240,14 @@ have a test named after them.
   to be a node, inject fabricated inventory and read every node's RDMA rkeys. The proxy does not
   forward it and `src/api/client.ts` has no method for it. Both are deliberate; neither is enough
   alone.
-- **No auth surface.** Auth is one optional shared bearer token that also guards the agent API, so a
-  token the browser holds hands whoever loads the page that whole surface. The supported answer is
-  that the proxy or the server injects the header on the way through, which needs nothing from here.
+- **The token is asked for by a 401, never by its own absence.** Auth is one optional shared bearer
+  token that also guards the agent API, so a token the browser holds hands whoever loads the page
+  that whole surface. The preferred answer is still that the proxy or the server injects the header
+  on the way through — and that deployment never sees the prompt, because it never gets refused.
+  Where nothing injects it, `components/TokenGate.vue` asks and `api/auth.ts` keeps it in
+  `localStorage`; the header carries a `token · forget` control wherever one is held. Only a `/v1`
+  status moves that state: `/readyz` is unauthenticated and polled concurrently, so counting its 200
+  as evidence would flap the gate twice a poll.
 - **One timer, one set of reads, one replacement.** Every user-API GET costs the server a full store
   load plus a reconcile over the whole fleet — O(fleet), not O(response). `stores/fleet.ts` polls
   once for everything the screen needs and skips a hidden tab.
@@ -209,6 +300,12 @@ have a test named after them.
   be a small control in a corner that tears something down. Park, apply, then `×`. The row's `×` is
   the exception and stays destructive, because there is no flag on a source and so no dark state to
   require — it says what it will stop rather than being made to look safe.
+- **A `×` states its cost from what the *server* is carrying, never from what the grid is drawing.**
+  The two are the same number until something is staged and then they are not: the board renders the
+  staged set, so a leg drops out of `cell.count` the instant a park is clicked, while the paths under
+  it are still up and a removal still stops every one of them. `carrying` is the second number and it
+  is what all three `×`s read — the drawn count would make a control say "carrying nothing" over
+  media it is about to tear down, which is exactly what "dark means dark on the server" forbids.
 - **A draft is a spec, and it is the boundary of the rule below rather than an exception to it.** The
   reason an edit must not be a copied spec is that the server's copy moves underneath it. A request
   that does not exist has no copy, so the operator's text is the only text there is. It is held to

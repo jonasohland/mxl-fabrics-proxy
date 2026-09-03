@@ -40,6 +40,20 @@ test:
 replicator:
 	go build -ldflags "$(GO_LDFLAGS)" -o build/mxl-replicator ./cmd/mxl-replicator
 
+# The web UI, built into ui/app/dist, from where `ui/embed.go` compiles it into the binary.
+#
+# Deliberately not a prerequisite of `replicator` or of `all`: a Go build must not require a node
+# toolchain, and the binary is complete without the UI — `--server-ui` is the flag that asks for it
+# and it refuses to start when there is nothing behind it. Run this first, or `make replicator-ui`,
+# when the assets are wanted.
+.PHONY: ui
+ui:
+	npm --prefix ui/app ci
+	npm --prefix ui/app run build
+
+.PHONY: replicator-ui
+replicator-ui: ui replicator
+
 .PHONY: proxy-legacy
 proxy-legacy:
 	go build -o build/mxl-fabrics-proxy ./legacy/go/cmd/mxl-fabrics-proxy

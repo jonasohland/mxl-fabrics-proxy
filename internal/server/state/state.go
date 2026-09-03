@@ -257,8 +257,13 @@ type Fleet struct {
 //
 // Keys outside the three layers are ignored rather than reported: leader election writes under
 // this key space too, and a future addition must not read as corruption to an older server.
+//
+// The list is scoped to [store.PrefixSnapshot] rather than to the empty prefix, which is what
+// keeps the event log out of it (§12.1). Ignoring those keys after reading them would not be
+// enough — every user-API read runs this function, so a full list would pull every object's ring
+// and every stored log tail over the wire on every read, to discard them.
 func Load(ctx context.Context, s store.Store) (*Fleet, error) {
-	kvs, revision, err := s.List(ctx, "")
+	kvs, revision, err := s.List(ctx, store.PrefixSnapshot)
 	if err != nil {
 		return nil, fmt.Errorf("load fleet: %w", err)
 	}

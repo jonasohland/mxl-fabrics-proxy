@@ -1354,6 +1354,7 @@ func (b *builder) assign(plan *pathPlan, record state.SessionRecord, flow api.Fl
 
 	common := api.Assignment{
 		SessionID:                   record.ID,
+		PathID:                      plan.id,
 		FlowID:                      src.Flow,
 		Interface:                   record.Interface,
 		Fabric:                      record.Fabric,

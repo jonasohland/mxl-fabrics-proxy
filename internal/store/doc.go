@@ -22,18 +22,25 @@
 //
 // # The key space
 //
-// Desired, observed and derived state (§4) live under separate top-level prefixes, so that the
-// three can carry different compaction and backup policy (§8.3) and so that a watch can be
-// scoped to one of them:
+// Desired, observed and derived state (§4) live under separate prefixes, so that the three can
+// carry different compaction and backup policy (§8.3) and so that a watch can be scoped to one of
+// them — and all three sit under one root, so that a single range covers exactly the state:
 //
-//	/desired/nodes/<node>           registration: attachments, versions, domains, port range
-//	/desired/requests/<id>          replication requests
-//	/desired/policy                 operator policy: provider order, budgets
-//	/observed/leases/<node>         leased — instance uuid, agent version
-//	/observed/inventory/<node>      leased — full snapshot (§9.2)
-//	/observed/status/<node>         leased — full snapshot of sessions actually running
-//	/derived/sessions/<session-id>  session record: negotiated interface config
-//	/derived/assignments/<node>     written only by the reconciler
+//	/state/desired/nodes/<node>           registration: attachments, versions, areas, port range
+//	/state/desired/requests/<ns>/<name>   replication requests
+//	/state/desired/policy                 operator policy: provider order, budgets
+//	/state/observed/leases/<node>         leased — instance uuid, agent version
+//	/state/observed/inventory/<node>      leased — full snapshot (§9.2)
+//	/state/observed/status/<node>         leased — full snapshot of sessions actually running
+//	/state/derived/sessions/<session-id>  session record: negotiated interface config
+//	/state/derived/assignments/<node>     written only by the reconciler
+//	/events/paths/<path-id>               bounded event ring (§12.1)
+//	/events/logs/<path-id>                the last failing worker's log tail (§12.2)
+//
+// The nesting is load-bearing rather than decorative — see [PrefixSnapshot]. The event log is
+// outside it on purpose: it is diagnostics *about* the three layers rather than state of its own,
+// nothing reconciles against it, and a snapshot that carried it would make every user-API read pay
+// for a log it ignores.
 //
 // Observed state is written **under a lease**, so an agent that goes away garbage-collects
 // itself (§8.3) and the server never has to distinguish "this node reported nothing" from

@@ -88,7 +88,13 @@ describe('node detail', () => {
     const touching = paths.filter((p) => p.source.node === 'edge-01' || p.destination.node === 'edge-01')
     expect(touching.length, 'fixture has no path touching edge-01').toBeGreaterThan(0)
 
-    const rows = wrapper.findAll('.dt-table').at(-1)!.findAll('tbody tr')
+    // Selected by its `role` column rather than as "the last table on the page", which it stopped
+    // being when the event log pane landed under it. A positional selector on a view that grows
+    // sections is a test that fails for the next author rather than for a bug.
+    const table = wrapper.findAll('.dt-table').find((el) => el.find('thead').text().includes('role'))
+    expect(table, 'no table on the node view has a role column').toBeTruthy()
+
+    const rows = table!.findAll('tbody tr')
     expect(rows).toHaveLength(touching.length)
     expect(rows[0]!.text()).toMatch(/initiator|target/)
   })
@@ -310,8 +316,9 @@ describe('path and session, which are two views on purpose', () => {
     const gone = await mountAt('/paths/00000000000000000000000000000000')
     const missing = gone.find('.dt-missing')
     expect(missing.text()).toContain('No path')
-    // The why is a title, as everything that is training rather than data is (`ui-plan.md` §2).
-    expect(missing.attributes('title')).toContain('only while some request expands onto it')
+    // The absence of a banner is the assertion. There is deliberately no explanatory title here:
+    // a detail view addressed by URL is routinely a thing that has gone away, and saying so plainly
+    // is the whole of what this line owes an operator (`styles/detail.css`, `.dt-missing`).
     expect(gone.find('.banner-bad').exists()).toBe(false)
     gone.unmount()
   })

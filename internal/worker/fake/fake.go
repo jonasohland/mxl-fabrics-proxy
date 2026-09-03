@@ -252,6 +252,7 @@ type Handle struct {
 	exit   worker.Exit
 	done   bool
 	nStops int
+	tail   string
 
 	dead   chan struct{}
 	exited chan worker.Exit
@@ -265,6 +266,21 @@ func (h *Handle) Spec() worker.Spec { return h.spec }
 // Seq is the 1-based start sequence number of this handle within its launcher. Useful for
 // asserting *which* start a handle came from when a session has restarted.
 func (h *Handle) Seq() int { return h.seq }
+
+// LogTail implements [worker.Handle].
+func (h *Handle) LogTail() string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.tail
+}
+
+// SetLogTail sets what this worker will claim to have printed, so a test can assert that the
+// sentence explaining a failure reaches the server with the failure (§12.2).
+func (h *Handle) SetLogTail(text string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.tail = text
+}
 
 // TargetInfo implements [worker.Handle].
 func (h *Handle) TargetInfo(ctx context.Context) (string, error) {

@@ -5,18 +5,17 @@
 {{- /*
 One agent per node.
 
-**No per-node ConfigMap of subscriptions, and no reloader.** What a node is replicating lives in
-the API and is applied with `mxl-replicator apply`, so the only thing here is provisioning — node
-name, areas, fabric attachments, server URL, port range — which changes when the host is built
-rather than when a flow is routed. That is what collapsed the agent's restart rate down to
-upgrades.
+There is no per-node ConfigMap of subscriptions and no reloader. What a node is replicating lives
+in the API and is applied with `mxl-replicator apply`, so the only thing here is provisioning: node
+name, areas, fabric attachments, server URL, port range. That changes when the host is built rather
+than when a flow is routed, which is what keeps the agent's restart rate down to upgrades.
 
-**No node-address init container either.** The agent execs the worker's `--interfaces` probe and
-asks libfabric what this node actually has, instead of a script guessing from the environment.
+There is no node-address init container either. The agent execs the worker's `--interfaces` probe
+and asks libfabric what this node actually has, instead of a script guessing from the environment.
 
-`agent.pools`, when non-empty, replaces the single DaemonSet with one per pool — a fleet whose
+`agent.pools`, when non-empty, replaces the single DaemonSet with one per pool, for a fleet whose
 nodes are not alike. Each pool is merged over everything in `agent`, and their node selectors must
-not overlap: two agents claiming one node name is a real failure mode, and the server rejects the
+not overlap. Two agents claiming one node name is a real failure mode and the server rejects the
 second claimant.
 */}}
 {{- if and (not .Values.server.enabled) (not .Values.agent.servers) }}
@@ -43,17 +42,12 @@ second claimant.
 {{- $config := include "mxl-replicator.agentConfig" (dict "root" $root "agent" $a) }}
 {{- include "mxl-replicator.checkAreaMounts" (dict "root" $root "agent" $a "pool" (default "default" $name)) }}
 
-{{- /* EFA and hugepages are extended resources: requests and limits must be equal. */}}
+{{- /* EFA is an extended resource: requests and limits must be equal. */}}
 {{- $req := deepCopy (dig "resources" "requests" (dict) $a) }}
 {{- $lim := deepCopy (dig "resources" "limits" (dict) $a) }}
 {{- if $a.efa.enabled }}
 {{- $_efaReq := set $req $a.efa.resourceName $a.efa.count }}
 {{- $_efaLim := set $lim $a.efa.resourceName $a.efa.count }}
-{{- if $a.efa.hugepages.enabled }}
-{{- $hp := printf "hugepages-%s" (toString $a.efa.hugepages.size) }}
-{{- $_hpReq := set $req $hp $a.efa.hugepages.amount }}
-{{- $_hpLim := set $lim $hp $a.efa.hugepages.amount }}
-{{- end }}
 {{- end }}
 ---
 apiVersion: v1
@@ -70,8 +64,8 @@ metadata:
   {{- end }}
 data:
   # Areas and fabric attachments are lists of records, which is what does not fit on a command
-  # line. Everything else the agent takes is a flag. `node` is absent on purpose: it comes from
-  # MXL_REPLICATOR_NODE, which is the pod's own spec.nodeName.
+  # line. `node` is absent on purpose. It comes from MXL_REPLICATOR_NODE, which is the pod's own
+  # spec.nodeName.
   agent.yaml: |
     {{- $config | nindent 4 }}
 ---
@@ -148,8 +142,8 @@ spec:
             name: {{ $fullname }}
         - name: workdir
           # Per-worker-instance working directories: a config.json, a metrics socket, and for a
-          # target a target-info.json. emptyDir on purpose — the agent holds no state that has to
-          # survive a restart, and a fresh directory per worker *start* is what keeps a leftover
+          # target a target-info.json. emptyDir on purpose, because the agent holds no state that
+          # has to survive a restart, and a fresh directory per worker start keeps a leftover
           # metrics socket from being a fatal EADDRINUSE.
           emptyDir:
             medium: Memory
@@ -165,11 +159,6 @@ spec:
             path: {{ $a.devices.infiniband.path }}
             type: {{ default "Directory" $a.devices.infiniband.type }}
         {{- end }}
-        {{- if and $a.efa.enabled $a.efa.hugepages.enabled }}
-        - name: hugepages
-          emptyDir:
-            medium: HugePages
-        {{- end }}
         {{- with $a.extraVolumes }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
@@ -177,6 +166,11 @@ spec:
         - name: agent
           image: {{ include "mxl-replicator.agentImage" (dict "root" $root "agent" $a) }}
           imagePullPolicy: {{ $root.Values.image.pullPolicy }}
+          {{- /*
+          Only what the chart itself decides. Every other agent flag is left at the binary's
+          default and reachable through `extraArgs`, so this list does not have to be kept in step
+          with the binary's defaults.
+          */}}
           args:
             - run
             - --agent
@@ -184,16 +178,12 @@ spec:
             - /etc/mxl-replicator/agent.yaml
             - --agent-listen
             - {{ printf "0.0.0.0:%v" $a.listenPort | quote }}
-            - --agent-work-dir
-            - {{ $a.workDir | quote }}
             - --agent-port-range
             - {{ $a.portRange | quote }}
             - --agent-start-rate
             - {{ $a.startRate | quote }}
             - --agent-start-burst
             - {{ $a.startBurst | quote }}
-            - --agent-flow-idle-after
-            - {{ $a.flowIdleAfter | quote }}
             {{- if $a.detectDefaultFabric }}
             - --agent-detect-default-fabric
             {{- end }}
@@ -219,18 +209,19 @@ spec:
           ports:
             - name: http
               containerPort: {{ $a.listenPort }}
-              {{- if or $a.hostPort $a.hostNetwork }}
+              {{- if and $a.hostPort (not $a.hostNetwork) }}
+              # Under hostNetwork the port is already on the host and this field is redundant.
               hostPort: {{ $a.listenPort }}
               {{- end }}
               protocol: TCP
           readinessProbe:
-            # /healthz, because the agent serves no /readyz — its HTTP surface is health and this
-            # node's metrics, and nothing else. So this proves the process is up and serving and
+            # /healthz, because the agent serves no /readyz. Its HTTP surface is health and this
+            # node's metrics and nothing else, so this proves the process is up and serving and
             # says nothing about whether it has registered.
             #
             # It is here rather than omitted because a DaemonSet's rolling update waits on
-            # readiness to move to the next node, and with no probe at all a pod counts as ready
-            # the instant the container starts — which would roll the whole fleet at the speed of
+            # readiness to move to the next node. With no probe at all a pod counts as ready the
+            # instant the container starts, which would roll the whole fleet at the speed of
             # `docker run` while every node's flows are still re-establishing.
             httpGet:
               path: /healthz
@@ -239,7 +230,7 @@ spec:
             periodSeconds: 5
             timeoutSeconds: 3
           livenessProbe:
-            # /healthz stays green when a transfer is failing, deliberately: a peer being
+            # /healthz stays green when a transfer is failing, deliberately. A peer being
             # unreachable is no reason to restart this agent and drop every other flow on the
             # node. Failure is made observable through status and metrics instead.
             httpGet:
@@ -272,7 +263,7 @@ spec:
             capabilities:
               add:
                 # Required by the RDMA providers. These gate whether the agent *advertises* an
-                # attachment at all; they never go over the wire.
+                # attachment at all. They never go over the wire.
                 {{- toYaml . | nindent 16 }}
             {{- end }}
           volumeMounts:
@@ -280,7 +271,10 @@ spec:
               mountPath: /etc/mxl-replicator
               readOnly: true
             - name: workdir
-              mountPath: {{ $a.workDir }}
+              # The binary's default --agent-work-dir. Overriding it through extraArgs means
+              # moving this mount with extraVolumeMounts, or the working directories land on the
+              # container filesystem instead of the tmpfs below.
+              mountPath: /run/mxl-replicator
             {{- range $mount := $a.hostMounts }}
             - name: {{ $mount.name }}
               mountPath: {{ $mount.mountPath }}
@@ -288,10 +282,6 @@ spec:
             {{- if $a.devices.infiniband.enabled }}
             - name: infiniband
               mountPath: {{ $a.devices.infiniband.path }}
-            {{- end }}
-            {{- if and $a.efa.enabled $a.efa.hugepages.enabled }}
-            - name: hugepages
-              mountPath: /dev/hugepages
             {{- end }}
             {{- with $a.extraVolumeMounts }}
             {{- toYaml . | nindent 12 }}

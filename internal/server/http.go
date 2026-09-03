@@ -41,6 +41,7 @@ func (s *Server) routes() http.Handler {
 	agent.HandleFunc("POST "+api.AgentPrefix+"/{node}/heartbeat", s.handleHeartbeat)
 	agent.HandleFunc("POST "+api.AgentPrefix+"/{node}/inventory", s.handleInventory)
 	agent.HandleFunc("POST "+api.AgentPrefix+"/{node}/status", s.handleStatus)
+	agent.HandleFunc("POST "+api.AgentPrefix+"/{node}/events", s.handleAgentEvents)
 	agent.HandleFunc("GET "+api.AgentPrefix+"/{node}/assignments", s.handleAssignments)
 
 	// Requests live under their namespace, because `(namespace, name)` is a request's ID (§9.3).
@@ -62,10 +63,26 @@ func (s *Server) routes() http.Handler {
 	user.HandleFunc("GET "+api.PathFlows, s.handleFlows)
 	user.HandleFunc("GET "+api.PathPaths, s.handlePaths)
 
+	// The event log (§12.1) and the log tails of §12.2. These are the only user-API reads that do
+	// not run Compute: a ring is a record of what already happened, so there is nothing to
+	// recompute and nothing that could drift.
+	user.HandleFunc("GET "+api.PathPaths+"/{id}/events", s.handlePathEvents)
+	user.HandleFunc("GET "+api.PathPaths+"/{id}/logs", s.handlePathLogs)
+	user.HandleFunc("GET "+api.PathNamespaces+"/{ns}/requests/{name}/events", s.handleRequestEvents)
+	user.HandleFunc("GET "+api.PathNodes+"/{node}/events", s.handleNodeEvents)
+
 	// One middleware per surface, so that adding per-node credentials or mTLS to the agent API
 	// later does not touch the user API — or any handler (§13).
 	mux.Handle(api.AgentPrefix+"/", s.authenticate(surfaceAgent, agent))
 	mux.Handle(api.UserPrefix+"/", s.authenticate(surfaceUser, user))
+
+	// The web UI, when this binary was built with it and `--server-ui` asked for it. Registered
+	// last and matched last: every pattern above is more specific, so the app cannot shadow an API
+	// route however the router's own paths are spelled. See [staticUI] for why it is outside
+	// [Server.authenticate].
+	if s.ui != nil {
+		mux.Handle("/", staticUI(s.ui))
+	}
 
 	return s.recoverPanics(noStore(mux))
 }

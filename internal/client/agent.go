@@ -94,6 +94,25 @@ func (c *Client) ReportStatus(ctx context.Context, snapshot api.StatusSnapshot) 
 	})
 }
 
+// ReportEvents performs POST /agent/v1/{node}/events: a batch of diagnostic entries for the event
+// log (§9.2, §12.1).
+//
+// **The one agent report that is a stream rather than a snapshot**, and the reason it is a
+// separate call rather than a field on [Client.ReportStatus]: `status` is compared before sending
+// (§6), and an event folded into a compared snapshot is dropped when it repeats and re-sent
+// forever when it does not.
+//
+// Delivery is at-least-once. The caller must be prepared to send a batch again — the agent holds
+// no persistent state (§6.1) and cannot guarantee exactly-once — and the server de-duplicates on
+// [api.AgentEvent.Seq], which is per agent instance.
+func (c *Client) ReportEvents(ctx context.Context, batch api.EventBatch) error {
+	return c.do(ctx, request{
+		method: http.MethodPost,
+		path:   api.EventsPath(batch.Node),
+		body:   batch,
+	})
+}
+
 // Assignments performs GET /agent/v1/{node}/assignments?rev=&wait=: the long poll that carries
 // the complete set of workers this node should be running (§9.2).
 //

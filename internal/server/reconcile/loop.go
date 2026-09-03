@@ -40,6 +40,38 @@ type LoopOptions struct {
 
 	// Hooks report what the loop did, for metrics. Optional.
 	Hooks Hooks
+
+	// Journal is where this loop records what it observed (§12.1). Optional: nil disables the
+	// event log entirely, which is what the read-only handlers and most tests want.
+	Journal Journal
+
+	// NoInventoryEvents suppresses the flow and domain entries of §12.1 on each node's ring.
+	//
+	// **Spelled negatively so that the zero value is the default behaviour**, which is on — the
+	// same shape [Config.NoNetworkLatencyMeasurement] takes, and for the same reason: a
+	// default-constructed config must behave the way the product does, or an embedder silently
+	// gets something the flags say they would not.
+	//
+	// It has a switch at all because this is the one part of the log whose volume is set by the
+	// **fleet** rather than by the control plane: a node's flows are whatever its producers are
+	// doing.
+	NoInventoryEvents bool
+}
+
+// Journal is the event log as the reconcile loop needs it (§12.1).
+//
+// An interface rather than the concrete recorder, for the same reason [Hooks] is a set of
+// callbacks: it keeps this package testable without a store behind it, and it makes the
+// dependency one-way — the log observes the reconciler and the reconciler never reads the log,
+// which is what keeps [Compute] a pure function of one snapshot (§7.3).
+type Journal interface {
+	// Record appends a batch to one object's ring. Called at most once per object per pass:
+	// store revisions are not free (§8.1).
+	Record(ctx context.Context, key string, batch ...api.Event) error
+
+	// ForgetPath drops everything retained about a path, because a path's log dies with the
+	// path (§12.1).
+	ForgetPath(ctx context.Context, pathID string) error
 }
 
 // Outcome is how one reconcile pass ended.
@@ -103,6 +135,11 @@ type Loop struct {
 	// no epoch transitions — which is right, because this replica did not see one.
 	observed *Observation
 	epochs   map[string]string
+
+	// journal is the previous pass's view, for computing transitions. Leader-local for the same
+	// reason as the two above, and reset on losing leadership so that the next leader declares a
+	// gap rather than inventing transitions across it.
+	journal *journal
 }
 
 // Observation is what one reconcile pass saw, kept so that metrics can be served without a
@@ -171,6 +208,7 @@ func (l *Loop) lead(leading bool) {
 	l.leading = leading
 	if !leading {
 		l.observed, l.epochs, l.settled = nil, nil, false
+		l.journal.reset()
 	}
 }
 
@@ -188,7 +226,11 @@ func NewLoop(opts LoopOptions) *Loop {
 	}
 	opts.Config.Now = opts.Now
 
-	return &Loop{opts: opts, idle: newIdleTracker(opts.Now)}
+	return &Loop{
+		opts:    opts,
+		idle:    newIdleTracker(opts.Now),
+		journal: newJournal(!opts.NoInventoryEvents),
+	}
 }
 
 // SettlingWindow is how long the first reconcile is held back for.
@@ -248,7 +290,13 @@ func (l *Loop) session(ctx context.Context) error {
 	// the read and the watch is missed. That handoff is a property the store guarantees and the
 	// conformance suite pins; building the cursor any other way leaves a window in which a
 	// change is silently skipped (§9.2).
-	events, err := l.opts.Store.Watch(ctx, "", fleet.Revision+1)
+	//
+	// Scoped to the same prefix the snapshot loads, which is what keeps this loop from waking
+	// itself: this pass writes events (§12.1), and a watch on the whole store would see those
+	// writes and reconcile again for them. It would converge — the second pass changes nothing and
+	// writes nothing — but it would double every pass that recorded anything, and it would put the
+	// event log on the establishment path, which is the one place §12.1 must not reach.
+	events, err := l.opts.Store.Watch(ctx, store.PrefixSnapshot, fleet.Revision+1)
 	if err != nil {
 		return err
 	}
@@ -420,6 +468,8 @@ func (l *Loop) once(ctx context.Context) error {
 			"sessions", len(result.Frozen))
 	}
 
+	l.record(ctx, fleet, result)
+
 	l.observe(fleet, result, l.opts.Now().Sub(started))
 	if err := l.publish(ctx, fleet); err != nil {
 		return err
@@ -427,6 +477,46 @@ func (l *Loop) once(ctx context.Context) error {
 
 	l.opts.Hooks.pass(OutcomeOK, l.opts.Now().Sub(started))
 	return nil
+}
+
+// record writes what this pass changed to the event log (§12.1).
+//
+// **One store write per object, never one per event.** The journal returns a batch, this groups it
+// by ring, and each ring is written once — which is what keeps the log from becoming the writer
+// that breaks §8.3, and what keeps it from burning the revisions sqlite's watch history is bounded
+// by (§8.1).
+//
+// Failures are logged and swallowed. This is a diagnostic aid, not an audit log (§12.1), and a
+// reconcile that refused to finish because it could not write down what it had done would trade
+// media for bookkeeping. Called after Apply for the same reason [Loop.observe] is: a pass that
+// failed to write has nothing to report about.
+func (l *Loop) record(ctx context.Context, fleet *state.Fleet, result *Result) {
+	if l.opts.Journal == nil {
+		return
+	}
+
+	entries, dropped := l.journal.diff(fleet, result, l.opts.Now())
+
+	batches := map[string][]api.Event{}
+	order := make([]string, 0, len(entries))
+	for _, e := range entries {
+		if _, seen := batches[e.key]; !seen {
+			order = append(order, e.key)
+		}
+		batches[e.key] = append(batches[e.key], e.event)
+	}
+
+	for _, key := range order {
+		if err := l.opts.Journal.Record(ctx, key, batches[key]...); err != nil {
+			l.opts.Logger.Warn("recording events failed", "key", key, "error", err)
+		}
+	}
+
+	for _, gone := range dropped {
+		if err := l.opts.Journal.ForgetPath(ctx, gone.pathID); err != nil {
+			l.opts.Logger.Warn("dropping a path's event log failed", "path", gone.pathID, "error", err)
+		}
+	}
 }
 
 // observe records what this pass saw.

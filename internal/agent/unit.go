@@ -41,8 +41,15 @@ func (k unitKey) compare(other unitKey) int {
 // process coming up — which matters because a target's start includes waiting for its blob, the
 // one part of establishment with an unbounded-looking wait in it.
 type unit struct {
-	key   unitKey
-	spec  worker.Spec
+	key  unitKey
+	spec worker.Spec
+
+	// pathID is the object this unit's event-log entries are anchored on (§12.1). Empty when the
+	// server did not send one, in which case what this unit observes lands on the node's log
+	// rather than being dropped — a server one version behind must not make a node's diagnostics
+	// disappear (§13.1).
+	pathID string
+
 	agent *Agent
 	log   *slog.Logger
 
@@ -69,17 +76,33 @@ type unit struct {
 	restarts []time.Time
 	total    uint64
 
+	// lastTail is the output of the most recent worker start, captured as the attempt unwinds
+	// because the handle that holds it is withdrawn before the death is classified.
+	lastTail string
+
+	// tailSent reports that this crash loop's worker log has already been pushed (§12.2).
+	//
+	// **One tail per crash loop, not one per restart.** Forty-seven restarts produce forty-seven
+	// copies of the same fatal line, and the forty-seventh is not evidence, it is volume.
+	//
+	// What re-arms it is *time to death*, not the worker having reached ready — the same signal
+	// §15.1 classifies from, and for the same reason. A target that binds, writes its blob and
+	// then dies on a timeout reaches ready on **every** cycle, so a readiness-based reset would
+	// push a tail per restart while looking like it did not.
+	tailSent bool
+
 	// handle is the worker currently running, or nil between attempts. Held so that /metrics can
 	// scrape it (§12) — it is the only reader, and the supervision loop is the only writer.
 	handle worker.Handle
 }
 
-func (a *Agent) newUnit(key unitKey, spec worker.Spec) *unit {
+func (a *Agent) newUnit(key unitKey, spec worker.Spec, pathID string) *unit {
 	return &unit{
-		key:   key,
-		spec:  spec,
-		agent: a,
-		flow:  a.flowLabelsFor(spec),
+		key:    key,
+		spec:   spec,
+		pathID: pathID,
+		agent:  a,
+		flow:   a.flowLabelsFor(spec),
 		log: a.log.With(
 			"session", key.Session,
 			"role", string(key.Role),
@@ -193,7 +216,14 @@ func (u *unit) attempt(ctx context.Context) (worker.Exit, bool) {
 	// scrape never holds a handle to a worker the supervision loop has moved past. A scrape that
 	// races a death is not special — it gets [worker.ErrExited] and contributes nothing.
 	u.setHandle(handle)
-	defer u.setHandle(nil)
+	defer func() {
+		// The tail is taken here rather than in [unit.died], because by the time that runs the
+		// handle has been withdrawn — and the handle is the only thing holding this start's
+		// output (§12.2). The pumps are drained before an exit is published, so what is captured
+		// here is complete.
+		u.captureTail(handle)
+		u.setHandle(nil)
+	}()
 
 	if u.spec.IsTarget() {
 		if !u.captureTargetInfo(ctx, handle, nonce) {
@@ -283,7 +313,32 @@ func (u *unit) waitingForPermit() {
 	u.state, u.reason, u.reasonCode = api.WorkerStarting, "waiting for a permit to start", ""
 	u.mu.Unlock()
 
+	// A queued start is otherwise indistinguishable from one that launched and is coming up
+	// slowly, which is exactly the distinction an operator watching a slow recovery needs (§6.3).
+	// The status says so while it lasts; this says it happened.
+	// Info, not a warning: pacing is what §6.3 is *for*, and its defaults are deliberately
+	// conservative, so a queued start is the node working correctly under a bulk re-establishment.
+	// It is recorded because a queued start is otherwise indistinguishable from a stuck one — which
+	// is an argument for writing it down, not for alarming about it.
+	u.emit(api.EventWorkerStartQueued, api.SeverityInfo,
+		"start is queued behind the node's start rate limit", "", "")
+
 	u.agent.Notify()
+}
+
+// emit queues one entry about this unit, anchored on its path (§12.1).
+func (u *unit) emit(kind api.EventKind, severity api.EventSeverity, message string, code api.ReasonCode, log string) {
+	u.agent.emit(api.AgentEvent{
+		Path:       u.pathID,
+		Kind:       kind,
+		Severity:   severity,
+		At:         u.agent.now(),
+		Message:    message,
+		ReasonCode: code,
+		Session:    u.key.Session,
+		Role:       u.key.Role,
+		Log:        log,
+	})
 }
 
 func (u *unit) setState(state api.WorkerState, reason string, code api.ReasonCode) {
@@ -319,10 +374,22 @@ func (u *unit) ready(epochValue, blob string) {
 func (u *unit) startFailed(reason string) worker.Exit {
 	u.log.Error("worker did not start", "reason", reason)
 	u.setState(api.WorkerFailed, reason, "")
+
+	// No tail: there is no process, so there is no output to have captured. The reason string is
+	// the whole diagnosis here, which is why it carries the resolved path or the allocation error
+	// verbatim rather than a summary.
+	u.emit(api.EventWorkerExited, api.SeverityError, "worker did not start: "+reason, "", "")
+
 	return worker.Exit{At: u.agent.now(), Err: errors.New(reason)}
 }
 
-// died records an unexpected exit.
+// died records an unexpected exit, and pushes the worker's own account of it (§12.2).
+//
+// The tail is what makes this entry worth more than the status it duplicates: `FAILED` /
+// `worker_restarts` says a worker keeps dying, and `fatal: unknown error: failed to create flow
+// writer` says why. Without this the second sentence is on the node, in the agent's log, reachable
+// only with shell access to a fleet member — which is what centralising the control plane was
+// supposed to remove.
 func (u *unit) died(exit worker.Exit, lived time.Duration) {
 	reason := "worker exited unexpectedly after " + lived.Round(time.Millisecond).String()
 	if exit.Err != nil {
@@ -330,8 +397,14 @@ func (u *unit) died(exit worker.Exit, lived time.Duration) {
 	}
 
 	u.mu.Lock()
-	defer u.mu.Unlock()
-
+	tail := u.lastTail
+	// A worker that ran for a while before dying is a new incident rather than the next turn of a
+	// loop, so it gets a fresh tail: whatever killed it after minutes of healthy transfer is not
+	// what the first attempt's output describes.
+	send := tail != "" && (!u.tailSent || lived >= u.agent.cfg.BackoffReset)
+	if send {
+		u.tailSent = true
+	}
 	u.state, u.reason, u.reasonCode = api.WorkerFailed, reason, api.ReasonWorkerRestarts
 	// A dead target's blob describes memory registrations that died with it, so it is worse than
 	// no answer: reporting it would let the server keep an initiator assigned against rkeys that
@@ -339,6 +412,12 @@ func (u *unit) died(exit worker.Exit, lived time.Duration) {
 	u.epoch, u.targetInfo = "", ""
 	u.restarts = append(u.restarts, u.agent.now())
 	u.total++
+	u.mu.Unlock()
+
+	if !send {
+		tail = ""
+	}
+	u.emit(api.EventWorkerExited, api.SeverityError, reason, api.ReasonWorkerRestarts, tail)
 }
 
 // status renders this worker as the server sees it (§9.2).
@@ -375,6 +454,15 @@ func (u *unit) status(now time.Time, window time.Duration) api.SessionStatus {
 
 // desired returns the spec this unit is supervising.
 func (u *unit) desired() worker.Spec { return u.spec }
+
+// captureTail retains one start's output, so the death that follows can be explained.
+func (u *unit) captureTail(handle worker.Handle) {
+	tail := handle.LogTail()
+
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.lastTail = tail
+}
 
 func (u *unit) setHandle(handle worker.Handle) {
 	u.mu.Lock()

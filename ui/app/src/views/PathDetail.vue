@@ -20,6 +20,7 @@
 import { computed } from 'vue'
 import { RouterLink } from 'vue-router'
 
+import EventLog from '@/components/EventLog.vue'
 import { endpointText, since } from '@/model/detail'
 import { plural } from '@/model/labels'
 import { domainRoute, flowRoute, nodeRoute, requestRoute, sessionRoute } from '@/router'
@@ -45,8 +46,9 @@ const holders = computed(() => path.value?.requests ?? [])
     </h1>
 
     <!-- A path is derived: one that is not here was not deleted, it stopped being computed, which
-         happens the moment the last request naming it is cancelled or parked. Not an error surface
-         — the reason is a title, as everything that is training rather than data is. -->
+         happens the moment the last request naming it is cancelled or parked. Not an error surface,
+         and not an explained one either: the sentence is the whole answer, and a tooltip teaching
+         the derivation rule to somebody who followed a stale link is training nobody asked for. -->
     <p v-if="!path" class="dt-missing">
       No path <span class="mono">{{ props.id }}</span>.
     </p>
@@ -135,6 +137,12 @@ const holders = computed(() => path.value?.requests ?? [])
           </dd>
         </dl>
       </section>
+
+      <!-- The path is the unit of retention (§12.1), so this is the log the whole feature is
+           anchored on: a state and a reason say what is true now, and a path that flapped for ten
+           minutes and is ACTIVE again says nothing at all about the ten minutes. It is also the only
+           subject with worker log tails, which is why the pane's subject union is a union. -->
+      <EventLog :subject="{ kind: 'path', id: props.id }" />
     </template>
   </main>
 </template>

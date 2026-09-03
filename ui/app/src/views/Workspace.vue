@@ -21,54 +21,86 @@
  * reason on it. Omission produces "where is the grid?", which is a worse question than a control
  * that says why it is off — the same reason the destination editor lists a node with no writable
  * area rather than hiding it.
+ *
+ * **Which screen is in the URL, and the tabs are links.** It was a local `ref`, which made
+ * `/ns/nab` name the namespace and not the screen: the claims view of an exclusive namespace could
+ * be reached but not linked, and a browser's back button walked over it without stopping. The
+ * choice still survives a namespace switch — the picker carries the view across (`NamespacePicker`)
+ * — but it now survives a reload and a paste as well.
  */
-import { computed, ref } from 'vue'
+import { computed, watch } from 'vue'
+import { RouterLink, useRouter } from 'vue-router'
 
 import Ledger from './Ledger.vue'
 import Matrix from './Matrix.vue'
+import type { WorkspaceView } from '@/router'
+import { claimsRoute, gridRoute } from '@/router'
 import { useNamespaceStore } from '@/stores/namespaces'
 
-const props = defineProps<{ namespace: string }>()
+/** `view` is absent on bare `/ns/:namespace`, which asks for whichever screen the mode allows. */
+const props = defineProps<{ namespace: string; view?: string }>()
 
+const router = useRouter()
 const namespaces = useNamespaceStore()
 const mode = computed(() => namespaces.mode(props.namespace))
 
-type View = 'grid' | 'claims'
+const asked = computed<WorkspaceView | undefined>(() =>
+  props.view === 'grid' || props.view === 'claims' ? props.view : undefined)
 
-const chosen = ref<View>('grid')
+/** The grid is only ever a grid here; anywhere else the choice resolves to the ledger. */
+const view = computed<WorkspaceView>(() =>
+  mode.value === 'exclusive' ? asked.value ?? 'grid' : 'claims')
 
 /**
- * The grid is only ever a grid here; anywhere else the choice resolves to the ledger.
+ * A URL asking for the grid of a shared namespace is corrected rather than rendered.
  *
- * The *choice* survives a namespace switch and only its resolution changes, so moving through a
- * shared namespace and back does not silently change which screen the operator is reading.
+ * The alternative is an address bar that says `grid` beside a ledger, which is worse than either
+ * screen — the whole point of putting the view in the URL is that the URL names what is on screen.
+ * Safe to do on arrival because the namespace list lands in the same poll as everything else and
+ * `App.vue` renders no route until the first one has: this cannot fire against a mode it has not
+ * read yet. `replace`, so the back button does not land on the URL that was just corrected.
  */
-const view = computed<View>(() => (mode.value === 'exclusive' ? chosen.value : 'claims'))
+watch(
+  [() => props.namespace, asked, mode],
+  () => {
+    if (asked.value === 'grid' && mode.value !== 'exclusive') {
+      void router.replace(claimsRoute(props.namespace))
+    }
+  },
+  { immediate: true },
+)
 </script>
 
 <template>
   <nav class="views">
-    <button
+    <RouterLink
+      v-if="mode === 'exclusive'"
       class="view"
       :class="{ on: view === 'grid' }"
-      :disabled="mode !== 'exclusive'"
-      :title="
-        mode === 'exclusive'
-          ? 'Sources down, destinations across, a request as a rectangle'
-          : 'Not available in a shared namespace'
-      "
-      @click="chosen = 'grid'"
+      :to="gridRoute(namespace)"
+      title="Sources down, destinations across, a request as a rectangle"
     >
       grid
-    </button>
-    <button
+    </RouterLink>
+    <!-- Shown and disabled with the reason, never omitted: "where is the grid?" is a worse question
+         than a control that says why it is off. A `<span>` rather than a link, because there is
+         nothing to navigate to — a disabled anchor is still an anchor. -->
+    <span
+      v-else
+      class="view off"
+      title="Not available in a shared namespace: two requests may hold one path, so a cell would stop meaning what it looks like"
+    >
+      grid
+    </span>
+
+    <RouterLink
       class="view"
       :class="{ on: view === 'claims' }"
+      :to="claimsRoute(namespace)"
       title="One row per path, with the claims on it"
-      @click="chosen = 'claims'"
     >
       claims
-    </button>
+    </RouterLink>
   </nav>
 
   <Matrix v-if="view === 'grid'" :namespace="namespace" />
@@ -93,6 +125,7 @@ const view = computed<View>(() => (mode.value === 'exclusive' ? chosen.value : '
   font: inherit;
   font-size: 12px;
   padding: 3px 12px;
+  text-decoration: none;
 }
 
 .view.on {
@@ -101,5 +134,5 @@ const view = computed<View>(() => (mode.value === 'exclusive' ? chosen.value : '
   color: var(--fg);
 }
 
-.view:disabled { color: var(--fg-faint); cursor: not-allowed; }
+.view.off { color: var(--fg-faint); cursor: not-allowed; }
 </style>

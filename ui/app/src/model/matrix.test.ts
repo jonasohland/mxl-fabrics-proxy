@@ -406,3 +406,51 @@ describe('buildMatrix with a named but unrouted destination', () => {
     expect(matrix.columns[0]).toMatchObject({ draft: false, requests: ['nab/wall'] })
   })
 })
+
+/**
+ * The number a `×` states its cost from, which is **not** the number the board draws.
+ *
+ * The grid renders the staged set, so a leg staged for parking stops being drawn the instant it is
+ * clicked — right for the board, and wrong for anything that says what a removal would stop. Staged
+ * dark is not dark: nothing has been written, the paths are still up, and a control that read the
+ * drawn count would offer "carrying nothing" over media it is about to tear down.
+ */
+describe('what a leg is carrying, as against what it draws', () => {
+  const source = src('studio-a', ['cameras'])
+  const live = dst('edge-01', ['ingest'])
+  const parked = dst('edge-01', ['ingest'], true)
+
+  const stored = request('wall', [source], [live], [['p1', 'p2']])
+  const staged = request('wall', [source], [parked], [['p1', 'p2']])
+
+  const paths = [
+    path('p1', source, 'flow-1', live, 'ACTIVE', ['nab/wall']),
+    path('p2', source, 'flow-2', live, 'ACTIVE', ['nab/wall']),
+  ]
+
+  it('agrees with the drawn count when nothing is staged', () => {
+    const matrix = buildMatrix(paths, [stored], NODES, 'nab', [stored])
+    expect(matrix.cells[0]![0]).toMatchObject({ count: 2, carrying: 2 })
+    expect(matrix.columns[0]).toMatchObject({ paths: 2, carrying: 2 })
+  })
+
+  // The case the two exist to tell apart. The staged spec parks the leg, so the grid draws it dark
+  // and counts nothing there — while the server still holds both paths, and a removal still stops
+  // both.
+  it('keeps counting a leg the operator has only staged for parking', () => {
+    const matrix = buildMatrix(paths, [staged], NODES, 'nab', [stored])
+    const cell = matrix.cells[0]![0]!
+    expect(cell.parked).toBe(true)
+    expect(cell.count).toBe(0)
+    expect(cell.carrying).toBe(2)
+    expect(matrix.columns[0]).toMatchObject({ paths: 0, carrying: 2 })
+  })
+
+  // Applied, the two agree again at zero: a destination parked on the server produces no path at
+  // all, so there is nothing left for a `×` over it to stop.
+  it('counts nothing once the park has been written', () => {
+    const matrix = buildMatrix([], [staged], NODES, 'nab', [staged])
+    expect(matrix.cells[0]![0]).toMatchObject({ parked: true, count: 0, carrying: 0 })
+    expect(matrix.columns[0]).toMatchObject({ paths: 0, carrying: 0 })
+  })
+})

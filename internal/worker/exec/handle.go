@@ -74,6 +74,7 @@ func (l *Launcher) Start(ctx context.Context, spec worker.Spec) (worker.Handle, 
 		socket:    socket,
 		grace:     l.stopGrace,
 		log:       log,
+		tail:      logs.NewRing(l.tailBytes),
 		dead:      make(chan struct{}),
 		infoReady: make(chan struct{}),
 		exited:    make(chan worker.Exit, 1),
@@ -128,6 +129,11 @@ type handle struct {
 
 	pumps sync.WaitGroup
 
+	// tail is the retained end of this worker's output (§12.2). Per *start*, like the work
+	// directory: a restart is a new incarnation and its predecessor's output explains a different
+	// failure.
+	tail *logs.Ring
+
 	// dead closes once the process has exited and its output has been drained.
 	dead   chan struct{}
 	exited chan worker.Exit
@@ -148,6 +154,9 @@ var _ worker.Handle = (*handle)(nil)
 
 // Spec implements [worker.Handle].
 func (h *handle) Spec() worker.Spec { return h.spec }
+
+// LogTail implements [worker.Handle].
+func (h *handle) LogTail() string { return h.tail.Text() }
 
 // Exited implements [worker.Handle].
 func (h *handle) Exited() <-chan worker.Exit { return h.exited }
@@ -284,6 +293,12 @@ func (h *handle) pump(r io.Reader, stream string) {
 		if line == "" {
 			continue
 		}
+		// Into the tail *before* parsing, and whether or not it parses (§12.2). A tail holding
+		// only what this parser understood would omit whatever a library on the link line printed
+		// on its way out, which is the case where the parser is least likely to be right and the
+		// output most likely to matter.
+		h.tail.Add(line)
+
 		record, ok := logs.Parse(line)
 		if !ok {
 			// Not a spdlog line: libfabric's own diagnostics go to the same stream, and so

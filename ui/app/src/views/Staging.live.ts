@@ -123,7 +123,7 @@ describe('staging a cell', () => {
   it('declines the two clicks it cannot interpret, and says which', () => {
     const shared = cellFor('Studio A:Camera 1', 'fast/four')
     expect(shared.attributes('aria-disabled')).toBe('true')
-    expect(shared.attributes('title')).toContain('no one request for a new leg to join')
+    expect(shared.attributes('title')).toContain('No single request for a new leg to join')
 
     const contested = cellFor('Studio A:Camera 42', 'fast/ghost')
     expect(contested.attributes('aria-disabled')).toBe('true')
@@ -137,7 +137,9 @@ describe('staging a cell', () => {
   // rather than from the dry run.
   it('stages a park across the whole column of the rectangle', async () => {
     const cell = cellFor('Studio A:Camera 1', 'fast/one')
-    expect(cell.attributes('title')).toContain('also parks 1 other cell')
+    // Matched mid-sentence rather than from the start: what is load-bearing is that the tooltip
+    // names the blast radius of the click, not where the clause happens to fall in the prose.
+    expect(cell.attributes('title')).toContain('parks 1 other cell of this request')
 
     await cell.trigger('click')
 

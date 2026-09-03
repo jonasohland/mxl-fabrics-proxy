@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/url"
+	"strconv"
 
 	"github.com/jonasohland/mxl-replicator/internal/api"
 )
@@ -279,4 +280,57 @@ func (c *Client) Nodes(ctx context.Context) ([]api.Node, error) {
 		return nil, err
 	}
 	return out.Nodes, nil
+}
+
+// Events performs one of the three event-log reads (§9.1, §12.1): what happened to a path, a
+// request or a node.
+//
+// A cursor of zero asks for everything the ring still holds. To poll, pass back
+// [api.EventList.Next] — a **sequence number**, not a timestamp: an entry is stamped by whoever
+// emitted it, so a merged view interleaves the clocks of two agents and a leader, and the sequence
+// is the only thing that orders a ring.
+//
+// The entries returned always include the fleet ring's, so a leader change's gap marker appears in
+// the log where the gap is (§12.1).
+func (c *Client) Events(ctx context.Context, path string, since uint64) (*api.EventList, error) {
+	query := url.Values{}
+	if since > 0 {
+		query.Set(api.QuerySince, strconv.FormatUint(since, 10))
+	}
+
+	var out api.EventList
+	err := c.do(ctx, request{method: http.MethodGet, path: path, query: query, out: &out})
+	if err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// PathEvents, RequestEvents and NodeEvents are the three [Client.Events] targets, named so a
+// caller does not build a URL.
+func (c *Client) PathEvents(ctx context.Context, id string, since uint64) (*api.EventList, error) {
+	return c.Events(ctx, api.PathEventsPath(id), since)
+}
+
+func (c *Client) RequestEvents(ctx context.Context, id api.RequestID, since uint64) (*api.EventList, error) {
+	return c.Events(ctx, api.RequestEventsPath(id), since)
+}
+
+func (c *Client) NodeEvents(ctx context.Context, node string, since uint64) (*api.EventList, error) {
+	return c.Events(ctx, api.NodeEventsPath(node), since)
+}
+
+// PathLogs performs GET /v1/paths/{id}/logs: the last failing worker's output (§12.2).
+//
+// A separate call from [Client.PathEvents] rather than a field on it. The entry carries only a
+// marker that a tail exists; fetching it is a deliberate act, because inlining a few KiB per
+// failure into a ring a UI polls would make the cheap read expensive exactly when things fail.
+//
+// A path no worker has failed on has no tail, which arrives as a not-found error.
+func (c *Client) PathLogs(ctx context.Context, id string) (*api.LogTail, error) {
+	var out api.LogTail
+	if err := c.do(ctx, request{method: http.MethodGet, path: api.PathLogsPath(id), out: &out}); err != nil {
+		return nil, err
+	}
+	return &out, nil
 }

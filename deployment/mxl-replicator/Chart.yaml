@@ -1,21 +1,11 @@
 apiVersion: v2
 name: mxl-replicator
 description: >-
-  Replicate MXL flows between hosts over MXL Fabrics, driven by a central control plane.
-  Installs the control-plane server and a per-node agent DaemonSet.
+  Replicate MXL flows between hosts over MXL Fabrics, driven by a central control plane. Installs the control-plane server and a per-node agent DaemonSet.
 type: application
-
-# The chart's own version. Bumped when the templates change.
-version: 0.1.0
-
-# The default image tag. Override with image.tag — and pin it: the project is experimental and
-# there is no wire compatibility guarantee across versions.
-appVersion: "latest"
-
-# hostPort on a DaemonSet, `local` PersistentVolumes and the `Recreate` strategy are all older
-# than this; the floor is where `kubectl` stopped warning about the APIs used here.
+version: 0.0.1-alpha.2
+appVersion: 0.0.1-alpha.2
 kubeVersion: ">=1.25.0-0"
-
 home: https://github.com/jonasohland/mxl-replicator
 sources:
   - https://github.com/jonasohland/mxl-replicator
@@ -26,4 +16,4 @@ keywords:
   - libfabric
   - efa
 maintainers:
-  - name: Jonas Ohland
+  - name: Jonas Ohland <jonas.ohland@gmail.com>

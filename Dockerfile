@@ -1,4 +1,24 @@
 ARG BASE_IMAGE="jonasohland/mxl:v1.1-rc1-fabrics"
+
+# The web UI, built in its own stage so the image that ships carries no node toolchain and the Go
+# build below still gets the assets to embed. It runs unconditionally — the assets are a few
+# hundred kilobytes and `--server-ui` is off by default, so every image can serve the UI and no
+# image has to.
+#
+# **The tag tracks `ui/app/.nvmrc`.** Vite 7 and Vitest 3 both want a current LTS and jsdom's
+# dependency tree is specific about the patch level; a version pinned for the developer and a
+# different one in the image is how the thing that ships stops being the thing that was tested.
+#
+# The manifests are copied before the sources so `npm ci` caches against them rather than against
+# every edit to a component, and `npm ci` rather than `install` because a lockfile the image
+# quietly updated is a lockfile that is not describing this build.
+FROM node:24-alpine AS ui
+WORKDIR /build/ui/app
+COPY ui/app/package.json ui/app/package-lock.json ./
+RUN npm ci
+COPY ui/app ./
+RUN npm run build
+
 FROM ${BASE_IMAGE} AS builder
 
 USER 0:0
@@ -39,6 +59,12 @@ RUN GOWORK=off /usr/local/go/bin/go mod download
 
 COPY cmd cmd
 COPY internal internal
+
+# `ui/` is the Go package holding the embed directive; the built assets it embeds come from the
+# node stage rather than from the build context, which .dockerignore keeps out precisely so that a
+# stale local `npm run build` cannot end up in an image (`ui/embed.go`).
+COPY ui ui
+COPY --from=ui /build/ui/app/dist ui/app/dist
 
 ARG VERSION="unknown"
 RUN GOWORK=off /usr/local/go/bin/go build \

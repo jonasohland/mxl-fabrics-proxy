@@ -6,7 +6,7 @@
 #
 # `agent.pools` **replaces** the single DaemonSet rather than adding to it. Selectors must not
 # overlap: two agents claiming one node name both receive the same assignments, both start
-# workers, and they fight over ports — so the server makes the liveness lease exclusive and
+# workers, and they fight over ports, so the server makes the liveness lease exclusive and
 # rejects the second claimant.
 
 image:
@@ -28,20 +28,22 @@ agent:
     - name: ib
       nodeSelector: {mxl.ebu.org/fabric: ib}
       # `ip_version` because the HCA also carries a link-local IPv6 address, which is a second
-      # probe entry under the same device name — `device` alone is ambiguous and gets dropped.
+      # probe entry under the same device name, so `device` alone is ambiguous and gets dropped.
       fabrics:
         - {provider: verbs, fabric: ib-fabric-a, device: mlx5_0, ip_version: 4}
 
     - name: efa
       nodeSelector: {mxl.ebu.org/fabric: efa}
       efa: {enabled: true}
+      # The EFA build. Only this pool needs it.
+      image: {tag: v0.3.0-efa}
       fabrics:
         - {provider: efa, fabric: vpc1-subnet-a, device: rdmap0s6-rdm}
 
     - name: tcp
       nodeSelector: {mxl.ebu.org/fabric: tcp}
       # `network` rather than `interface`, because the netdev name is the one thing that is not
-      # uniform across a pool — `eth1` on some of these, `ens5f0` on the rest — while the prefix
+      # uniform across a pool (`eth1` on some of these, `ens5f0` on the rest) while the prefix
       # is the same value everywhere and still picks each node's own address.
       fabrics:
         - {provider: tcp, fabric: dc1-data, network: 10.1.0.0/16}

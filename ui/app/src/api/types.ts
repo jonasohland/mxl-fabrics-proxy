@@ -642,6 +642,129 @@ export interface NamespaceList {
 }
 
 // ---------------------------------------------------------------------------
+// Events — the log of what *happened* (`internal/api/event.go`, architecture §12.1)
+// ---------------------------------------------------------------------------
+
+/**
+ * How loudly an entry should read — and **not** the state vocabulary.
+ *
+ * Colour a row from this and nothing else. Designed behaviour never warns: an idle teardown, a
+ * queued start, a producer stopping are each the system doing exactly what §11.1 or §6.3 says it
+ * should, so a row whose `state` is `PAUSED` is routinely `info`. Driving the colour from `state`
+ * instead reproduces the board-full-of-false-faults that §11 avoids twice over.
+ */
+export type EventSeverity = 'info' | 'warn' | 'error'
+
+/**
+ * The closed vocabulary of what an entry says (`api.EventKinds()`).
+ *
+ * Closed, and paired with a {@link ReasonCode} from the existing vocabulary rather than a second
+ * one: an event about a path going `INVALID` carries the code that path is reporting, so the log
+ * and the status cannot disagree. `message` is the human rendering and is never what a reader
+ * matches on.
+ */
+export type EventKind =
+  | 'path_state_changed'
+  | 'session_established'
+  | 'epoch_changed'
+  | 'worker_exited'
+  | 'worker_start_queued'
+  | 'assignment_rejected'
+  | 'session_withdrawn'
+  | 'path_conflict_lost'
+  | 'request_state_changed'
+  | 'expansion_changed'
+  | 'node_registered'
+  | 'node_lease_expired'
+  | 'node_claimed'
+  | 'inventory_baseline'
+  | 'flow_appeared'
+  | 'flow_disappeared'
+  | 'domain_appeared'
+  | 'domain_disappeared'
+  | 'reconciler_took_over'
+  | 'events_dropped'
+
+/**
+ * One entry in an object's ring.
+ *
+ * **A coalesced entry is one row, not `count` rows.** `count`, `first_at` and `at` together mean
+ * *this happened N times between these two moments*; expanding them re-creates the flapping the
+ * ring exists to compress, and does it where the ring can no longer protect anything.
+ */
+export interface Event {
+  /**
+   * Orders the ring, and **this rather than the timestamp is the ordering**. An entry is stamped by
+   * whoever emitted it, so a merged request view interleaves two agents' clocks and a leader's.
+   * Monotonic within one ring and meaningless across rings.
+   */
+  seq: number
+  kind: EventKind
+  severity: EventSeverity
+  /** When this entry *last* happened. Display only — never a causal timeline across hosts. */
+  at: string
+  /** When the coalesced run behind it started. Present only when `count` is above one. */
+  first_at?: string
+  /** How many occurrences this row stands for. Absent when it is one. */
+  count?: number
+  /** The human rendering. Render it verbatim; match on `kind` and `reason_code`. */
+  message: string
+  reason_code?: ReasonCode
+  /** What the object moved *to*, on the kinds that describe a transition. */
+  state?: RequestState
+  node?: string
+  session?: string
+  role?: 'initiator' | 'target'
+  /** The `<ns>/<name>` responsible, where one request is. A path is shared, so this is often absent. */
+  request?: string
+  /**
+   * A worker log tail was stored with this entry and can be fetched from the path's `logs` endpoint.
+   *
+   * **A marker, not content.** The tail is a second fetch on purpose, so the list a UI polls stays
+   * cheap exactly when things are failing — which is when it is polled hardest. Nothing may fetch
+   * these eagerly.
+   */
+  has_log?: boolean
+}
+
+/** What the three `events` endpoints return. */
+export interface EventList {
+  events: Event[]
+  /**
+   * Entries evicted by the ring's bound over its life — history that aged out.
+   *
+   * **A different loss from an `events_dropped` entry**, which is entries an agent never managed to
+   * report at all. Both need saying and saying them the same way loses the distinction that matters:
+   * only one means something was never seen.
+   */
+  dropped?: number
+  /** The cursor to resume from. See {@link Event.seq} on why this UI does not use it. */
+  next: number
+}
+
+/**
+ * The last failing worker's output for a path (`GET /v1/paths/{id}/logs`, §12.2).
+ *
+ * One tail per crash loop, not per restart: forty-seven restarts produce one of these, because the
+ * forty-seventh copy of a message is volume rather than evidence.
+ */
+export interface LogTail {
+  path: string
+  node: string
+  session?: string
+  role?: 'initiator' | 'target'
+  /** When the worker this came from died. */
+  at: string
+  /**
+   * Output was discarded from the **head** to fit the bound. Say so — a worker's fatal line is its
+   * last, so what is on screen is the useful end of a longer log rather than the whole of a short
+   * one.
+   */
+  truncated?: boolean
+  text: string
+}
+
+// ---------------------------------------------------------------------------
 // Health
 // ---------------------------------------------------------------------------
 

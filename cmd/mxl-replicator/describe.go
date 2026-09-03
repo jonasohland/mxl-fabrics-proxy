@@ -102,10 +102,15 @@ func (c *DescribeCmd) node(ctx context.Context, user *client.Client) error {
 		return err
 	}
 
-	return c.render(node, func() { printNode(*node, domains, paths.Paths) })
+	// The node's own log: registrations, claims, lease expiries (§12.1). It is what answers "why
+	// did every path on this node re-establish at 12:04" in one line rather than in fifty
+	// identical path entries — and it is the log that still exists after the paths are gone.
+	events := eventsFor(ctx, func() (*api.EventList, error) { return user.NodeEvents(ctx, c.Name, 0) })
+
+	return c.render(node, func() { printNode(*node, domains, paths.Paths, events) })
 }
 
-func printNode(node api.Node, domains *api.DomainList, paths []api.Path) {
+func printNode(node api.Node, domains *api.DomainList, paths []api.Path, events *api.EventList) {
 	out := table()
 	defer flush(out)
 
@@ -193,6 +198,7 @@ func printNode(node api.Node, domains *api.DomainList, paths []api.Path) {
 	}
 
 	printNodePaths(out, node.Name, paths)
+	printObjectEvents(out, events)
 }
 
 func printNodePaths(out *tabwriter.Writer, name string, paths []api.Path) {
@@ -438,11 +444,19 @@ func (c *DescribeCmd) request(ctx context.Context, user *client.Client) error {
 	if ns == "" {
 		ns = api.DefaultNamespace
 	}
-	request, err := user.Request(ctx, api.RequestID{Namespace: ns, Name: c.Name})
+	id := api.RequestID{Namespace: ns, Name: c.Name}
+	request, err := user.Request(ctx, id)
 	if err != nil {
 		return err
 	}
-	return c.render(request, func() { printRequest(*request) })
+
+	// A request's log is its own entries merged with those of the paths it currently expands onto
+	// (§12.1), which the server does — so this is one read, not one per path.
+	events := eventsFor(ctx, func() (*api.EventList, error) { return user.RequestEvents(ctx, id, 0) })
+
+	// The machine formats stay the *request*, unchanged: a script written against `-o json` is
+	// written against the documented API type, not against a wrapper this view wanted (§9.1).
+	return c.render(request, func() { printRequest(*request, events) })
 }
 
 // --- namespace ------------------------------------------------------------------------------
@@ -498,7 +512,7 @@ func pathPolicyText(policy api.PathPolicy) string {
 	return "shared — requests here may share a path (the default)"
 }
 
-func printRequest(request api.Request) {
+func printRequest(request api.Request, events *api.EventList) {
 	out := table()
 	defer flush(out)
 
@@ -571,16 +585,20 @@ func printRequest(request api.Request) {
 	// answer an operator needs and it has no meaning in a one-flow-per-request model (§9.1).
 	fmt.Fprintln(out)
 	if len(request.Status.Paths) == 0 {
+		// **And the log still prints below.** A request that expands onto nothing is the case its
+		// own ring exists for: there is no path for "why is this WAITING" to be asked of, so
+		// returning here would hide the only answer (§12.1).
 		fmt.Fprintln(out, "  no paths")
-		return
-	}
-	fmt.Fprintln(out, "  PATH\tFLOW\tDESTINATION\tSTATE\tREASON")
-	for _, path := range request.Status.Paths {
-		fmt.Fprintf(out, "  %s\t%s\t%s\t%s\t%s\n",
-			path.ID, path.Source.Flow, path.Destination.Endpoint(), path.State, path.Reason)
+	} else {
+		fmt.Fprintln(out, "  PATH\tFLOW\tDESTINATION\tSTATE\tREASON")
+		for _, path := range request.Status.Paths {
+			fmt.Fprintf(out, "  %s\t%s\t%s\t%s\t%s\n",
+				path.ID, path.Source.Flow, path.Destination.Endpoint(), path.State, path.Reason)
+		}
 	}
 
 	printExclusions(out, request.Status)
+	printObjectEvents(out, events)
 }
 
 // printExclusions renders what the expansion deliberately left out (§9.1).
@@ -623,14 +641,30 @@ func (c *DescribeCmd) path(ctx context.Context, user *client.Client) error {
 		return err
 	}
 	for _, path := range paths.Paths {
-		if path.ID == c.Name {
-			return c.render(path, func() { printPath(path) })
+		if path.ID != c.Name {
+			continue
 		}
+
+		// The recent history, under the status, because the whole reason §12.1 exists is that a
+		// state and a reason do not explain a failure on their own: FAILED / worker_restarts says
+		// a worker keeps dying and the log says what it printed on the way out.
+		//
+		// Best-effort, and deliberately not fatal. A path that has just been created has no ring,
+		// an older server has no endpoint, and neither is a reason to refuse to describe a path.
+		events, eventErr := user.PathEvents(ctx, path.ID, 0)
+		if eventErr != nil {
+			events = nil
+		}
+
+		// The machine formats stay the *path*, unchanged. A script written against `-o json` is
+		// written against the documented API type, and quietly wrapping it in a second object to
+		// carry a convenience the text view wanted would break that (§9.1).
+		return c.render(path, func() { printPath(path, events) })
 	}
 	return fmt.Errorf("no path %q", c.Name)
 }
 
-func printPath(path api.Path) {
+func printPath(path api.Path, events *api.EventList) {
 	out := table()
 	defer flush(out)
 
@@ -652,11 +686,34 @@ func printPath(path api.Path) {
 	fmt.Fprintln(out)
 	if path.Session == nil {
 		fmt.Fprintln(out, "  no session")
+	} else {
+		fmt.Fprintf(out, "  Session %s\n", path.Session.ID)
+		fmt.Fprintf(out, "    fabric\t%s / %s\n", path.Session.Fabric, path.Session.Interface.Provider)
+		fmt.Fprintf(out, "    state\t%s\n", endpointSummary(*path.Session))
+	}
+
+	// **Outside the session branch, not inside it.** A path with no session is WAITING or INVALID,
+	// which is the case its history explains best — why it was established and then was not — so
+	// returning early on a nil session would hide the log exactly where it is most wanted.
+	printPathEvents(out, events)
+}
+
+// printPathEvents shows the tail of a path's log, and points at the two things that need a second
+// command: the whole log, and a worker's own output.
+func printPathEvents(out *tabwriter.Writer, events *api.EventList) {
+	if events == nil {
 		return
 	}
-	fmt.Fprintf(out, "  Session %s\n", path.Session.ID)
-	fmt.Fprintf(out, "    fabric\t%s / %s\n", path.Session.Fabric, path.Session.Interface.Provider)
-	fmt.Fprintf(out, "    state\t%s\n", endpointSummary(*path.Session))
+
+	printObjectEvents(out, events)
+
+	for _, event := range events.Events {
+		if event.HasLog {
+			fmt.Fprintln(out)
+			fmt.Fprintln(out, "  a worker log was captured: mxl-replicator logs path <id>")
+			return
+		}
+	}
 }
 
 // --- session --------------------------------------------------------------------------------
@@ -733,6 +790,32 @@ func printEndpoint(out *tabwriter.Writer, role string, endpoint *api.SessionEndp
 }
 
 // --- shared ---------------------------------------------------------------------------------
+
+// eventsFor fetches an object's log, best-effort.
+//
+// **Never fatal.** An object that has just been created has no ring, an older server has no
+// endpoint (§13.1), and neither is a reason to refuse to describe the thing that was asked for. A
+// nil list renders as nothing rather than as an error the operator has to read past.
+func eventsFor(ctx context.Context, fetch func() (*api.EventList, error)) *api.EventList {
+	list, err := fetch()
+	if err != nil {
+		return nil
+	}
+	return list
+}
+
+// printObjectEvents renders the tail of any object's log under its description.
+//
+// Eight entries, because this is a summary and `events` is the whole log — but the count of what
+// was left out is printed, since a view that silently shows the last few reads as a log with a few
+// entries in it.
+func printObjectEvents(out *tabwriter.Writer, events *api.EventList) {
+	if events == nil {
+		return
+	}
+	heading(out, "  Events")
+	printEvents(out, events, 8)
+}
 
 // heading opens a section: a blank line and a title, neither of which carries a tab. That is what
 // ends the preceding column block, so each section's columns are sized to that section alone

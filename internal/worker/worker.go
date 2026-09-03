@@ -68,6 +68,17 @@ type Handle interface {
 	// status report that tells the peer its epoch is gone) hangs off it.
 	Exited() <-chan Exit
 
+	// LogTail returns the retained tail of this worker's output (§12.2).
+	//
+	// Bounded in bytes and holding the *end* of the stream, because a worker's fatal line is its
+	// last — in both failure shapes, one that never comes up and one that dies after hours. The
+	// agent pushes it with the transition into FAILED, so that the sentence explaining a failure
+	// reaches an operator who has no shell access to the node.
+	//
+	// Safe to call after the worker has exited, which is when it is actually called: the pumps are
+	// drained before the exit is published, so a dead worker's tail is complete.
+	LogTail() string
+
 	// Stop terminates the worker and releases everything it holds — for the exec
 	// implementation, SIGTERM, a grace period, SIGKILL, and the work directory.
 	//

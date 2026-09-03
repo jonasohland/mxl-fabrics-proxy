@@ -44,25 +44,23 @@ driver.
 
 | `type` | What it makes | Notes |
 |---|---|---|
-| `hostPath` *(default)* | A directory on `persistence.node`, created if missing. | No PV and no PVC — the pod names the directory. Least friction. |
-| `local` | A `local` PersistentVolume with node affinity, bound to a PVC by `claimRef`. | The directory **must already exist**; the local volume plugin will not create it. The better object once someone has provisioned the mount. |
-| `existingClaim` | Nothing. Uses `persistence.existingClaim`. | `node` is unused. |
-| `storageClass` | A PVC against a provisioner. | |
+| `hostPath` *(default)* | A directory on `persistence.node`, created if missing. | No PV and no PVC. The pod names the directory. Least friction. |
+| `pvc` | A PersistentVolumeClaim, or nothing if `pvc.existingClaim` names one you manage. | `node` is unused. Set `pvc.storageClass` to pick a provisioner. |
 | `emptyDir` | Nothing durable. | **The request set does not survive a restart.** Development only. |
 
-For `hostPath` and `local` the server pod is pinned to `persistence.node` with a nodeSelector, and
-it has to be: the data is on that node's disk. Draining that node takes the control plane down
-until it comes back — which does not stop running media, because agents are fail-static and act on
-the last assignment set they retrieved, but it does stop reconciliation. Move to the etcd backend
-when that matters.
+The store file is always `<persistence.mountPath>/store.db`, so it cannot be placed outside the
+volume by accident.
 
-The `local` PV's reclaim policy is `Retain`, so `helm uninstall` removes the PV and the claim and
-leaves the directory. A reinstall binds straight back to it.
+For `hostPath` the server pod is pinned to `persistence.node` with a nodeSelector, and it has to
+be, because the data is on that node's disk. Draining that node takes the control plane down until
+it comes back. That does not stop running media, since agents are fail-static and act on the last
+assignment set they retrieved, but it does stop reconciliation. Move to the etcd backend when that
+matters.
 
-The image runs as a non-root user and a directory kubelet just created is owned by root, so a
-short root init container takes ownership first — hostPath volumes get no `fsGroup` treatment from
-Kubernetes, which is why this is an init container rather than a pod securityContext. Turn it off
-with `server.persistence.initChown.enabled=false` if the directory is already owned correctly.
+The image runs as a non-root user and a directory kubelet just created is owned by root, so a short
+root init container takes ownership first. hostPath volumes get no `fsGroup` treatment from
+Kubernetes, which is why this is an init container rather than a pod securityContext. Set
+`server.persistence.initChown=false` if the directory is already owned correctly.
 
 ### HA
 
@@ -123,16 +121,18 @@ some nodes and `ens5f0` on the rest, and it is usually the right selector for tc
 anything about reachability; two nodes inside one prefix may still have no route between them, and
 that is what the `fabric` label decides.
 
-Areas and fabrics go into a ConfigMap rather than onto the command line — they are lists of
-records, which is exactly what does not fit on one — and the DaemonSet carries a checksum of it, so
-changing either rolls the agents. Everything else the agent takes stays a flag.
+Areas and fabrics go into a ConfigMap rather than onto the command line, because they are lists of
+records and that is exactly what does not fit on one. The DaemonSet carries a checksum of it, so
+changing either rolls the agents.
 
 ## EFA
 
 ```yaml
 image:
-  tag: v0.3.0                     # the agent gets v0.3.0-efa
+  tag: v0.3.0
 agent:
+  image:
+    tag: v0.3.0-efa
   efa:
     enabled: true
   nodeSelector:
@@ -141,28 +141,32 @@ agent:
     - {provider: efa, fabric: vpc1-subnet-a, device: rdmap0s6-rdm}
 ```
 
-`efa.enabled` does two things: it requests the extended resource
-`vpc.amazonaws.com/efa: 1` (in both requests and limits, as Kubernetes requires) and it switches
-the agent's image tag to the `-efa` variant, which is built on the EFA-enabled libfabric base. The
-server keeps the stock image — it never touches a fabric.
+`efa.enabled` does one thing: it requests the extended resource `vpc.amazonaws.com/efa: 1`, in both
+requests and limits as Kubernetes requires for an extended resource.
 
 Four things it does **not** do, because each is a claim only an operator can make:
 
+- **Pick the image.** The EFA build carries a libfabric with the provider compiled in and the stock
+  image does not, so set `agent.image.tag` to it. The server never touches a fabric and keeps the
+  stock image.
 - **Install the device plugin.** `aws-efa-k8s-device-plugin` must already be running on the
-  cluster. Requesting the resource is what attaches the adapter to the pod; without the request the
+  cluster. Requesting the resource is what attaches the adapter to the pod. Without the request the
   device is on the node and invisible in the container.
 - **Pick the nodes.** Narrow `agent.nodeSelector` to instance types that have an adapter, or the
   DaemonSet will schedule pods that stay `Pending` on the resource.
 - **Pick the fabric label.** EFA does not route, so nodes in different subnets must not share one.
   Two nodes sharing a label is an assertion that they can reach each other.
-- **Set the count.** `efa.count` is 1. Instances with several adapters want the real number, and
-  the number is per-node hardware rather than something the chart can see.
+
+`efa.count` is 1. Instances with several adapters want the real number, which is per-node hardware
+rather than something the chart can see.
 
 `agent.devices.infiniband` stays on: an EFA adapter presents as `/dev/infiniband/uverbs*`.
 
 The container is privileged by default, which is what gives the RDMA providers their unlimited
 locked memory. Dropping to `IPC_LOCK` + `SYS_RESOURCE` works on some clusters and is worth trying,
-but it is not what this is tested with.
+but it is not what this is tested with. On a cluster where privileged is not available, request
+hugepages through `agent.resources` and mount them through `agent.extraVolumes` and
+`agent.extraVolumeMounts`.
 
 ## Why the agent runs as root
 
@@ -280,6 +284,45 @@ kubectl -n mxl get secret mxl-replicator-token -o jsonpath='{.data.token}' | bas
 a kubelet and a scrape job, none of which carry a token — so the ServiceMonitor and PodMonitor need
 no credentials.
 
+## Web UI
+
+Off by default. `server.ui.enabled: true` adds `--server-ui`, and the server serves the app at `/`
+on the port it already listens on — same origin as the API, no second Service, no extra route. The
+default ingress rule (`/`, `Prefix`) already covers it.
+
+```yaml
+server:
+  ui:
+    enabled: true
+```
+
+Two things decide whether that is enough.
+
+**The image has to carry it.** Every image built from this repository's Dockerfile does — it builds
+the app in a stage of its own, unconditionally. But the assets are compiled into the binary, so a
+custom image built without them refuses to start with the flag rather than serving a blank page.
+That fails the rollout, which is the intended way to find out.
+
+**The browser is given no token, on purpose.** The UI has no login and no place to put one, because
+the token it would collect is the same credential that opens the *agent* API: anything holding it
+can claim to be a node and read every node's RDMA rkeys. So with `auth.enabled` — the default — the
+page loads and every API call from it returns 401 until something in front of the server injects
+the header. That is every call, reads included — there is no degraded read-only mode to fall back
+on, which is why this has to be arranged rather than worked around. Two ways:
+
+- **Inject `Authorization` at the ingress.** The answer the same-origin design exists to make
+  available: the browser never holds the credential. How depends on the controller. With
+  ingress-nginx it is a `configuration-snippet` annotation adding
+  `proxy_set_header Authorization "Bearer …";` — note that snippet annotations are disabled by
+  default in current versions, and that an annotation is a poor home for a literal token. A gateway
+  or auth proxy already fronting this route is the better place.
+- **`auth.enabled: false`**, where the network is genuinely trusted. Read the warning `helm install`
+  prints first: the same switch opens the agent API to anything that can reach it.
+
+The other supported shape is a proxy fronting the app and the API on one origin, in which case
+leave this off. Turning it on as well is two copies of the app, one of them whichever binary is
+oldest.
+
 ## Upgrades
 
 **The server rolls first.** It must tolerate agents a version or more behind, agents may assume the
@@ -305,6 +348,36 @@ carry `prometheus.io/scrape` annotations by default (`metrics.annotations`).
 For prometheus-operator, `metrics.serviceMonitor.enabled` covers the server and
 `metrics.podMonitor.enabled` covers every agent pool. The agents have no Service, deliberately —
 hostNetwork with a hostPort is how a node's metrics are reachable — so they are scraped as pods.
+
+## Tuning flags
+
+The chart passes only the flags it decides itself: the listen addresses, the store backend and
+path, the agent's config file, its port range and its start rate. Everything else is left at the
+binary's own default, so the chart does not carry a second copy of those defaults that can drift
+out of step with the binary.
+
+Three server timings are surfaced as values because a fleet on a slow or lossy network is the case
+that needs them, and each is empty by default:
+
+```yaml
+server:
+  heartbeatInterval: 10s
+  leaseTTL: 30s
+  maxLongPollWait: 60s
+```
+
+Anything else goes through `extraArgs`, which is appended verbatim:
+
+```yaml
+server:
+  extraArgs: [--server-idle-teardown, 10m, --server-provider-order, "verbs,tcp"]
+agent:
+  extraArgs: [--agent-flow-idle-after, 5s]
+```
+
+`mxl-replicator run --help` lists the full set. One coupling to know about: the agent's working
+directory is an in-memory `emptyDir` mounted at the binary's default `/run/mxl-replicator`, so
+overriding `--agent-work-dir` means moving that mount with `agent.extraVolumeMounts` too.
 
 ## Values
 

@@ -112,6 +112,8 @@ type AgentOptions struct {
 	StartBurst int     `help:"How many workers may start at once before --agent-start-rate applies." default:"2"`
 
 	WorkerBinary string `help:"Path to the data-plane worker binary." default:"mxl-replicator-worker" env:"MXL_REPLICATOR_WORKER_BINARY"`
+
+	LogTailBytes int `help:"Bytes of each worker's output to keep, pushed to the server when the worker fails (§12.2). Node-local: the server caps what it will store independently." default:"8192"`
 	// Fresh directory per worker *start* (not per logical worker): the worker does not
 	// unlink a pre-existing metrics socket before binding, so a leftover file from a
 	// SIGKILL is a fatal EADDRINUSE (WRS §6). Stale directories are swept at startup.
@@ -222,6 +224,12 @@ func (c *AgentOptions) Validate() error {
 	if c.StartBurst < 1 {
 		return fmt.Errorf("--start-burst must be at least 1; use --start-rate 0 to turn rate control off")
 	}
+	// Zero takes the built-in default rather than meaning "keep nothing", which is the idiom
+	// every other size in this file follows. The sentinel direction §2.2 argues about — where zero
+	// has to mean the *safe* thing — does not arise: neither reading works out to stopping media.
+	if c.LogTailBytes < 0 {
+		return fmt.Errorf("--log-tail-bytes cannot be negative; 0 takes the default")
+	}
 
 	// The merged picture, and the only place that has one. **The one rule left is that no two
 	// areas share a path** (§10.6): areas may nest, and the innermost containing one names a
@@ -320,10 +328,11 @@ func (c *AgentOptions) build(ctx context.Context, logger *slog.Logger) (*agent.A
 	}
 
 	launcher, err := exec.NewLauncher(exec.Options{
-		Binary:   c.WorkerBinary,
-		WorkRoot: c.WorkDir,
-		LogLevel: c.workerLogLevel(ctx, logger),
-		Logger:   logger.With("module", "worker"),
+		Binary:       c.WorkerBinary,
+		WorkRoot:     c.WorkDir,
+		LogLevel:     c.workerLogLevel(ctx, logger),
+		LogTailBytes: c.LogTailBytes,
+		Logger:       logger.With("module", "worker"),
 	})
 	if err != nil {
 		return nil, err

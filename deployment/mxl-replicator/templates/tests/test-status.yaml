@@ -1,7 +1,7 @@
 {{- if .Values.server.enabled }}
 {{- /*
 `helm test` runs the CLI against the deployed server, which exercises the Service, the token and
-the user API in one call — and prints the fleet, so a failing install says which part is not up.
+the user API in one call. It prints the fleet, so a failing install says which part is not up.
 */}}
 apiVersion: v1
 kind: Pod

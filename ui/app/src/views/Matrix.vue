@@ -49,12 +49,14 @@ import type { LegEdit, SourceEdit, Verb, Want } from '@/model/staging'
 import type { SourcePrefill } from '@/model/unrouted'
 import { useFleetStore } from '@/stores/fleet'
 import { useNamespaceStore } from '@/stores/namespaces'
+import { useSectionStore } from '@/stores/sections'
 import { useStagingStore } from '@/stores/staging'
 
 const props = defineProps<{ namespace: string }>()
 
 const fleet = useFleetStore()
 const namespaces = useNamespaceStore()
+const sections = useSectionStore()
 const staging = useStagingStore()
 
 const mode = computed(() => namespaces.mode(props.namespace))
@@ -442,8 +444,12 @@ function legTitle(cell: MatrixCell): string {
   if (storedParked(id, matrix.value.columns[cell.column]!.key)) {
     return `Remove this leg from ${request}. It is parked, so nothing stops.${empty}`
   }
-  return cell.count > 0
-    ? `Remove this leg from ${request}. It is carrying ${plural(cell.count, 'path')}, which stop.${empty}`
+  // `carrying`, never `count`: the drawn count is 0 the moment a park is staged, and a leg staged
+  // for parking is still carrying every path it had. Naming the cost off the board would make this
+  // `×` say "carrying nothing" about media it is about to stop, which is the one thing the
+  // stored-parked guard above exists to prevent.
+  return cell.carrying > 0
+    ? `Remove this leg from ${request}. It is carrying ${plural(cell.carrying, 'path')}, which stop.${empty}`
     : `Remove this leg from ${request}. It is carrying nothing.${empty}`
 }
 
@@ -453,8 +459,10 @@ function columnTitle(column: MatrixColumn): string {
   }
   const scope = `Remove ${column.node} ${column.domain} from ` +
     `${plural(column.requests.length, 'request')}.`
-  return column.paths > 0
-    ? `${scope} ${plural(column.paths, 'path')} land here, which stop.`
+  // The same rule as the leg's, for the same reason: all three `×`s name the paths they stop, and a
+  // column the operator has staged off is still carrying them.
+  return column.carrying > 0
+    ? `${scope} ${plural(column.carrying, 'path')} land here, which stop.`
     : `${scope} Nothing lands here, so nothing stops.`
 }
 
@@ -812,38 +820,62 @@ const pathLine = (path: Path) =>
 
     <!-- The rectangle's own line. `PARTIAL` is the rectangle's word and it never appears on a path;
          the state is the server's own, never the local fold, because the server also folds leg
-         failures that produce no path and there is nothing here to recompute them from. -->
+         failures that produce no path and there is nothing here to recompute them from.
+         Foldable, with the strip below it, because both are bounded by what the fleet holds rather
+         than by the window: a namespace with forty rectangles and a fleet with two hundred unrouted
+         flows leave the grid a strip of the screen, and the grid is what the screen is for. -->
     <section v-if="matrix.requests.length" class="requests">
-      <h2>Requests</h2>
-      <div v-for="entry in matrix.requests" :key="entry.id" class="request">
-        <span class="swatch" :class="accentClass(entry.accent)"></span>
-        <span class="mono col name" :title="entry.id">{{ entry.name }}</span>
-        <!-- A draft has no state to report and the vocabulary has no word for *not written*, so it
-             says what it is instead of borrowing one. `WAITING` is what the synthesised status
-             carries and nothing renders it — this is the check that keeps that true. -->
-        <span
-          v-if="staging.isDraft(entry.id)"
-          class="col state draft-word"
-          title="Authored here, not created"
-        >draft</span>
-        <span v-else class="col state" :class="`state-${entry.request.status.state}`">
-          {{ entry.request.status.state }}
-        </span>
-        <span class="col shape dim">
-          {{ plural(entry.rows.length, 'source') }} × {{ plural(entry.columns.length, 'destination') }}
-        </span>
-        <span class="col tally dim">{{ plural(entry.paths, 'path') }}</span>
-        <!-- §7a: request-level things belong to the rectangle rather than to a row, because a row
-             can be a source of more than one request. This is the only one of them so far. -->
+      <h2>
         <button
           type="button"
-          class="dup"
-          :aria-disabled="staging.isDraft(entry.id)"
-          :title="duplicateTitle(entry)"
-          @click="staging.isDraft(entry.id) ? undefined : openSource(entry.request)"
-        >duplicate</button>
-        <span class="reason">{{ entry.request.status.reason }}</span>
-      </div>
+          class="fold"
+          :aria-expanded="!sections.folded('requests')"
+          :title="sections.folded('requests')
+            ? 'Show the request list'
+            : 'Hide the request list and give the grid the room. Nothing here is a state the grid does not draw.'"
+          @click="sections.toggle('requests')"
+        >
+          <span class="caret" aria-hidden="true">{{ sections.folded('requests') ? '▸' : '▾' }}</span>Requests
+        </button>
+        <!-- Kept when folded, on the strip's rule: a folded section still says how much is in it.
+             Drafts spliced in the same way the page header does it, and for the same reason. -->
+        <span class="tally-head dim">
+          {{ plural(matrix.requests.length - draftCount, 'request')
+          }}<span v-if="draftCount > 0" class="draft-word"> · {{ draftCount }} draft</span>
+        </span>
+      </h2>
+
+      <template v-if="!sections.folded('requests')">
+        <div v-for="entry in matrix.requests" :key="entry.id" class="request">
+          <span class="swatch" :class="accentClass(entry.accent)"></span>
+          <span class="mono col name" :title="entry.id">{{ entry.name }}</span>
+          <!-- A draft has no state to report and the vocabulary has no word for *not written*, so it
+               says what it is instead of borrowing one. `WAITING` is what the synthesised status
+               carries and nothing renders it — this is the check that keeps that true. -->
+          <span
+            v-if="staging.isDraft(entry.id)"
+            class="col state draft-word"
+            title="Authored here, not created"
+          >draft</span>
+          <span v-else class="col state" :class="`state-${entry.request.status.state}`">
+            {{ entry.request.status.state }}
+          </span>
+          <span class="col shape dim">
+            {{ plural(entry.rows.length, 'source') }} × {{ plural(entry.columns.length, 'destination') }}
+          </span>
+          <span class="col tally dim">{{ plural(entry.paths, 'path') }}</span>
+          <!-- §7a: request-level things belong to the rectangle rather than to a row, because a row
+               can be a source of more than one request. This is the only one of them so far. -->
+          <button
+            type="button"
+            class="dup"
+            :aria-disabled="staging.isDraft(entry.id)"
+            :title="duplicateTitle(entry)"
+            @click="staging.isDraft(entry.id) ? undefined : openSource(entry.request)"
+          >duplicate</button>
+          <span class="reason">{{ entry.request.status.reason }}</span>
+        </div>
+      </template>
     </section>
 
     <!-- The other half of the axes: the grid draws intent, and this is the inventory that intent has
@@ -925,7 +957,39 @@ h2 {
   letter-spacing: 0.06em;
   color: var(--fg-dim);
   margin: 0 0 8px;
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
 }
+
+/* The section title, which is also the fold control — the same shape the strip's header uses, so
+   the two sections under the grid fold the same way. A button reset that changes no geometry: the
+   heading keeps its own type, so folding cannot move the tally beside it. */
+.fold {
+  background: none;
+  border: 0;
+  color: inherit;
+  cursor: pointer;
+  font: inherit;
+  letter-spacing: inherit;
+  padding: 0;
+  text-transform: inherit;
+}
+
+.fold:hover { color: var(--fg); }
+.fold:focus-visible { outline: 1px solid var(--accent); }
+
+/* Fixed width, because `▸` and `▾` are not: a caret sized by its own glyph would shift the word
+   beside it every time the section is folded. */
+.caret {
+  display: inline-block;
+  width: 10px;
+  color: var(--fg-faint);
+}
+
+/* The header's own count, which is what a folded section has left to say for itself. Not uppercase
+   like the heading it sits in: it is a reading rather than a label. */
+.tally-head { font-weight: 400; text-transform: none; letter-spacing: 0; }
 
 /* The grid scrolls in both directions inside its own box, so the headers can stick to its edges
    rather than to the page's. */

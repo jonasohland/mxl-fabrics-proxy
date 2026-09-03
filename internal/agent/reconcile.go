@@ -31,8 +31,15 @@ func (a *Agent) reconcile(ctx context.Context, set *api.AssignmentSet) {
 	desired := make(map[unitKey]worker.Spec, len(set.Assignments))
 	rejected := map[unitKey]string{}
 
+	// The path each session realises, so that what a unit observes can be anchored on the right
+	// object in the event log (§12.1). The session is the wrong key there — it ends at every
+	// re-establishment, and the log has to span those.
+	paths := make(map[unitKey]string, len(set.Assignments))
+
 	for _, assignment := range set.Assignments {
 		key := unitKey{Session: assignment.SessionID, Role: assignment.Role}
+		paths[key] = assignment.PathID
+
 		spec, err := a.specFor(key, assignment)
 		if err != nil {
 			// Recorded and reported rather than dropped: an assignment this node cannot honour
@@ -41,6 +48,18 @@ func (a *Agent) reconcile(ctx context.Context, set *api.AssignmentSet) {
 			a.log.Error("cannot honour an assignment",
 				"session", key.Session, "role", string(key.Role), "error", err)
 			rejected[key] = err.Error()
+
+			// And on the path's own log, which is where an operator looks. The status carries the
+			// reason for as long as the assignment stands; this survives it being withdrawn, which
+			// is exactly the case where the reason would otherwise vanish before anyone read it.
+			if was := a.wasRejected(key); was != err.Error() {
+				a.emit(api.AgentEvent{
+					Path: assignment.PathID, Kind: api.EventAssignmentRejected,
+					Severity: api.SeverityError, At: a.now(),
+					Session: key.Session, Role: key.Role,
+					Message: "cannot honour this assignment: " + err.Error(),
+				})
+			}
 			continue
 		}
 		desired[key] = spec
@@ -53,7 +72,7 @@ func (a *Agent) reconcile(ctx context.Context, set *api.AssignmentSet) {
 
 	a.stopUndesired(running, desired)
 	a.materialise(desired)
-	a.startMissing(ctx, desired)
+	a.startMissing(ctx, desired, paths)
 	a.publishProvenance()
 
 	a.Notify()
@@ -170,12 +189,12 @@ func (a *Agent) stopUndesired(running map[unitKey]*unit, desired map[unitKey]wor
 }
 
 // startMissing starts a worker for every desired unit that is not already running.
-func (a *Agent) startMissing(ctx context.Context, desired map[unitKey]worker.Spec) {
+func (a *Agent) startMissing(ctx context.Context, desired map[unitKey]worker.Spec, paths map[unitKey]string) {
 	for key, spec := range desired {
 		a.mu.Lock()
 		_, running := a.units[key]
 		if !running {
-			u := a.newUnit(key, spec)
+			u := a.newUnit(key, spec, paths[key])
 			a.units[key] = u
 			a.mu.Unlock()
 

@@ -116,8 +116,12 @@ type Config struct {
 	Logger *slog.Logger
 	Now    func() time.Time
 
-	PollWait          time.Duration
-	ReportInterval    time.Duration
+	PollWait       time.Duration
+	ReportInterval time.Duration
+
+	// EventQueue bounds how many event-log entries this agent buffers between reports (§12.1).
+	// Zero takes [DefaultEventQueue].
+	EventQueue        int
 	RestartWindow     time.Duration
 	BackoffMin        time.Duration
 	BackoffMax        time.Duration
@@ -167,6 +171,11 @@ type Agent struct {
 	// starts paces worker starts (§6.3). Read by every supervision goroutine and by the metrics
 	// collector; set once in New and never replaced.
 	starts *startGate
+
+	// events is what this agent has observed and not yet reported (§12.1). Bounded and in memory:
+	// nothing here survives a restart, which is why the event log is a diagnostic aid rather than
+	// an audit log.
+	events *eventQueue
 
 	// notify wakes the report loop. Capacity one and a non-blocking send: it is a "something
 	// changed" edge, and coalescing several into one report is the point.
@@ -242,6 +251,7 @@ func New(cfg Config) (*Agent, error) {
 		units:    map[unitKey]*unit{},
 		rejected: map[unitKey]string{},
 		starts:   newStartGate(cfg.StartRate, cfg.StartBurst),
+		events:   newEventQueue(cfg.EventQueue),
 		notify:   make(chan struct{}, 1),
 	}, nil
 }
@@ -538,6 +548,30 @@ func (a *Agent) report(ctx context.Context) (lostIdentity bool) {
 			return a.reportFailed(ctx, err, "status")
 		}
 		a.acceptedStatus(encoded)
+	}
+
+	// Events go **after** status, deliberately. A status snapshot is on the establishment path —
+	// a target's epoch reaches the server here and the peer's initiator cannot be assigned until
+	// it does (§5.3) — and the event batch is diagnostics. Sending diagnostics first would put
+	// them in front of media coming up.
+	//
+	// There is no compare-before-send here and there must not be: events are a stream, and the
+	// thing that keeps them from becoming the fleet's loudest writer is that a quiet node produces
+	// none at all (§12.1).
+	if batch, dropped := a.events.take(); len(batch) > 0 || dropped > 0 {
+		report := api.EventBatch{
+			Node:     a.cfg.Node,
+			Instance: a.cfg.Instance,
+			Events:   batch,
+			Dropped:  dropped,
+		}
+		if err := a.cfg.Client.ReportEvents(ctx, report); err != nil {
+			// Put it back rather than dropping it: delivery is at-least-once and the server
+			// de-duplicates on the sequence numbers, so re-sending costs nothing and losing a batch
+			// to a transport error costs the entries that explain whatever is going wrong.
+			a.events.restore(batch, dropped)
+			return a.reportFailed(ctx, err, "events")
+		}
 	}
 
 	return false

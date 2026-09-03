@@ -11,10 +11,44 @@ import "net/url"
 // never mutate desired state" a property you can see in a key rather than a rule someone has
 // to remember.
 const (
-	PrefixDesired  = "/desired/"
-	PrefixObserved = "/observed/"
-	PrefixDerived  = "/derived/"
+	PrefixDesired  = PrefixSnapshot + "desired/"
+	PrefixObserved = PrefixSnapshot + "observed/"
+	PrefixDerived  = PrefixSnapshot + "derived/"
 )
+
+// PrefixSnapshot is the root the three state layers live under: what the fleet snapshot lists, and
+// what the reconcile loop watches.
+//
+// **The three layers are nested under one root so that a single range covers exactly the state and
+// nothing else.** §7.3 requires the snapshot to be *one* List, because three lists give three
+// revisions and a reconcile computed across a skewed snapshot can conclude that a session both
+// should and should not exist. Until the event log (§12.1) the only prefix covering all three was
+// the empty one — every key in the store — and that is no longer acceptable in either direction:
+//
+//   - **Reads.** Every user-API read loads the whole snapshot and runs Compute (§7.3). Sized
+//     against §14 — a fleet of a thousand paths, each with a bounded ring and a stored log tail —
+//     an unscoped list drags megabytes of diagnostics over the wire on every read, to discard them.
+//   - **Writes.** A watch on the empty prefix sees the events the reconciler itself just wrote and
+//     wakes it for them. It would converge, since the next pass changes nothing, but it would
+//     double every pass that recorded anything and put the event log on the establishment path.
+//
+// Nesting rather than choosing a clever byte range is the point: `/desired/`, `/derived/` and
+// `/observed/` share no prefix but their first character, and two of them do not even share that,
+// so any range built on their spelling would be an accident waiting for a fourth layer to break
+// it. A layer outside this root would be **silently absent from every snapshot**, which is
+// indistinguishable from a wiped store and is the one failure §4.2 exists to prevent. A test pins
+// the invariant, and a new layer belongs in that test before it belongs in a key.
+const PrefixSnapshot = "/state/"
+
+// PrefixEvents is the event log (§12.1): bounded per-object rings, and the worker log tails of
+// §12.2.
+//
+// **A fourth prefix and deliberately not a fourth layer.** It is diagnostics *about* the three
+// above rather than state of its own: nothing reconciles against it, no decision reads it, and the
+// fleet snapshot excludes it. That exclusion is not tidiness — every user-API read is O(fleet)
+// because it loads the whole store and runs Compute (§7.3), so folding a diagnostic log into the
+// snapshot would make every unrelated read pay for it.
+const PrefixEvents = "/events/"
 
 // PrefixElection is where leader election puts its keys (§8.2).
 //
@@ -131,6 +165,60 @@ func SessionKey(sessionID string) string { return PrefixSessions + escape(sessio
 
 // AssignmentsKey is one node's assignment set.
 func AssignmentsKey(node string) string { return PrefixAssignments + escape(node) }
+
+// The four event key spaces (§12.1). Each holds one bounded ring per object in a single value,
+// rather than one key per event: an append-only stream would need sequencing, gap detection,
+// compaction and a garbage collector, and a ring in one value needs none of them — it reads in one
+// Get, it is bounded by construction, and it is deleted by deleting one key.
+const (
+	// PrefixPathEvents is the event ring for one path, and **the path is the unit of retention**.
+	//
+	// Not the session: a session is ephemeral (§3), and a session-scoped log would split the story
+	// at exactly the boundary under investigation, since a re-establishment is where one session
+	// ends and the next begins. A path ID is also stable across server restarts and leader changes
+	// (§5.4, §7.3), where a session ID changes whenever the source flow definition does — which is
+	// what a log needs from its key.
+	PrefixPathEvents = PrefixEvents + "paths/"
+
+	// PrefixRequestEvents is the event ring for one request, keyed `<ns>/<name>` like the request
+	// itself (§9.1). It holds only what is genuinely request-scoped — admission refusals, an
+	// expansion that changed, a path lost to precedence — rather than a copy of its paths' entries.
+	PrefixRequestEvents = PrefixEvents + "requests/"
+
+	// PrefixNodeEvents is the event ring for one node: registration, lease expiry, claims, probe
+	// results, start-permit saturation. Cheap by construction, and it is the log that still exists
+	// after a node's paths are gone.
+	PrefixNodeEvents = PrefixEvents + "nodes/"
+
+	// PrefixLogs is the worker log tail for one path (§12.2), stored apart from the ring so that a
+	// UI polling events does not carry a few KiB per failure on every poll.
+	PrefixLogs = PrefixEvents + "logs/"
+)
+
+// KeyFleetEvents is the control plane's own event ring: what happened to the fleet rather than to
+// one object in it — a leader taking over, a settling window closing.
+//
+// It exists because the entries that explain a **gap** belong to no object. A leader change leaves
+// every path's log missing whatever changed during it (§12.1), and writing that marker into a
+// thousand path rings would be a store storm at the exact moment the fleet is already churning.
+// One write, and every read merges this ring into what it returns — so the marker is visible in
+// the log where the gap is, without being stored there.
+const KeyFleetEvents = PrefixEvents + "fleet"
+
+// PathEventsKey is one path's event ring.
+func PathEventsKey(pathID string) string { return PrefixPathEvents + escape(pathID) }
+
+// RequestEventsKey is one request's event ring, keyed on the `(namespace, name)` pair that is its
+// ID — two segments, escaped independently, exactly as [RequestKey] is.
+func RequestEventsKey(ns, name string) string {
+	return PrefixRequestEvents + escape(ns) + "/" + escape(name)
+}
+
+// NodeEventsKey is one node's event ring.
+func NodeEventsKey(node string) string { return PrefixNodeEvents + escape(node) }
+
+// LogKey is the last failing worker's log tail for one path.
+func LogKey(pathID string) string { return PrefixLogs + escape(pathID) }
 
 // escape makes an operator-assigned name safe to concatenate into a key.
 //

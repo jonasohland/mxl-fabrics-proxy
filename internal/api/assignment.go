@@ -80,6 +80,18 @@ type Assignment struct {
 	SessionID string `json:"session_id"`
 	Role      Role   `json:"role"`
 
+	// PathID is the path this session realises, carried so that an agent can anchor what it
+	// observes on the right object in the event log (§12.1).
+	//
+	// The path is the unit of retention there, and the agent otherwise knows only its session —
+	// which is the wrong key, because a session ends at every re-establishment and the log has to
+	// span those. Resolving session → path server-side instead would put a fleet load on the
+	// event endpoint, which is the one user-API read that is O(response) rather than O(fleet).
+	//
+	// It is **not** part of the "already correct" test: it is derived from the same identity the
+	// session ID is (§5.4), so it cannot change while the session does not.
+	PathID string `json:"path_id,omitempty"`
+
 	// Epoch is the target incarnation this assignment is for (§5.2).
 	//
 	// Absent for a target assignment: the target *produces* the epoch. Required for an

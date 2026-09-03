@@ -129,3 +129,28 @@ func StatusPath(node string) string { return agentNodePath(node) + "/status" }
 
 // AssignmentsPath is /agent/v1/{node}/assignments.
 func AssignmentsPath(node string) string { return agentNodePath(node) + "/assignments" }
+
+// EventsPath is /agent/v1/{node}/events (§9.2, §12.1).
+//
+// The one agent report that is a stream rather than a snapshot, and a separate endpoint for
+// exactly that reason: `inventory` and `status` are compared before sending (§6), and an event
+// folded into a compared snapshot is dropped when it repeats and re-sent forever when it does not.
+func EventsPath(node string) string { return agentNodePath(node) + "/events" }
+
+// PathEventsPath is /v1/paths/{id}/events — what happened to one path (§12.1).
+func PathEventsPath(id string) string { return PathPaths + "/" + url.PathEscape(id) + "/events" }
+
+// PathLogsPath is /v1/paths/{id}/logs — the last failing worker's log tail (§12.2).
+func PathLogsPath(id string) string { return PathPaths + "/" + url.PathEscape(id) + "/logs" }
+
+// RequestEventsPath is /v1/namespaces/{ns}/requests/{name}/events.
+func RequestEventsPath(id RequestID) string { return RequestPath(id) + "/events" }
+
+// NodeEventsPath is /v1/nodes/{node}/events.
+func NodeEventsPath(node string) string { return NodePath(node) + "/events" }
+
+// QuerySince is an event poller's cursor: the highest sequence number it has already seen (§12.1).
+//
+// A sequence number rather than a timestamp, because entries are stamped by whoever emitted them
+// and a merged view interleaves several clocks — the sequence is the only thing that orders a ring.
+const QuerySince = "since"

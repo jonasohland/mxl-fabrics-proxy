@@ -33,8 +33,8 @@ spec:
 {{- end }}
 {{- if and .Values.agent.enabled .Values.metrics.podMonitor.enabled }}
 {{- /*
-The agents have no Service — hostNetwork with a hostPort is how a node's metrics are reachable —
-so they are scraped as pods. Worker metrics are gathered on demand inside the request, through a
+The agents have no Service, because hostNetwork with a hostPort is how a node's metrics are
+reachable, so they are scraped as pods. Worker metrics are gathered on demand inside the request, through a
 bounded pool with per-worker and overall deadlines, so a generous scrapeTimeout is not wasted.
 */}}
 ---

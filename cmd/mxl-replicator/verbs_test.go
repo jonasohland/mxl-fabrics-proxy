@@ -297,7 +297,7 @@ func TestAMistypedVerbIsNotSwallowedByTheDefaultCommand(t *testing.T) {
 
 	// Every verb the binary actually has, so adding one to [CLI] cannot leave it unreachable.
 	assert.ElementsMatch(t,
-		[]string{"run", "apply", "delete", "label", "status", "get", "describe"}, commands)
+		[]string{"run", "apply", "delete", "label", "status", "get", "describe", "events", "logs"}, commands)
 	for _, verb := range commands {
 		assert.NoError(t, guardDefaultCommand(commands, []string{verb}), "verb %q", verb)
 	}

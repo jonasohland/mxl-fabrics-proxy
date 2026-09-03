@@ -9,5 +9,7 @@ import './styles/base.css'
 import './styles/editor.css'
 // Global for the same reason and prefixed `dt-`: six detail views share one shape.
 import './styles/detail.css'
+// And `ls-`: three index views share one table.
+import './styles/list.css'
 
 createApp(App).use(createPinia()).use(router).mount('#app')

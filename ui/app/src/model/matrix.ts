@@ -93,6 +93,16 @@ export interface MatrixColumn {
   /** Rows with a lit cell here. A column is **additive**, and this is the number that says so. */
   sources: number
   paths: number
+  /**
+   * What the **server** is carrying here, which is not what the grid is drawing.
+   *
+   * {@link paths} counts the drawn set, so a leg staged for parking drops out of it the moment it is
+   * clicked — which is right for the board and wrong for a `×`. Staged dark is not dark: nothing has
+   * been written, the media is still moving, and a control that named its cost from the drawn count
+   * would say "nothing stops" over paths it is about to stop. Read this for anything that states a
+   * cost and {@link paths} for anything that describes the board.
+   */
+  carrying: number
 }
 
 export interface MatrixCell {
@@ -114,6 +124,16 @@ export interface MatrixCell {
   state: RequestState | undefined
   count: number
   paths: Path[]
+  /**
+   * What the **server** is carrying on this pairing, which is not what the cell is drawing.
+   *
+   * {@link count} is the drawn count and is 0 for a leg staged for parking, because the grid stops
+   * drawing it the moment it is clicked. That is right for the board and wrong for the cost of a
+   * `×`: staged dark is not dark, nothing has been written, and those paths are still up. The two
+   * numbers are equal on a screen with nothing staged and differ exactly by what the operator has
+   * authored and not yet applied.
+   */
+  carrying: number
   /**
    * Requests whose rectangle covers this pairing.
    *
@@ -238,6 +258,8 @@ interface ColumnBuild {
   parkedRequests: number
   paths: Set<string>
   sources: Set<number>
+  /** The server's own, for the controls that state a cost — see {@link MatrixColumn.carrying}. */
+  carrying: Set<string>
 }
 
 /** The worst of a set of states by display order, which is worst-first. */
@@ -323,6 +345,7 @@ export function buildMatrix(
           parkedRequests: 0,
           paths: new Set(),
           sources: new Set(),
+          carrying: new Set(),
         }
         columnsByKey.set(key, column)
       }
@@ -348,6 +371,7 @@ export function buildMatrix(
       parkedRequests: 0,
       paths: new Set(),
       sources: new Set(),
+      carrying: new Set(),
     })
   }
 
@@ -375,6 +399,7 @@ export function buildMatrix(
       state: undefined,
       count: 0,
       paths: [],
+      carrying: 0,
       requests: [],
       accent: undefined,
     })),
@@ -384,6 +409,16 @@ export function buildMatrix(
   // pairing whose whole *source* has matched nothing is the "accepted, not yet satisfiable" outcome
   // and the source's own state is the honest word for it.
   const pending: RequestState[][][] = rowBuilds.map(() => columnBuilds.map(() => []))
+
+  /**
+   * What the **server** holds per cell, accumulated beside the drawn set rather than derived from it.
+   *
+   * It has to be gathered before the parked check below, because that is exactly where the two part
+   * company: a destination the operator has staged for parking is skipped for drawing and is still
+   * carrying its paths. Ids rather than a counter, because two requests can light one cell and the
+   * path underneath is one path.
+   */
+  const carrying: Set<string>[][] = rowBuilds.map(() => columnBuilds.map(() => new Set<string>()))
 
   const rectangles: MatrixRequest[] = []
   let accentNext = 0
@@ -439,6 +474,15 @@ export function buildMatrix(
         if (!cell.requests.includes(request.id)) cell.requests.push(request.id)
         cell.accent ??= accent
 
+        // Before the skip, deliberately. A `×` names the paths it stops, and a leg the operator has
+        // only staged for parking is still carrying every one of them.
+        const key = endpointKey(destination)
+        for (const path of owned) {
+          if (endpointKey(path.destination) !== key) continue
+          carrying[row]![column]!.add(path.id)
+          columnBuilds[column]!.carrying.add(path.id)
+        }
+
         if (destination.disabled === true) continue
 
         // Counted as a source of this column because it is authored *and* on — a column reads as
@@ -471,6 +515,11 @@ export function buildMatrix(
   for (const row of cells) {
     for (const cell of row) {
       if (!cell.lit) continue
+
+      // Above the parked check on purpose: a cell drawn dark because the operator staged a park is
+      // the one case where the two counts differ, and it is the case a `×` must not describe as
+      // safe. Skipping it here would zero exactly the number that has to be right.
+      cell.carrying = carrying[cell.row]![cell.column]!.size
 
       // Parked only when *every* request lighting the cell parked its entry: one live claim keeps
       // the leg running and a cell drawn dark over it would be a lie about media that is flowing.
@@ -536,6 +585,7 @@ export function buildMatrix(
       .sort(),
     sources: build.sources.size,
     paths: build.paths.size,
+    carrying: build.carrying.size,
   }))
 
   const heldPaths = paths.filter((path) => held.has(path.id))

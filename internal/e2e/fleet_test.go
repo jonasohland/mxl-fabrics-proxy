@@ -137,6 +137,10 @@ type fleetOptions struct {
 
 	// token turns on bearer authentication.
 	token string
+
+	// serverAdjust edits each replica's config after the defaults are applied, for the handful of
+	// tests that are about a server setting rather than about fleet behaviour.
+	serverAdjust func(*server.Config)
 }
 
 // fleet is a whole control plane in one process: N servers over one backend, and the nodes
@@ -277,7 +281,7 @@ func (f *fleet) newReplica(name string) *replica {
 	backing := f.opts.backend.open(f.t, name)
 	port := freePort(f.t)
 
-	return &replica{
+	r := &replica{
 		t:     f.t,
 		name:  name,
 		url:   fmt.Sprintf("http://127.0.0.1:%d", port),
@@ -295,6 +299,10 @@ func (f *fleet) newReplica(name string) *replica {
 			Reconcile:          f.opts.reconcile,
 		},
 	}
+	if f.opts.serverAdjust != nil {
+		f.opts.serverAdjust(&r.cfg)
+	}
+	return r
 }
 
 // start brings this replica up. The listener, the elector and the reconcile loop are all the

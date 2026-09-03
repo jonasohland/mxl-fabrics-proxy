@@ -43,6 +43,7 @@ type server struct {
 	assignments   map[string][]api.Assignment
 	inventories   []api.InventorySnapshot
 	statuses      []api.StatusSnapshot
+	events        []api.EventBatch
 	registrations []api.NodeRegistration
 	heartbeats    int
 	polls         int
@@ -71,6 +72,7 @@ func newServer(t *testing.T) *server {
 	mux.HandleFunc("POST "+api.AgentPrefix+"/{node}/heartbeat", s.handleHeartbeat)
 	mux.HandleFunc("POST "+api.AgentPrefix+"/{node}/inventory", s.handleInventory)
 	mux.HandleFunc("POST "+api.AgentPrefix+"/{node}/status", s.handleStatus)
+	mux.HandleFunc("POST "+api.AgentPrefix+"/{node}/events", s.handleEvents)
 	mux.HandleFunc("GET "+api.AgentPrefix+"/{node}/assignments", s.handleAssignments)
 
 	s.http = httptest.NewServer(mux)
@@ -133,6 +135,29 @@ func (s *server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	s.mu.Unlock()
 
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *server) handleEvents(w http.ResponseWriter, r *http.Request) {
+	var batch api.EventBatch
+	require.NoError(s.t, json.NewDecoder(r.Body).Decode(&batch))
+
+	s.mu.Lock()
+	s.events = append(s.events, batch)
+	s.mu.Unlock()
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// reportedEvents flattens every batch this server has accepted, in arrival order.
+func (s *server) reportedEvents() []api.AgentEvent {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var out []api.AgentEvent
+	for _, batch := range s.events {
+		out = append(out, batch.Events...)
+	}
+	return out
 }
 
 func (s *server) handleAssignments(w http.ResponseWriter, r *http.Request) {
@@ -452,7 +477,11 @@ func (h *harness) consistently(what string, d time.Duration, cond func() bool) {
 func targetAssignment(sessionID string) api.Assignment {
 	return api.Assignment{
 		SessionID: sessionID,
-		Role:      api.RoleTarget,
+		// The path this session realises, which is what an agent's event-log entries are anchored
+		// on: the session is the wrong key there, because it ends at every re-establishment and
+		// the log has to span those (§12.1).
+		PathID: "p-" + sessionID,
+		Role:   api.RoleTarget,
 		// **One structured domain for both roles.** The resolver takes the area name and the
 		// elements, so nothing outside the CLI's manifest parser turns a domain string back into
 		// path elements (§10.6).

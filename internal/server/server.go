@@ -29,6 +29,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"net"
 	"net/http"
@@ -39,6 +40,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/jonasohland/mxl-replicator/internal/api"
+	"github.com/jonasohland/mxl-replicator/internal/server/events"
 	"github.com/jonasohland/mxl-replicator/internal/server/leader"
 	"github.com/jonasohland/mxl-replicator/internal/server/reconcile"
 	"github.com/jonasohland/mxl-replicator/internal/server/state"
@@ -87,6 +89,42 @@ type Config struct {
 	// settings written into both ends of every session.
 	Reconcile reconcile.Config
 
+	// EventRingSize is how many entries each object's event log holds (§12.1). Zero takes
+	// [api.DefaultEventRingSize].
+	//
+	// A count and never an age: the overnight failure someone arrives to at 09:00 is the case
+	// the log most exists for, and an age bound expires it exactly then.
+	EventRingSize int
+
+	// NoInventoryEvents suppresses recording flows and domains entering and leaving each node's
+	// inventory on that node's event ring (§12.1).
+	//
+	// **Negatively spelled so the zero value is on**, which is what the flag defaults to and
+	// therefore what an embedder should get without asking. This is the one part of the log whose
+	// volume is set by the fleet rather than by the control plane — a node's flows are whatever its
+	// producers are doing — which is why it is the one part with a switch at all. Entries are
+	// batched per reconcile pass, so even a churning node costs one entry per kind per pass rather
+	// than one per flow.
+	NoInventoryEvents bool
+
+	// LogTailBytes caps the worker log tail this server will store per path (§12.2). Zero takes
+	// [api.DefaultLogTailBytes].
+	//
+	// Server-side and independent of what an agent chose to capture, because an endpoint that
+	// accepts unbounded bytes from a node is a store-filling primitive handed to every member of
+	// the fleet.
+	LogTailBytes int
+
+	// UI is the built web UI, served at `/` with an index fallback for the app's own routes.
+	// Nil serves nothing there, which is the default and what a server behind a proxy that
+	// fronts the assets itself wants (`ui.md` §6).
+	//
+	// An [fs.FS] rather than a path on disk: the assets are compiled into the binary, so there is
+	// no directory to deploy beside it, nothing to get out of step with the version serving it,
+	// and no read of an operator-supplied path from a process that also serves an unauthenticated
+	// surface.
+	UI fs.FS
+
 	// Now is the clock, injectable for tests.
 	Now func() time.Time
 }
@@ -120,6 +158,15 @@ type Server struct {
 	// (§4.7).
 	registry *prometheus.Registry
 	metrics  *controlMetrics
+
+	// events is the event log (§12.1). Every replica writes it — an agent's batch lands wherever
+	// its request did, and a diagnostic write that had to find the leader would be lost most of the
+	// time behind a plain load balancer (§8.2).
+	events *events.Recorder
+
+	// ui is the built web UI, or nil when this binary carries none or none was asked for. It is
+	// read only while [Server.routes] builds the mux.
+	ui fs.FS
 
 	now     func() time.Time
 	handler http.Handler
@@ -163,6 +210,16 @@ func New(cfg Config) (*Server, error) {
 	control := newControlMetrics()
 	observed := observe(cfg.Store, control)
 
+	recorder := events.New(events.Options{
+		Store:     observed,
+		Logger:    cfg.Logger.With("module", "events"),
+		RingSize:  cfg.EventRingSize,
+		TailBytes: cfg.LogTailBytes,
+		Now:       cfg.Now,
+		Observe:   control.eventRecorded,
+		Drop:      control.eventDropped,
+	})
+
 	s := &Server{
 		store:       observed,
 		logger:      cfg.Logger,
@@ -176,6 +233,8 @@ func New(cfg Config) (*Server, error) {
 		elector:     cfg.Elector,
 		readCfg:     readCfg,
 		metrics:     control,
+		events:      recorder,
+		ui:          cfg.UI,
 		now:         cfg.Now,
 	}
 
@@ -188,6 +247,9 @@ func New(cfg Config) (*Server, error) {
 		SettlingHeartbeats: cfg.SettlingHeartbeats,
 		Now:                cfg.Now,
 		Hooks:              control.reconcileHooks(),
+		Journal:            recorder,
+
+		NoInventoryEvents: cfg.NoInventoryEvents,
 	})
 
 	s.registerMetrics()

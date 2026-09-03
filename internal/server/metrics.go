@@ -6,6 +6,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 
+	"github.com/jonasohland/mxl-replicator/internal/api"
 	"github.com/jonasohland/mxl-replicator/internal/metrics"
 	"github.com/jonasohland/mxl-replicator/internal/server/reconcile"
 )
@@ -35,12 +36,15 @@ type controlMetrics struct {
 	epochTransitions      *prometheus.CounterVec
 	leaderChanges         prometheus.Counter
 	registrationsRejected *prometheus.CounterVec
+	eventsRecorded        *prometheus.CounterVec
+	eventsDropped         *prometheus.CounterVec
 }
 
 func (m *controlMetrics) collectors() []prometheus.Collector {
 	return []prometheus.Collector{
 		m.storeDuration, m.storeFailures, m.reconcileDuration,
 		m.reconciles, m.epochTransitions, m.leaderChanges, m.registrationsRejected,
+		m.eventsRecorded, m.eventsDropped,
 	}
 }
 
@@ -196,6 +200,23 @@ func newControlMetrics() *controlMetrics {
 		// registrationsRejected covers the two ways a node is turned away: another instance holds its
 		// name (§7.1), or it is newer than this server (§13.1). Both are loud in the log and both are
 		// conditions an operator wants alerting on rather than reading about.
+		// eventsRecorded and eventsDropped are the event log's own accounting (§12.1).
+		//
+		// The dropped counter is labelled by **where** the loss happened, because the two are
+		// different problems: `queue` is an agent whose in-memory batch overflowed before it could
+		// report, `ring` is history aged out of a full ring, `store` and `contention` are this
+		// server failing to write. Both are expected in a bad hour and only the first says
+		// something was never seen at all.
+		eventsRecorded: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: metrics.Control("events_recorded_total"),
+			Help: "Event-log entries written, by kind.",
+		}, []string{"kind"}),
+
+		eventsDropped: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: metrics.Control("events_dropped_total"),
+			Help: "Event-log entries lost, by where: queue, ring, store or contention.",
+		}, []string{"reason"}),
+
 		registrationsRejected: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: metrics.Control("registrations_rejected_total"),
 			Help: "Node registrations refused, by reason.",
@@ -218,4 +239,17 @@ func (m *controlMetrics) reconcileHooks() reconcile.Hooks {
 		},
 		EpochChanged: func(node string) { m.epochTransitions.WithLabelValues(node).Inc() },
 	}
+}
+
+// eventRecorded and eventDropped are the recorder's callbacks (§12.1).
+//
+// Callbacks rather than the recorder holding a registry, for the same reason the reconcile loop
+// takes [reconcile.Hooks]: the event log stays free of a Prometheus dependency, and a test can
+// assert on what it decided without gathering an exposition.
+func (m *controlMetrics) eventRecorded(kind api.EventKind) {
+	m.eventsRecorded.WithLabelValues(string(kind)).Inc()
+}
+
+func (m *controlMetrics) eventDropped(reason string) {
+	m.eventsDropped.WithLabelValues(reason).Inc()
 }

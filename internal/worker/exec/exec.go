@@ -84,6 +84,13 @@ type Options struct {
 	// [DefaultStopGrace].
 	StopGrace time.Duration
 
+	// LogTailBytes is how much of each worker's output to retain for [worker.Handle.LogTail]
+	// (§12.2). Defaults to [logs.DefaultRingBytes].
+	//
+	// Node-local, like the port range and the start rate: it is a property of what this host is
+	// willing to buffer, and the server caps independently what it will accept.
+	LogTailBytes int
+
 	// Logger receives the launcher's own messages and the workers' translated output. Required.
 	Logger *slog.Logger
 }
@@ -94,6 +101,7 @@ type Launcher struct {
 	workRoot  string
 	env       []string
 	stopGrace time.Duration
+	tailBytes int
 	log       *slog.Logger
 }
 
@@ -113,6 +121,7 @@ func NewLauncher(opts Options) (*Launcher, error) {
 		binary:    orDefault(opts.Binary, DefaultBinary),
 		workRoot:  orDefault(opts.WorkRoot, DefaultWorkRoot),
 		stopGrace: opts.StopGrace,
+		tailBytes: opts.LogTailBytes,
 		log:       opts.Logger,
 	}
 	if launcher.stopGrace <= 0 {

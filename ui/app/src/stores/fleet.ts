@@ -103,6 +103,15 @@ export const useFleetStore = defineStore('fleet', () => {
         return
       }
 
+      // Nor is a 401 a failure to report here. The transport has already raised the prompt
+      // (`api/auth.ts`), which says what to do about it; a `Stale` banner over the top would be the
+      // same fact told worse, and would keep counting minutes at an operator whose answer is to type
+      // a token rather than to go looking for a server.
+      if (error instanceof ApiError && error.unauthorized) {
+        lastError.value = undefined
+        return
+      }
+
       storeUnreachable.value = error instanceof ApiError && error.storeUnreachable
       lastError.value = error instanceof Error ? error : new Error(String(error))
     } finally {

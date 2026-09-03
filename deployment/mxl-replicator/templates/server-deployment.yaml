@@ -2,23 +2,20 @@
 {{- $p := .Values.server.persistence }}
 {{- $sqlite := eq .Values.server.store.backend "sqlite" }}
 {{- $store := and $sqlite $p.enabled }}
-{{- $claim := and $store (has $p.type (list "local" "storageClass" "existingClaim")) }}
-{{- $pinned := and $store (has $p.type (list "hostPath" "local")) }}
+{{- $claim := and $store (eq $p.type "pvc") }}
+{{- $pinned := and $store (eq $p.type "hostPath") }}
 {{- $etcdTLS := and (eq .Values.server.store.backend "etcd") .Values.server.store.etcd.tls.existingSecret }}
 
 {{- /*
-Both of these are spelled `x == "sqlite"` / `x == "hostPath"` throughout, so a typo would take the
-other branch silently — an etcd-flavoured command line on a `sqllite` backend, or an emptyDir on a
-`hostpath` store, which loses the request set on every restart and looks like it worked.
+Both of these are compared by equality throughout, so a typo would take the other branch silently:
+an etcd-flavoured command line on a `sqllite` backend, or an emptyDir on a `hostpath` store, which
+loses the request set on every restart and looks like it worked.
 */}}
 {{- if not (has .Values.server.store.backend (list "sqlite" "etcd")) }}
 {{- fail (printf "server.store.backend must be sqlite or etcd, not %q" .Values.server.store.backend) }}
 {{- end }}
-{{- if not (has $p.type (list "hostPath" "local" "existingClaim" "storageClass" "emptyDir")) }}
-{{- fail (printf "server.persistence.type must be one of hostPath, local, existingClaim, storageClass, emptyDir — not %q" $p.type) }}
-{{- end }}
-{{- if and (eq $p.type "existingClaim") (not $p.existingClaim) }}
-{{- fail "server.persistence.type=existingClaim needs server.persistence.existingClaim" }}
+{{- if not (has $p.type (list "hostPath" "pvc" "emptyDir")) }}
+{{- fail (printf "server.persistence.type must be one of hostPath, pvc, emptyDir, not %q" $p.type) }}
 {{- end }}
 {{- if and (eq .Values.server.store.backend "etcd") (not .Values.server.store.etcd.endpoints) }}
 {{- fail "server.store.backend=etcd needs server.store.etcd.endpoints" }}
@@ -27,13 +24,13 @@ other branch silently — an etcd-flavoured command line on a `sqllite` backend,
 {{- /*
 The control plane.
 
-A Deployment rather than a DaemonSet, and it rolls *before* the agents: the server must tolerate
+A Deployment rather than a DaemonSet, and it rolls before the agents. The server must tolerate
 agents a version or more behind, agents may assume the server is at least as new, and the server
 refuses an agent newer than itself.
 
-With sqlite this is one replica, one volume, always the leader — a real production shape for a
-single control-plane node. For HA, point `server.store.backend` at etcd and raise the replica
-count; every replica then serves the API and one of them is elected reconciler leader.
+With sqlite this is one replica, one volume, always the leader, which is the shape a single
+control-plane node takes. For HA, point `server.store.backend` at etcd and raise the replica count.
+Every replica then serves the API and one of them is elected reconciler leader.
 */}}
 apiVersion: apps/v1
 kind: Deployment
@@ -49,13 +46,13 @@ metadata:
   {{- end }}
 spec:
   {{- if $sqlite }}
-  # One. The sqlite backend is single-node; etcd is required for more.
+  # One. The sqlite backend is single-node and etcd is required for more.
   replicas: 1
   strategy:
-    # The volume has one writer and so does sqlite: the old pod must be gone before the new one
-    # starts. A server restart does not glitch media — the settling window and deterministic
-    # session IDs mean the new process adopts running sessions rather than re-establishing them —
-    # so there is nothing to gain from overlapping them.
+    # The volume has one writer and so does sqlite, so the old pod must be gone before the new one
+    # starts. A server restart does not glitch media, because the settling window and deterministic
+    # session IDs mean the new process adopts running sessions rather than re-establishing them.
+    # There is nothing to gain from overlapping them.
     type: Recreate
   {{- else }}
   replicas: {{ .Values.server.replicas }}
@@ -122,7 +119,7 @@ spec:
       volumes:
         {{- if $store }}
         - name: store
-          {{- if eq $p.type "hostPath" }}
+          {{- if $pinned }}
           hostPath:
             path: {{ $p.hostPath }}
             type: DirectoryOrCreate
@@ -151,11 +148,11 @@ spec:
         {{- toYaml . | nindent 8 }}
         {{- end }}
       {{- end }}
-      {{- if and $store $p.initChown.enabled (ne $p.type "emptyDir") }}
+      {{- if and $store $p.initChown (ne $p.type "emptyDir") }}
       initContainers:
-        # The image runs as a non-root user; a directory kubelet just created is owned by root,
-        # and hostPath volumes get no fsGroup treatment from Kubernetes. The uid is resolved
-        # inside the image rather than hardcoded here, so it follows the image.
+        # The image runs as a non-root user, a directory kubelet just created is owned by root,
+        # and hostPath volumes get no fsGroup treatment from Kubernetes. The uid is resolved inside
+        # the image rather than hardcoded here, so it follows the image.
         - name: init-store
           image: {{ include "mxl-replicator.image" . }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
@@ -163,7 +160,7 @@ spec:
           args:
             - |
               set -eu
-              chown -R "$(id -u {{ $p.initChown.user }}):$(id -g {{ $p.initChown.user }})" {{ $p.mountPath }}
+              chown -R "$(id -u mxl):$(id -g mxl)" {{ $p.mountPath }}
           securityContext:
             runAsUser: 0
             runAsGroup: 0
@@ -183,6 +180,11 @@ spec:
         - name: server
           image: {{ include "mxl-replicator.image" . }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- /*
+          Only what the chart itself decides, plus the three timings it surfaces. Every other
+          server flag is left at the binary's default and reachable through `extraArgs`, so this
+          list does not have to be kept in step with the binary's defaults.
+          */}}
           args:
             - run
             - --server
@@ -192,14 +194,12 @@ spec:
             - {{ .Values.server.store.backend | quote }}
             {{- if $sqlite }}
             - --server-store-sqlite-path
-            - {{ .Values.server.store.sqlite.path | quote }}
+            - {{ include "mxl-replicator.storePath" . | quote }}
             {{- else }}
             {{- range .Values.server.store.etcd.endpoints }}
             - --server-store-etcd-endpoints
             - {{ . | quote }}
             {{- end }}
-            - --server-store-etcd-prefix
-            - {{ .Values.server.store.etcd.prefix | quote }}
             {{- if $etcdTLS }}
             - --server-store-etcd-ca
             - /etc/mxl-replicator/etcd/ca.crt
@@ -209,34 +209,32 @@ spec:
             - /etc/mxl-replicator/etcd/tls.key
             {{- end }}
             {{- end }}
+            {{- with .Values.server.heartbeatInterval }}
             - --server-heartbeat-interval
-            - {{ .Values.server.heartbeatInterval | quote }}
+            - {{ . | quote }}
+            {{- end }}
+            {{- with .Values.server.leaseTTL }}
             - --server-lease-ttl
-            - {{ .Values.server.leaseTTL | quote }}
-            - --server-settling-heartbeats
-            - {{ .Values.server.settlingHeartbeats | quote }}
+            - {{ . | quote }}
+            {{- end }}
+            {{- with .Values.server.maxLongPollWait }}
             - --server-max-long-poll-wait
-            - {{ .Values.server.maxLongPollWait | quote }}
-            - --server-provider-order
-            - {{ join "," .Values.server.providerOrder | quote }}
-            - --server-idle-timeout
-            - {{ .Values.server.idleTimeout | quote }}
-            - --server-idle-teardown
-            - {{ .Values.server.idleTeardown | quote }}
-            - --server-connect-timeout
-            - {{ .Values.server.connectTimeout | quote }}
-            - --server-degraded-restarts
-            - {{ .Values.server.degradedRestarts | quote }}
-            - --server-failed-restarts
-            - {{ .Values.server.failedRestarts | quote }}
-            {{- if .Values.server.noNetworkLatencyMeasurement }}
-            - --server-no-network-latency-measurement
+            - {{ . | quote }}
             {{- end }}
             {{- if .Values.server.tls.enabled }}
             - --server-tls-cert
             - /etc/mxl-replicator/tls/tls.crt
             - --server-tls-key
             - /etc/mxl-replicator/tls/tls.key
+            {{- end }}
+            {{- /*
+            The UI is same-origin with the API by construction — same listener, same port, no
+            second Service and nothing to route — so enabling it adds a flag and nothing else. It
+            is a value rather than an extraArg because whether the control plane has a face is a
+            deployment decision, not a tuning one.
+            */}}
+            {{- if .Values.server.ui.enabled }}
+            - --server-ui
             {{- end }}
             {{- with .Values.server.extraArgs }}
             {{- toYaml . | nindent 12 }}
@@ -280,7 +278,7 @@ spec:
             timeoutSeconds: 3
           livenessProbe:
             # Deliberately /healthz and not /readyz. Readiness reports whether the reconciler has
-            # settled; restarting the server because it has not yet would be a loop, and a server
+            # settled. Restarting the server because it has not yet would be a loop, and a server
             # that is up but settling is not a failed one.
             httpGet:
               path: /healthz

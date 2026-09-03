@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
 	"time"
@@ -79,6 +80,15 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 			s.logger.Error("rejecting a second claimant for a node name",
 				"node", node, "claimant", registration.Instance, "holder", claimed.holder)
 			s.metrics.registrationsRejected.WithLabelValues("node_claimed").Inc()
+			// On the node's log as well as this server's, because the two agents involved are on
+			// different hosts and the operator reading about it is on neither (§12.1).
+			if err := s.events.RecordNode(ctx, node, api.Event{
+				Kind: api.EventNodeClaimed, Severity: api.SeverityError, Node: node,
+				Message: fmt.Sprintf("instance %s was refused: %s already holds this node name",
+					registration.Instance, claimed.holder),
+			}); err != nil {
+				s.logger.Warn("recording a claim event failed", "node", node, "error", err)
+			}
 			writeError(w, http.StatusConflict, api.CodeNodeClaimed,
 				"node "+node+" is already claimed by another agent instance",
 				"holder", claimed.holder)
@@ -108,6 +118,20 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 		"fabrics", len(registration.Capabilities.Fabrics),
 		"areas", len(registration.Capabilities.Areas),
 		"mxl", registration.Capabilities.Versions.MXL)
+
+	// Recorded here rather than inferred by the reconciler noticing a new lease, because this is
+	// the moment it happened and this is the only place the instance is known (§12.1).
+	//
+	// It is the entry that answers "why did every path on edge-01 re-establish at 12:04" in one
+	// line rather than in fifty identical path entries: an agent restart re-establishes every flow
+	// on its node (§6.1), and nothing in a path's own log says that is what happened to it.
+	if err := s.events.RecordNode(r.Context(), node, api.Event{
+		Kind: api.EventNodeRegistered, Node: node,
+		Severity: registrationSeverity(registration.Capabilities),
+		Message:  registrationMessage(registration),
+	}); err != nil {
+		s.logger.Warn("recording a registration event failed", "node", node, "error", err)
+	}
 
 	writeJSON(w, http.StatusOK, api.RegistrationResponse{
 		Lease:             strconv.FormatInt(int64(lease), 10),
@@ -470,4 +494,50 @@ func (s *Server) settled(ctx context.Context) (bool, error) {
 		return false, err
 	}
 	return record.Found && record.Value.Settled, nil
+}
+
+// registrationMessage renders what an agent just advertised (§10.2, §12.1).
+//
+// It carries the probe's verdict as well as the fact of registration, because the two arrive
+// together: the probe's result *is* the registration body (§10.5), so a separate entry for it would
+// be the same fact written twice, one store write apart.
+//
+// The versions are here for a reason that is easy to miss. `target_info` is produced by one node's
+// mxl-fabrics and consumed by another's (§10.2), so a pair straddling a version boundary is a
+// compatibility question neither agent can see alone — and this is the only place in the log where
+// a node says which one it is running.
+func registrationMessage(registration api.NodeRegistration) string {
+	writable := 0
+	for _, area := range registration.Capabilities.Areas {
+		if area.Write {
+			writable++
+		}
+	}
+
+	return fmt.Sprintf(
+		"agent instance %s registered: %d fabric attachment(s), %d area(s) (%d writable), mxl %s, libfabric %s",
+		registration.Instance,
+		len(registration.Capabilities.Fabrics),
+		len(registration.Capabilities.Areas), writable,
+		orUnknown(registration.Capabilities.Versions.MXL),
+		orUnknown(registration.Capabilities.Versions.Libfabric))
+}
+
+// registrationSeverity raises a node that advertised no fabric attachment at all.
+//
+// A live configuration mistake rather than a curiosity: every request naming that node fails with
+// `no_shared_fabric` (§7.2), and on the *request* that reads as though the other end were at fault.
+// This is the entry that says which end to look at.
+func registrationSeverity(capabilities api.Capabilities) api.EventSeverity {
+	if len(capabilities.Fabrics) == 0 {
+		return api.SeverityWarn
+	}
+	return api.SeverityInfo
+}
+
+func orUnknown(value string) string {
+	if value == "" {
+		return "unknown"
+	}
+	return value
 }

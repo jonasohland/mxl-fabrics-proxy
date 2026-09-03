@@ -29,6 +29,7 @@ import { RouterLink } from 'vue-router'
 
 import { REQUEST_STATES, renderDomain } from '@/api/types'
 import type { Path, PathStatus, SourceStatus } from '@/api/types'
+import EventLog from '@/components/EventLog.vue'
 import { endpointText, providerText, since } from '@/model/detail'
 import { domainSelectorLabel, plural, selectorLabel, shortId, sourceRef } from '@/model/labels'
 import { countsInOrder } from '@/model/state'
@@ -312,6 +313,14 @@ const notHeld = computed(() => pathRows.value.filter((row) => row.live && !row.h
              not say when it is untrue. -->
         <p v-if="status.excluded_dropped" class="dt-note">and {{ status.excluded_dropped }} more</p>
       </section>
+
+      <!-- The request's own ring merged with those of the paths it currently expands onto — the
+           server does the merge. Its own entries are what is genuinely request-scoped and has no
+           path to live on: an expansion that shrank, a leg parked, a path lost to precedence. The
+           case that proves it needs a log of its own is a request expanding onto **nothing**, where
+           there is no path for "why is this WAITING" to be asked of, and this pane is where that
+           question gets answered. -->
+      <EventLog :subject="{ kind: 'request', namespace: props.namespace, name: props.name }" />
     </template>
   </main>
 </template>
