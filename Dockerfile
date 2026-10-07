@@ -1,4 +1,4 @@
-ARG BASE_IMAGE="jonasohland/mxl:v1.1-rc1-fabrics"
+ARG BASE_IMAGE="jonasohland/mxl:v1.1-fabrics-initiator-auto-cqd-and-iov"
 
 # The web UI, built in its own stage so the image that ships carries no node toolchain and the Go
 # build below still gets the assets to embed. It runs unconditionally — the assets are a few

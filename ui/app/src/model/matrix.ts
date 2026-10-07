@@ -2,7 +2,7 @@
  * The routing matrix (`ui.md` §7a): rows are sources, columns are destinations, a request is a
  * rectangle over them.
  *
- * **The axes are virtual; only the cells are real.** A row is not a domain and a column is not a
+ * **Rows and columns are selectors; only cells hold real paths.** A row is not a domain and a column is not a
  * directory. A row is a *source* — a node, a domain **selector** and a flow **selector** — and
  * `{labels: {role: cameras}}` matches domains that do not exist yet. A column is a *destination*, and
  * a domain a request materialises does not exist until a request names it. Neither axis is a handle

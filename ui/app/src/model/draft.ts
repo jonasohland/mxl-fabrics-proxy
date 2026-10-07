@@ -27,7 +27,7 @@
  * a draft instead, which is what it should have been asking.
  *
  * **Drafts are session-scoped, and that is inherent here rather than a shortcut.** `ui.md` §7a
- * records the prototype's client-side retention of emptied rows as a workaround for *off* having
+ * records a client-side retention of emptied rows as the old workaround for *off* having
  * nowhere to be written down, and `disabled` replaced it. This is the other case and it has no such
  * fix: a request nobody has created has no server-side home by definition, so an authored row is
  * gone on reload and was never there for a second operator. The cost is bounded by the same

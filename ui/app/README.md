@@ -70,41 +70,56 @@ cell, and a control rather than a mode of the click because **it creates a name*
 entries whole — a parked leg stays parked, a per-destination `provider` override comes along — and
 the request-level settings with them.
 
-`ui/prototype/` is no longer the only implementation of anything on screen. The
-**manifest pane** `ui.md` §7a asks for is postponed rather than pending — `docs/open-items.md` §3.4,
+The **manifest pane** `ui.md` §7a asks for is postponed rather than pending — `docs/open-items.md` §3.4,
 where it turned into a question about the system: nothing in this tree renders a manifest at all, so
 the first thing that does should probably not be a second implementation of the grammar in
 TypeScript.
 
 ## Run it
 
-Three processes. None of them needs MXL, libfabric or hardware.
+Two processes, neither of which needs MXL, libfabric or hardware.
 
 ```bash
-# 1. the control plane, on sqlite, in a temp directory
+cd ui/app && nvm use && npm install
+
+# 1. a control plane on :12999 with the fake fleet behind it
+npm run devfleet
+
+# 2. this app, in another terminal
+npm run dev
+```
+
+Then open <http://localhost:5173/>.
+
+`scripts/devfleet.sh` is the fixture of `ui.md` §9 and what `npm run test:live` expects behind the
+server: five nodes with areas, inventory and labels, registered through the agent API with `curl`
+and their leases kept alive, plus the two namespaces the read-only suites assume, `nab` (exclusive)
+and `k8s` (shared). It needs `go`, `curl` and `jq`.
+
+If nothing answers at `$S` (default `http://127.0.0.1:12999`), it builds `cmd/mxl-replicator` and
+starts a server-only instance on a fresh sqlite store in a temp directory, removed again on Ctrl-C —
+so every run starts from an empty store. If something does answer, it registers the fleet into that
+instead, which is how to put it behind a server you are running under a debugger:
+
+```bash
 go build -o /tmp/mxl-replicator ./cmd/mxl-replicator
 /tmp/mxl-replicator run --server \
     --server-listen 127.0.0.1:12999 \
     --server-store-sqlite-path /tmp/mxl-store.db \
     --server-heartbeat-interval 1s --server-lease-ttl 8s
-
-# 2. five fake nodes with areas, inventory and labels, leases kept alive
-S=http://127.0.0.1:12999 ui/prototype/devfleet.sh
-
-# 3. this app
-cd ui/app && nvm use && npm install && npm run dev
 ```
 
-Then open <http://localhost:5173/>.
-
-**Use 12999, not 2283.** 2283 is what a real `mxl-replicator` listens on, and `devfleet.sh`
+**Use 12999, not 2283.** 2283 is what a real `mxl-replicator` listens on, and a fake fleet
 registers nodes through the *agent* API — point it at a fleet somebody is running and it writes
-fake node registrations into their store, which are durable and have no deregister API.
+fake node registrations into their store, which are durable and have no deregister API. The script
+refuses 2283 unless `DEVFLEET_ALLOW_2283=1`.
 
-`devfleet.sh` keeps running on purpose: leases need renewing, and a lease that expires freezes every
-path touching that node. Paths reach `ESTABLISHING` and stop, because nothing runs a worker. That is
-the useful fixture rather than a limitation — it is the state an operator watches while something
-comes up.
+The fake fleet has to keep running: leases need renewing, and a lease that expires freezes every
+path touching that node. A heartbeat answered with `reregister` registers the node again, and if the
+store was wiped the labels and namespaces go back too — so a server restart or an
+`rm /tmp/mxl-store.db` does not need the fleet restarted. Paths reach `ESTABLISHING` and stop,
+because nothing runs a worker. That is the useful fixture rather than a limitation — it is the state
+an operator watches while something comes up.
 
 ## Ship it
 
@@ -143,9 +158,9 @@ npm run check   # vue-tsc
 
 `*.test.ts` is the unit suite and has no dependencies beyond the repo. `*.live.ts` mounts the real
 components and lets them talk to a live server with the fake fleet behind it — real DOM, real fetch,
-real reconciler, real store. That second class is kept because the prototype established it catches
-bugs nothing else does, and the class is consistent: a stale list left over from a previous read,
-two reads landing out of order, a selection carried across a reopen. Each is the page's behaviour
+real reconciler, real store. That second class is kept because it catches bugs nothing
+else does, and the class is consistent: a stale list left over from a previous read, two reads
+landing out of order, a selection carried across a reopen. Each is the page's behaviour
 against a real *sequence* of reads, which is the only place it exists.
 
 jsdom installs its own `AbortController`, which node's `fetch` refuses by identity — `src/test/live.ts`
@@ -153,9 +168,8 @@ works around it and says why. A browser has one matching pair and never sees it.
 
 **The live suites write their own preconditions rather than inheriting them.** `Matrix.live.ts`
 deletes and rewrites the `nab` namespace as an exclusive fixture — a two-source rectangle, a leg
-another namespace also writes into, a parked destination and a selector that matches no flow — for
-the reason the prototype's harness gave: a fixture left behind by an earlier run makes the
-assertions a statement about the store's history rather than about the rule. `Staging.live.ts` seeds
+another namespace also writes into, a parked destination and a selector that matches no flow — because
+a fixture left behind by an earlier run makes the assertions a statement about the store's history rather than about the rule. `Staging.live.ts` seeds
 and then deletes a `staged` namespace of its own, routed clear of every other fixture, and drives the
 gesture end to end: click, stage, dry-run, apply, and the server agreeing that the leg is parked and
 its paths gone. `Index.live.ts` seeds `idx` (exclusive) and `idxs` (shared) and drives the
@@ -362,8 +376,8 @@ have a test named after them.
   from inside one namespace, and it is what makes "emptying this group empties the domain" false.
   The first is on the claim, the second on the group header, and computing the second needs the
   whole path list rather than this namespace's claims.
-- **A cell is always exactly two lines.** Geometry is a correctness property, not styling: cells in
-  a row share a height, so prose in one resizes the row. Reasons live in tooltips. A parked cell is
+- **A cell is always exactly two lines.** Cell and grid sizes must not depend on content (`ui.md`
+  §7a): cells in a row share a height, so prose in one resizes the row. Reasons live in tooltips. A parked cell is
   drawn rather than blanked, because "nobody ever routed this" and "somebody did and switched it
   off" are different sentences.
 - **Rows are grids with fixed tracks, never flex.** Under flex every item is content-sized, so a
@@ -376,7 +390,7 @@ have a test named after them.
   as a distribution rather than a row of identical alarms — `PAUSED` comes up calm and blue where
   `FAILED` comes up red, which is the distinction §11 exists to preserve. The gutter is reserved on
   every path and filled only where there is something to mark, so the accent cannot move the layout
-  it appears in — an inset shadow, never a border, for the same reason the prototype gives.
+  it appears in — an inset shadow, never a border, because a border takes space.
 - **The editors' chrome is one global stylesheet, prefixed `ed-`.** A `<style scoped>` scopes a
   *component*, not the class names inside it, and this app has already paid for that once — a line
   class named `head` inherited `flex-wrap: wrap` from the page header's own `.head` in the same file

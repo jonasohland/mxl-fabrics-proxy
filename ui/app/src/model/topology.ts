@@ -28,7 +28,7 @@
  * selector and a destination domain, which the server expands. Wiring two vertices would be authoring
  * something the model cannot express, so nothing here writes and nothing here stages.
  *
- * ## Layout is a correctness property, exactly as the grid's geometry is
+ * ## Layout must be deterministic, as cell and grid sizes must not depend on content (`ui.md` §7a)
  *
  * This screen polls every three seconds. A layout that depended on iteration order, insertion order
  * or anything non-deterministic would rearrange the fleet under the operator on every tick, which

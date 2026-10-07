@@ -10,12 +10,19 @@
 #include <spdlog/spdlog.h>
 #include <sstream>
 #include <sys/epoll.h>
+#include <sys/eventfd.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <system_error>
 #include <unistd.h>
 
 namespace mxl::proxy {
+
+namespace {
+// epoll_data tags. Sessions are numbered from 1, so neither collides.
+constexpr std::uint64_t listenTag = 0;
+constexpr std::uint64_t wakeTag = UINT64_MAX;
+} // namespace
 
 Metrics::Metrics(std::string const& socketPath, bool withNetworkLatency)
     : _socketPath(socketPath),
@@ -75,24 +82,52 @@ Metrics::Metrics(std::string const& socketPath, bool withNetworkLatency)
 
     auto ev = ::epoll_event{
         .events = EPOLLIN,
-        .data = ::epoll_data{.u64 = 0},
+        .data = ::epoll_data{.u64 = listenTag},
     };
     if (::epoll_ctl(_epollfd, EPOLL_CTL_ADD, _listenFd, &ev) < 0) {
         throw std::system_error{errno, std::generic_category(),
                                 "epoll_ctl (add)"};
     }
 
+    _wakeFd = ::eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+    if (_wakeFd < 0) {
+        throw std::system_error{errno, std::generic_category(), "eventfd"};
+    }
+
+    auto wakeEv = ::epoll_event{
+        .events = EPOLLIN,
+        .data = ::epoll_data{.u64 = wakeTag},
+    };
+    if (::epoll_ctl(_epollfd, EPOLL_CTL_ADD, _wakeFd, &wakeEv) < 0) {
+        throw std::system_error{errno, std::generic_category(),
+                                "epoll_ctl (add wake fd)"};
+    }
+
     _listenThread = std::thread([this]() { run(); });
 }
 
 Metrics::~Metrics() {
+    // Stop the thread before releasing anything it uses. Closing _epollfd
+    // first used to be the stop signal, but it does not wake a blocked
+    // epoll_wait, so the thread could still accept a scrape during teardown.
+    // accept() then returned the descriptor number just freed, epoll_ctl on
+    // that number failed with EINVAL, and the throw from the thread aborted
+    // the process before main could log why the worker was exiting.
+    std::uint64_t one = 1;
+    if (::write(_wakeFd, &one, sizeof one) < 0) {
+        spdlog::error("failed to wake the metrics thread: {}",
+                      ::strerror(errno));
+    }
+    _listenThread.join();
+
     for (auto& [_, session] : _sessions) {
         ::close(session.fd);
     }
-
+    ::close(_listenFd);
+    ::close(_wakeFd);
     ::close(_epollfd);
-    _listenThread.join();
-    std::filesystem::remove_all(_socketPath);
+    std::error_code ec;
+    std::filesystem::remove_all(_socketPath, ec);
 }
 
 void Metrics::observe(std::uint64_t bytes, std::uint64_t payloadBytes,
@@ -109,21 +144,36 @@ void Metrics::observe(std::uint64_t bytes, std::uint64_t payloadBytes,
 }
 
 void Metrics::run() {
+    // Nothing may escape this thread: an uncaught exception here is
+    // std::terminate for the whole worker, for the sake of a metrics scrape.
+    try {
+        serve();
+    } catch (std::exception const& ex) {
+        spdlog::error("metrics server stopped: {}", ex.what());
+    }
+}
+
+void Metrics::serve() {
     std::array<::epoll_event, 16> events{};
 
     for (;;) {
-        auto ret = ::epoll_wait(_epollfd, events.data(), events.size(), 1000);
+        auto ret = ::epoll_wait(_epollfd, events.data(), events.size(), -1);
         if (ret < 0) {
             auto const error = errno;
-            if (error != EBADF) {
-                spdlog::error("epoll err: {}", ::strerror(errno));
+            // SIGTERM may be delivered to this thread rather than the main one.
+            if (error == EINTR) {
+                continue;
             }
+            spdlog::error("epoll err: {}", ::strerror(error));
             return;
         }
 
         for (auto i = 0; i < ret; ++i) {
             auto& ev = events[i];
-            if (ev.data.u64 == 0) {
+            if (ev.data.u64 == wakeTag) {
+                return;
+            }
+            if (ev.data.u64 == listenTag) {
                 if (ev.events & EPOLLIN) {
                     accept();
                 }
@@ -140,19 +190,18 @@ void Metrics::run() {
 }
 
 void Metrics::accept() {
-    ::sockaddr_un addr;
-    ::socklen_t len = sizeof addr;
     for (;;) {
-        auto sock =
-            ::accept(_listenFd, reinterpret_cast<::sockaddr*>(&addr), &len);
+        auto sock = ::accept4(_listenFd, nullptr, nullptr,
+                              SOCK_NONBLOCK | SOCK_CLOEXEC);
         if (sock < 0) {
             auto const error = errno;
-            if (error == EWOULDBLOCK || error == EAGAIN) {
-                return;
+            if (error == EINTR || error == ECONNABORTED) {
+                continue;
             }
-
-            throw std::system_error{error, std::generic_category(),
-                                    "accept failed"};
+            if (error != EWOULDBLOCK && error != EAGAIN) {
+                spdlog::error("metrics accept failed: {}", ::strerror(error));
+            }
+            return;
         }
 
         createSession(sock);
@@ -166,29 +215,33 @@ void Metrics::createSession(int fd) {
 
     ::epoll_event ev{.events = EPOLLOUT | EPOLLIN | EPOLLERR,
                      .data = ::epoll_data{.u64 = _sessionCounter}};
-    if (::fcntl(it->second.fd, F_SETFL, O_NONBLOCK) < 0) {
-        _sessions.erase(_sessionCounter);
+    if (::epoll_ctl(_epollfd, EPOLL_CTL_ADD, fd, &ev) < 0) {
+        // One failed scrape is not a reason to take the worker down.
+        spdlog::error("failed to add metrics client to epoll set: {}",
+                      ::strerror(errno));
+        _sessions.erase(it);
         ::close(fd);
-        throw std::system_error{errno, std::generic_category(),
-                                "set O_NONBLOCK on client socket"};
-    }
-    if (::epoll_ctl(_epollfd, EPOLL_CTL_ADD, it->second.fd, &ev) < 0) {
-        _sessions.erase(_sessionCounter);
-        ::close(fd);
-        throw std::system_error{errno, std::generic_category(),
-                                "add client socket to epoll set"};
     }
 }
 
 void Metrics::removeSession(std::uint64_t id) {
-    auto& session = _sessions[id];
-    ::epoll_ctl(_epollfd, EPOLL_CTL_DEL, session.fd, {});
-    ::close(session.fd);
-    _sessions.erase(id);
+    // find, not operator[]: a missing id must not insert a default Session
+    // and then close whatever descriptor its fd field holds.
+    auto it = _sessions.find(id);
+    if (it == _sessions.end()) {
+        return;
+    }
+    ::epoll_ctl(_epollfd, EPOLL_CTL_DEL, it->second.fd, nullptr);
+    ::close(it->second.fd);
+    _sessions.erase(it);
 }
 
 void Metrics::writeable(std::uint64_t id) {
-    auto& session = _sessions[id];
+    auto it = _sessions.find(id);
+    if (it == _sessions.end()) {
+        return;
+    }
+    auto& session = it->second;
     for (;;) {
         if (session.written >= session.buf.size()) {
             removeSession(id);

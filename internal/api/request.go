@@ -332,9 +332,9 @@ type RequestSpec struct {
 
 	Provider ProviderPin `json:"provider,omitempty"`
 
-	// IdleTeardown overrides the agent's global long-idle threshold for this request's
-	// sessions (§11.1). Nil takes the global default; zero disables teardown, keeping the
-	// workers hot indefinitely.
+	// IdleTeardown overrides the server's global long-idle threshold (`--server-idle-teardown`)
+	// for this request's sessions (§11.1). Nil takes the global default; zero disables teardown,
+	// keeping the workers hot indefinitely.
 	//
 	// It exists because "this feed is bursty, keep it hot" is a real operational requirement:
 	// tearing down too eagerly costs a source that stops and starts frequently its first

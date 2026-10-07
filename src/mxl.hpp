@@ -122,6 +122,9 @@ class DiscreteFlowReader {
         /** Get the number of valid payload slices in the grain. */
         [[nodiscard]] std::uint16_t validSlices() const noexcept;
 
+        /** Get the grain flags (MXL_GRAIN_FLAG_*). */
+        [[nodiscard]] std::uint32_t flags() const noexcept;
+
         /** (Bad!) Write the tx timestamp in the last 8 bytes of the reserved
          * section of the grain header */
         void writeTxTimestamp(std::uint64_t txTimestamp) noexcept;
@@ -192,7 +195,7 @@ class ContinuousFlowReader {
 
     [[nodiscard]] ::mxlWrappedMultiBufferSlice
     getSamples(std::uint64_t headIndex, std::size_t count,
-               std::chrono::milliseconds timeout);
+               std::chrono::nanoseconds timeout);
 
   private:
     ContinuousFlowReader(::mxlFlowReader, ::mxlFlowConfigInfo, Instance);
@@ -248,6 +251,13 @@ class DiscreteFlowWriter {
         /** (Bad!) Write the tx timestamp to the last 8 bytes of the grain
          * header */
         void writeTxTimestamp(std::uint64_t txTime) noexcept;
+
+        /** (Bad!) Write validSlices and flags straight into the grain header
+         * in shared memory, without committing. libmxl >= 1.2 resets both in
+         * openGrain; this undoes that on a grain that is only being stamped.
+         * Relies on the internal MXL_GRAIN_PAYLOAD_OFFSET layout. */
+        void restoreHeader(std::uint16_t validSlices,
+                           std::uint32_t flags) noexcept;
 
         /** Read the tx timestamp from the last 8 bytes of the grain header */
         [[nodiscard]] std::uint64_t readTxTimestamp() const noexcept;

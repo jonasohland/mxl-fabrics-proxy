@@ -297,6 +297,10 @@ std::uint16_t DiscreteFlowReader::Access::validSlices() const noexcept {
     return _info.validSlices;
 }
 
+std::uint32_t DiscreteFlowReader::Access::flags() const noexcept {
+    return _info.flags;
+}
+
 /** --------------- Continuous Flow Reader --------------- */
 
 ContinuousFlowReader::ContinuousFlowReader(::mxlFlowReader reader,
@@ -362,7 +366,7 @@ ContinuousFlowReader::getSamplesNonBlocking(std::uint64_t headIndex,
 
 ::mxlWrappedMultiBufferSlice
 ContinuousFlowReader::getSamples(std::uint64_t headIndex, std::size_t count,
-                                 std::chrono::milliseconds timeout) {
+                                 std::chrono::nanoseconds timeout) {
     ::mxlWrappedMultiBufferSlice slice{};
     mxl(::mxlFlowReaderGetSamples, "failed to get samples", _reader, headIndex,
         count, timeout.count(), &slice);
@@ -466,6 +470,18 @@ void DiscreteFlowWriter::Access::validSlices(
 
 void DiscreteFlowWriter::Access::writeTxTimestamp(std::uint64_t ts) noexcept {
     *reinterpret_cast<std::uint64_t*>(_payload - sizeof(std::uint64_t)) = ts;
+}
+
+void DiscreteFlowWriter::Access::restoreHeader(std::uint16_t validSlices,
+                                               std::uint32_t flags) noexcept {
+    // Mirrors MXL_GRAIN_PAYLOAD_OFFSET in libmxl's internal Flow.hpp: the
+    // grain's mxlGrainInfo sits at the start of an 8 KiB header block that
+    // ends where the payload begins.
+    constexpr auto grainPayloadOffset = std::size_t{8192};
+    auto* header =
+        reinterpret_cast<::mxlGrainInfo*>(_payload - grainPayloadOffset);
+    header->validSlices = validSlices;
+    header->flags = flags;
 }
 
 std::uint64_t DiscreteFlowWriter::Access::readTxTimestamp() const noexcept {

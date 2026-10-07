@@ -20,14 +20,17 @@
 
 #include <algorithm>
 #include <csignal>
+#include <deque>
 #include <format>
 #include <iostream>
 #include <limits>
 #include <mxl/time.h>
+#include <numeric>
 #include <nlohmann/json.hpp>
 #include <optional>
 #include <string>
 #include <variant>
+#include <vector>
 
 namespace {
 
@@ -82,6 +85,8 @@ struct Options {
     bool verbose = false;
 };
 
+constexpr std::size_t latencyWindow = 50;
+
 struct Summary {
     std::string format;
     std::uint64_t read = 0;
@@ -93,6 +98,12 @@ struct Summary {
     std::uint64_t latencyMin = std::numeric_limits<std::uint64_t>::max();
     std::uint64_t latencyMax = 0;
     std::uint64_t latencyTotal = 0;
+    // The first and the most recent latencyWindow reads. Their means show
+    // whether latency moved over the run, which min/max/mean cannot: a
+    // reader falling steadily behind and one that jitters around a fixed
+    // latency can have the same spread.
+    std::vector<std::uint64_t> latencyFirst;
+    std::deque<std::uint64_t> latencyLast;
     bool signalled = false;
     std::string failure;
 
@@ -100,6 +111,23 @@ struct Summary {
         latencyMin = std::min(latencyMin, ns);
         latencyMax = std::max(latencyMax, ns);
         latencyTotal += ns;
+        if (latencyFirst.size() < latencyWindow) {
+            latencyFirst.push_back(ns);
+        }
+        latencyLast.push_back(ns);
+        if (latencyLast.size() > latencyWindow) {
+            latencyLast.pop_front();
+        }
+    }
+
+    template <typename Container>
+    [[nodiscard]] static std::uint64_t mean(Container const& values) {
+        if (values.empty()) {
+            return 0;
+        }
+        return std::accumulate(values.begin(), values.end(),
+                               std::uint64_t{0}) /
+               values.size();
     }
 
     [[nodiscard]] std::uint64_t latencyMean() const {
@@ -181,20 +209,19 @@ void readGrains(::mxl::DiscreteFlowReader reader, Options const& options,
                     summary.gaps += head - index;
                 }
                 index = head;
-                lastProgress = ::mxlGetTime();
-                continue;
+            } else if (!ex.isTooEarly() && !ex.isTimeout()) {
+                throw;
             }
-            if (ex.isTooEarly() || ex.isTimeout()) {
-                if (options.idleTimeout != 0 &&
-                    ::mxlGetTime() - lastProgress >
-                        options.idleTimeout * 1'000'000) {
-                    summary.failure =
-                        std::format("no grain for {} ms", options.idleTimeout);
-                    return;
-                }
-                continue;
+            // Only a grain read counts as progress, not a resync. A head
+            // that keeps moving over grains that never complete would
+            // otherwise resync forever and never go idle.
+            if (options.idleTimeout != 0 &&
+                ::mxlGetTime() - lastProgress >
+                    options.idleTimeout * 1'000'000) {
+                summary.failure =
+                    std::format("no grain for {} ms", options.idleTimeout);
+                return;
             }
-            throw;
         }
     }
 }
@@ -272,20 +299,18 @@ void readSamples(::mxl::ContinuousFlowReader reader, Options const& options,
                     summary.gaps += head - index;
                 }
                 index = head;
-                lastProgress = ::mxlGetTime();
-                continue;
+            } else if (!ex.isTooEarly() && !ex.isTimeout()) {
+                throw;
             }
-            if (ex.isTooEarly() || ex.isTimeout()) {
-                if (options.idleTimeout != 0 &&
-                    ::mxlGetTime() - lastProgress >
-                        options.idleTimeout * 1'000'000) {
-                    summary.failure = std::format("no samples for {} ms",
-                                                  options.idleTimeout);
-                    return;
-                }
-                continue;
+            // Only samples read count as progress, not a resync (see
+            // readGrains).
+            if (options.idleTimeout != 0 &&
+                ::mxlGetTime() - lastProgress >
+                    options.idleTimeout * 1'000'000) {
+                summary.failure = std::format("no samples for {} ms",
+                                              options.idleTimeout);
+                return;
             }
-            throw;
         }
     }
 }
@@ -385,7 +410,9 @@ int main(int argc, char* argv[]) {
             {"latency_ns",
              {{"min", summary.read == 0 ? 0 : summary.latencyMin},
               {"max", summary.latencyMax},
-              {"mean", summary.latencyMean()}}},
+              {"mean", summary.latencyMean()},
+              {"first_window_mean", Summary::mean(summary.latencyFirst)},
+              {"last_window_mean", Summary::mean(summary.latencyLast)}}},
             {"signalled", summary.signalled},
             {"failure", summary.failure},
             {"ok", ok},

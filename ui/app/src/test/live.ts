@@ -2,13 +2,13 @@
  * Harness for the integration tests: the real components, the real client, a real server.
  *
  * These drive the shipped code against a live control plane and a fake fleet — real DOM, real
- * fetch, real reconciler, real store. The prototype's `verify.mjs` established that this catches a
- * class of bug nothing else does, and the class is consistent: a stale dialog list, two per-node
- * reads landing out of order, a selection carried across a reopen. Each is the page's behaviour
- * against a real *sequence* of reads, which is the only place it exists.
+ * fetch, real reconciler, real store. This catches a class of bug nothing else does, and the class
+ * is consistent: a stale dialog list, two per-node reads landing out of order, a selection carried
+ * across a reopen. Each is the page's behaviour against a real *sequence* of reads, which is the
+ * only place it exists.
  *
- * Run them with `npm run test:live` after `npm run devfleet`. They are deliberately not part of
- * `npm test`, which stays hermetic.
+ * Run them with `npm run test:live` against a server with the fake fleet of `ui.md` §9 behind it.
+ * They are deliberately not part of `npm test`, which stays hermetic.
  */
 
 const BASE = process.env.API_BASE ?? 'http://127.0.0.1:12999'

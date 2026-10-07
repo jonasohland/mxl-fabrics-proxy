@@ -1,41 +1,44 @@
 # `mxl-replicator-worker` — runtime surface
 
-Reference for anyone driving the C++ worker from a new supervisor/replication manager.
-Everything below is the *contract as implemented*, derived from `src/` and from how
-`legacy/go/pkg/worker` currently drives it. Source references are `file:line`.
+This is a reference for anyone writing a new supervisor or replication manager that drives the C++
+worker. It describes the contract as implemented in `src/`, and how the current supervisor (the
+Go agent under `internal/`, mainly `internal/worker/exec` and `internal/agent`) drives the worker.
+Source references are `file:line`.
 
-The Go tree (`legacy/go/`) is being replaced. The worker binary is being kept. This document is
-the boundary between the two.
+The Go agent under `internal/` has replaced the legacy Go tree (`legacy/go/`). The legacy tree is
+still in the repository for reference, and this document cites it where its behaviour explains a
+current decision. The worker binary was kept. This document defines the boundary between the
+worker and its supervisor.
 
 ---
 
 ## 1. What the worker is
 
-One process = **one flow, one direction, one peer, one role**.
+One process handles **one flow, in one direction, with one peer, in one role**.
 
-- It is a *data-plane leaf*. It has no discovery, no control plane, no HTTP, no signalling,
-  no dynamic reconfiguration, no multi-flow support.
-- It is configured entirely by a JSON file passed as `argv[1]`, read once at startup
-  (`src/main.cpp:208`). To change anything, kill it and start a new one.
-- It runs until it is signalled or until it hits a fatal error. It is designed to be
-  supervised and restarted.
+- It only moves data. It has no discovery, no control plane, no HTTP, no signalling, no
+  dynamic reconfiguration and no multi-flow support.
+- All configuration comes from a JSON file passed as `argv[1]` and read once at startup
+  (`src/main.cpp:208`). To change anything, kill the process and start a new one.
+- It runs until it receives a signal or hits a fatal error. It expects to be supervised and
+  restarted.
 
-Two roles, selected by the `target` boolean in the config:
+The `target` boolean in the config selects one of two roles:
 
 | Role | `target` | Reads from | Writes to | Direction |
 |---|---|---|---|---|
 | **Initiator** (sender) | `false` | local MXL flow (by `flow_id`) | RDMA to remote target | egress |
 | **Target** (receiver) | `true` | RDMA from remote initiator | local MXL flow (created from `flow_def`) | ingress |
 
-Two transport paths, selected automatically from the flow's data format
-(`src/mxl.cpp:134`, `src/mxl.cpp:154`):
+The flow's data format selects one of two transport paths (`src/mxl.cpp:151-160` when opening a
+reader, `src/mxl.cpp:170` when creating a writer):
 
 - `MXL_DATA_FORMAT_VIDEO`, `MXL_DATA_FORMAT_DATA` → **discrete** (grain-based)
 - `MXL_DATA_FORMAT_AUDIO` → **continuous** (sample-batch-based)
-- anything else → `std::runtime_error{"invalid data format"}` at startup
+- any other format → `std::runtime_error{"invalid data format"}` at startup
 
-The role and format combination picks one of four code paths in `src/initiator.cpp` /
-`src/target.cpp`. Callers do not select this; it follows from the flow.
+Role and format together select one of four code paths in `src/initiator.cpp` /
+`src/target.cpp`. The caller does not choose the path; it follows from the flow.
 
 ---
 
@@ -45,7 +48,7 @@ The role and format combination picks one of four code paths in `src/initiator.c
 mxl-replicator-worker [OPTIONS] <CONFIG-FILE>
 ```
 
-`src/main.cpp:167-201`. The argument parser is deliberately minimal.
+The argument parser (`src/main.cpp:169-201`) is intentionally minimal.
 
 | Form | Behaviour | Exit |
 |---|---|---|
@@ -55,11 +58,12 @@ mxl-replicator-worker [OPTIONS] <CONFIG-FILE>
 | `-h`, `--help` | prints usage to **stderr**, exits | 0 |
 | no args / two positional args | usage to stderr | 1 |
 
-There are **no other flags**. Everything else is in the config file.
+There are **no other flags**. Everything else goes in the config file.
 
 ### `-v` output format
 
-Written to **stderr**, one `<name><padding><value>` line each (`src/main.cpp:156-164`):
+`-v` writes one `<name><padding><value>` line per component to **stderr**
+(`src/main.cpp:156-164`):
 
 ```
 proxy     0.0.1
@@ -67,18 +71,21 @@ mxl       1.1.0-rc1
 libfabric 2.6
 ```
 
-Parse by splitting on the first space and trimming (`legacy/go/pkg/worker/exec.go:47-62`).
-Keys are `proxy`, `mxl`, `libfabric`. This is the cheapest way to probe that the binary
-exists, is loadable (all shared libs resolve), and to report versions — the current Go
-code runs it once at startup and refuses to launch if it fails
+To parse, split each line on the first space and trim (`internal/worker/exec/probe.go:46-60`).
+The keys are `proxy`, `mxl` and `libfabric`. Running `-v` is the cheapest way to check that the
+binary exists and loads (all shared libraries resolve), and to report versions. The current agent
+runs it, followed by `--interfaces`, at startup and on every re-registration with the server
+(`cmd/mxl-replicator/agent.go:404-415`). If either probe fails, the agent does not register, so
+it is assigned no work, and it retries with backoff (`internal/agent/agent.go:344-395`). The
+legacy Go supervisor ran `-v` once at startup and exited if it failed
 (`legacy/go/cmd/mxl-fabrics-proxy/main.go:113`).
 
 ### `--interfaces` output format
 
-Written to **stdout**, because it is data rather than diagnostics (`src/main.cpp:64-154`).
-Calls `mxlFabricsGetInterfaces()` and prints a JSON array, one object per
-`(interface, address, provider)` combination — the same physical interface appears several
-times when it is reachable through several providers or carries several addresses.
+`--interfaces` writes to **stdout**, because its output is data rather than diagnostics
+(`src/main.cpp:64-154`). It calls `mxlFabricsGetInterfaces()` and prints a JSON array with one
+object per `(interface, address, provider)` combination. The same physical interface therefore
+appears several times if it is reachable through several providers or has several addresses.
 
 ```json
 [
@@ -100,100 +107,102 @@ times when it is reachable through several providers or carries several addresse
 ]
 ```
 
-Field notes, all of them load-bearing for a supervisor that joins this against its own
-configuration:
+A supervisor that matches this output against its own configuration depends on each of the
+following:
 
-- `node` is what goes in the config's `node` key for this interface: an IP for `tcp` and
-  `verbs`, a link-local device address for `efa`, and the **hostname** for `shm`.
-- **There is no `service`, deliberately.** The library reports one alongside the address, but
-  it is empty for every provider except `shm`, and the `shm` value is a per-process artefact
-  of the process that ran the probe — binding it in a later worker would be meaningless. The
-  supervisor allocates `service` from its own port range for every provider, `shm` included
-  (§9).
-- **There is no interface-name field**, because the library's API has none, and this is the
-  one thing about the probe a supervisor must design around rather than work around. The
-  physical interface, where it is known at all, is `attr.device_name`: the netdev name for
-  `tcp` (`eth1`, `wlan0`, `lo`), but the **libfabric device name** for `verbs` and `efa`
-  (`mlx5_0`, `rdmap0s6-rdm`), which is not the netdev name an operator would write. There is
-  no reliable way to turn a configured `ib0` or `efa0` into an entry in this list.
-  §10 item 3 sets out the join that follows from that.
-- `attr` is the library's best-effort attribute blob, passed through verbatim and omitted
-  when it reports none. Contents vary by platform and hardware; treat every key as
-  optional. `shm` reports no `device_name` at all.
-- `caps.max_message_size` is a `uint64` and providers do report `UINT64_MAX`. Decode it into
-  a 64-bit unsigned integer, not a float.
+- `node` is the value to put in the config's `node` key for this interface. It is an IP address
+  for `tcp` and `verbs`, a link-local device address for `efa`, and the **hostname** for `shm`.
+- **There is deliberately no `service` field.** The library reports a service alongside the
+  address, but it is empty for every provider except `shm`. For `shm` it is specific to the
+  process that ran the probe, so a later worker cannot bind it. The supervisor allocates
+  `service` from its own port range for every provider, `shm` included (§9).
+- **There is no interface-name field**, because the library's API does not provide one. A
+  supervisor has to be designed around this; it cannot be patched over. Where the physical
+  interface is known at all, it is in `attr.device_name`. For `tcp` that is the netdev name
+  (`eth1`, `wlan0`, `lo`). For `verbs` and `efa` it is the **libfabric device name** (`mlx5_0`,
+  `rdmap0s6-rdm`), which is not the netdev name an operator would write. There is no reliable
+  way to map a configured `ib0` or `efa0` to an entry in this list. §10 item 3 describes the
+  matching rules that follow from this.
+- `attr` is the library's best-effort attribute set, passed through unchanged and omitted when
+  the library reports none. Its contents vary by platform and hardware, so treat every key as
+  optional. `shm` reports no `device_name`.
+- `caps.max_message_size` is a `uint64`, and providers do report `UINT64_MAX`. Decode it into a
+  64-bit unsigned integer, not a float.
 
-Exit 0 on success, 1 on failure. The probe needs no domain: it creates and removes a
-throwaway one, because `mxlFabricsGetInterfaces()` requires an mxl instance and an mxl
-instance requires a domain directory that exists.
+The probe exits 0 on success and 1 on failure. It needs no domain from the caller: it creates a
+temporary domain and removes it afterwards, because `mxlFabricsGetInterfaces()` requires an mxl
+instance and an mxl instance requires an existing domain directory.
 
-⚠️ **stdout is also the log stream** (§7), and libfabric's own diagnostics are routed into
-it. The worker therefore redirects stdout to stderr for the duration of the probe and
-restores it before printing, so stdout carries the JSON and nothing else
-(`src/main.cpp:85-114`). Diagnostics still appear on stderr — capture the two separately.
+⚠️ **stdout is also the log stream** (§7), and libfabric's diagnostics are routed into it. The
+worker therefore redirects stdout to stderr while the probe runs and restores it before printing
+the result, so stdout carries only the JSON (`src/main.cpp:92-107`). Diagnostics still appear on
+stderr, so capture the two streams separately.
 
 ---
 
 ## 3. Config file (JSON)
 
-Parsed by `Config::read` in `src/config.cpp:96`. Plain JSON object, no nesting, no arrays.
-Unknown keys are ignored silently.
+`Config::read` in `src/config.cpp:96` parses the file. It is a flat JSON object: no nested
+objects, and the only array is `caps_flags`. Unknown keys are silently ignored.
 
 | Key | Type | Req. | Default | Used by | Meaning |
 |---|---|---|---|---|---|
 | `target` | bool | no | `false` | both | `true` = target/receiver, `false` = initiator/sender |
 | `domain` | string | **yes** | — | both | Local MXL domain path, e.g. `/dev/shm/mxl0`. Passed to `mxlCreateInstance`. |
 | `node` | string | **yes** | — | both | Local fabric bind address. Provider-dependent (IP for `tcp`/`verbs`, device address for `efa`). |
-| `service` | string | **yes** | — | both | Local fabric endpoint name, as a **string**. A port number for `tcp`/`verbs`/`efa`; for `shm` it is not a port at all, only a host-wide unique name. May be `""` (let the provider choose), but the key must be present — and a supervisor that wants to know where its target bound should not leave it empty (§9). |
-| `provider` | string | no | `"tcp"` | both | One of `any`, `tcp`, `verbs`, `efa`, `shm`. Parsed via `mxlFabricsProviderFromString`; anything else is a fatal `MXL_ERR_INVALID_ARG` at startup. |
-| `caps_flags` | array of string | no | `["REMOTE_WRITE","BLOCKING_OPERATIONS"]` | both | Negotiated interface capabilities. Names as printed by `--interfaces`: `REMOTE_WRITE`, `SEND_RECEIVE`, `BLOCKING_OPERATIONS`. An unknown name is a fatal `MXL_ERR_INVALID_ARG`. **Must be identical on both ends.** |
-| `max_message_size` | uint64 | no | `0` | both | Negotiated maximum message size, in bytes. `0` leaves it to the library, which logs a warning that the field will be required in a future version. **Must be identical on both ends.** |
-| `idle_timeout_ms` | int | no | `10000` | both | How long to wait without reading (initiator) or receiving (target) a grain before terminating. `0` or negative = wait indefinitely. |
+| `service` | string | **yes** | — | both | Local fabric endpoint name, as a **string**. A port number for `tcp`/`verbs`/`efa`. For `shm` it is not a port, only a name that must be unique on the host. May be `""` (the provider chooses), but the key must be present. A supervisor that needs to know where its target bound should not leave it empty (§9). |
+| `provider` | string | no | `"tcp"` | both | One of `any`, `tcp`, `verbs`, `efa`, `shm`. Parsed by `mxlFabricsProviderFromString`; any other value is a fatal `MXL_ERR_INVALID_ARG` at startup. |
+| `caps_flags` | array of string | no | `["REMOTE_WRITE","BLOCKING_OPERATIONS"]` | both | Negotiated interface capabilities, using the names `--interfaces` prints: `REMOTE_WRITE`, `SEND_RECEIVE`, `BLOCKING_OPERATIONS`. An unknown name is a fatal `MXL_ERR_INVALID_ARG`. **Must be identical on both ends.** |
+| `max_message_size` | uint64 | no | `0` | both | Negotiated maximum message size in bytes. `0` leaves it to the library, which logs a warning that the field will be required in a future version. **Must be identical on both ends.** |
+| `idle_timeout_ms` | int | no | `10000` | both | How long to go without reading (initiator) or receiving (target) a grain before terminating. `0` or negative = wait indefinitely. |
 | `connect_timeout_ms` | int | no | `60000` | initiator only | How long the connect loop waits for the target to become reachable. `0` or negative = wait indefinitely, which was the behaviour before this key existed. |
 | `metrics_socket` | string | **yes** | — | both | Path where the worker **creates** an `AF_UNIX` listening socket. See §6. |
-| `target_info` | string | **yes** | — | both | **Role-dependent — see below.** |
+| `target_info` | string | **yes** | — | both | **Meaning depends on the role — see below.** |
 | `flow_id` | string | no | `""` | initiator only | UUID of the local flow to read and send. |
-| `flow_def` | string | no | `""` | target only | The **flow definition JSON, as a string** (i.e. JSON embedded in a JSON string). Used to create the local flow. |
-| `no_network_latency_measurement` | bool | no | `false` | both | Disables the tx-timestamp hack (§5.3). Must match on both ends. |
-| `sched_prio` | int | no | disabled | both | `SCHED_FIFO` priority for the transfer loop. Absent or non-numeric (incl. JSON `null`) = leave scheduling alone. |
+| `flow_def` | string | no | `""` | target only | The **flow definition JSON, as a string** (JSON embedded in a JSON string). Used to create the local flow. |
+| `no_network_latency_measurement` | bool | no | `false` | both | Disables the tx-timestamp mechanism (§5.3). Must match on both ends. |
+| `sched_prio` | int | no | disabled | both | `SCHED_FIFO` priority for the transfer loop. Absent or non-numeric (including JSON `null`) = scheduling is left unchanged. |
 
-"Required" means: missing or wrong type throws `MXL_ERR_INVALID_ARG: missing required field: <key>`
-before anything else starts (`src/config.cpp:17-23`). This is a fast, cheap validation —
-a bad config fails in milliseconds, not after a connection attempt.
+"Required" means that a missing key or a value of the wrong type throws
+`MXL_ERR_INVALID_ARG: missing required field: <key>` before anything else starts
+(`src/config.cpp:70-76`). A bad config therefore fails within milliseconds, not after a
+connection attempt.
 
-### `target_info` is two different things
+### `target_info` means different things per role
 
-This is the single most important asymmetry in the interface (`src/target.cpp:45`,
-`src/initiator.cpp:31`):
+This is the most important asymmetry in the interface (`src/target.cpp:45`,
+`src/initiator.cpp:100`):
 
-- **Target role**: an **output file path**. The worker writes the serialised target info
-  JSON to this path once, immediately after the fabric endpoint is set up and before the
-  receive loop starts. The supervisor must poll for this file to appear.
-- **Initiator role**: the **target info JSON content itself**, inline in the config string.
-  The supervisor is responsible for having transported it from the peer's target.
+- **Target role:** an **output file path**. The worker writes the serialised target info JSON to
+  this path once, right after the fabric endpoint is set up and before the receive loop starts.
+  The supervisor must poll for the file to appear.
+- **Initiator role:** the **target info JSON itself**, inline as a string in the config. The
+  supervisor is responsible for fetching it from the peer's target.
 
 ### The negotiated interface config must match on both ends
 
-`provider`, `caps_flags` and `max_message_size` together are the interface configuration
-handed to `mxlFabricsTargetSetup` / `mxlFabricsInitiatorSetup` (`src/fabrics.cpp:28-47`).
-The library performs **no negotiation of its own** and documents that both ends must be
-given the same capabilities and maximum message size, with the caller's out-of-band channel
-responsible for agreeing them. Deciding them per side is therefore not a configuration
-choice, it is a bug: whatever agrees the pairing must compute one interface config and write
-it into both workers' configs, the same way `no_network_latency_measurement` has to match
+`provider`, `caps_flags` and `max_message_size` together form the interface configuration passed
+to `mxlFabricsTargetSetup` / `mxlFabricsInitiatorSetup` (`src/fabrics.cpp:28-47`). The library
+does **no negotiation of its own**. Its documentation says both ends must be given the same
+capabilities and maximum message size, and that the caller must agree them over its own
+out-of-band channel. Choosing these values separately on each side is therefore a bug, not a
+configuration option. Whatever sets up the pairing must compute one interface config and write it
+into both workers' configs, in the same way that `no_network_latency_measurement` must match
 (§5.3).
 
-The names in `caps_flags` are exactly the ones `--interfaces` prints, so a supervisor can
-intersect two nodes' reported flag sets and write the result straight back out without a
-translation step.
+The names in `caps_flags` are the same strings `--interfaces` prints. A supervisor can intersect
+the flag sets reported by two nodes and write the result into the config without translating
+anything.
 
 ### Fields the C++ worker ignores
 
-`legacy/go/pkg/worker/config.go` also emits `proxy_id`, `efa_use_wait`, and `labels`. **None are
-read by the worker** (verified: no occurrence in `src/`). They are supervisor-side
-bookkeeping that happens to ride along in the same struct. `efa_use_wait` in particular is
-dead — the README documents an `--efa-use-wait` flag that no longer exists on the Go side
-either. Do not carry these forward expecting the worker to honour them.
+The legacy Go supervisor (`legacy/go/pkg/worker/config.go:3-20`) also wrote `proxy_id`,
+`efa_use_wait` and `labels`. **The worker reads none of them** (verified: none occur in `src/`).
+They were supervisor-side bookkeeping that happened to share the struct. `efa_use_wait` is dead on
+both sides: the README documents an `--efa-use-wait` flag that the legacy Go side no longer has
+either. The current supervisor writes only keys the worker reads
+(`internal/worker/exec/config.go:18-60`). Do not add these fields back expecting the worker to act
+on them.
 
 ### Minimal examples
 
@@ -242,20 +251,19 @@ Target:
 
 ## 4. Target info
 
-The blob the target produces and the initiator consumes. Produced by
-`mxlFabricsTargetInfoToString`, consumed by `mxlFabricsTargetInfoFromString`
-(`src/fabrics.cpp:36-64`).
+Target info is the blob the target produces and the initiator consumes. The target produces it
+with `mxlFabricsTargetInfoToString`; the initiator parses it with `mxlFabricsTargetInfoFromString`
+(`src/fabrics.cpp:115-152`).
 
-**Treat it as an opaque string.** The worker itself only peeks at one field: it requires a
-top-level string `"id"` and throws `MXL_ERR_INVALID_ARG: invalid target info` otherwise
-(`src/fabrics.cpp:39-45`).
+**Treat it as an opaque string.** The worker inspects only one field: it requires a top-level
+string `"id"` and otherwise throws `MXL_ERR_INVALID_ARG: invalid target info`
+(`src/fabrics.cpp:119-123`).
 
-The file the target writes contains the JSON and nothing else. The library's
-`mxlFabricsTargetInfoToString` reports a length that counts the NUL terminator, so the blob
-used to be written with a trailing NUL byte that most JSON parsers reject after the
-top-level value; `src/fabrics.cpp:143-149` strips it.
+The file the target writes contains the JSON and nothing else. `mxlFabricsTargetInfoToString`
+reports a length that includes the NUL terminator, so the file used to end in a NUL byte, which
+most JSON parsers reject after the top-level value. `src/fabrics.cpp:143-149` now strips it.
 
-For orientation, the mxl library's schema is:
+For reference, the mxl library's schema is:
 
 ```json
 {
@@ -268,17 +276,22 @@ For orientation, the mxl library's schema is:
 }
 ```
 
-It encodes **RDMA memory registration keys for a specific process's specific memory
-mappings**. Consequences the supervisor must respect:
+The blob contains **RDMA memory registration keys (rkeys) for the memory mappings of one specific
+target process**. The supervisor must respect the consequences:
 
-- It is **invalidated by any target restart**. A stale target info will not reconnect —
-  it points at rkeys that no longer exist.
-- Therefore the pairing is stateful: if the target restarts, the initiator **must** be
-  restarted with the new blob. The current Go layer enforces this by comparing target info
-  on every keepalive and tearing down the subscription when it changed
+- **Any target restart invalidates it.** An initiator given stale target info cannot reconnect,
+  because the rkeys it refers to no longer exist.
+- The pairing is therefore stateful: when the target restarts, the initiator **must** be restarted
+  with the new blob. The current supervisor enforces this with an epoch. Each target start gets
+  a new nonce, and the agent computes the epoch from the nonce and the blob
+  (`internal/agent/unit.go:208`, `:284`). The server assigns an initiator only while its target
+  reports ready with an epoch, and copies that epoch and blob into the initiator's assignment
+  (`internal/server/reconcile/reconcile.go:1379-1405`). A new epoch changes the initiator's
+  `worker.Spec.Key`, so the initiator's agent stops the old initiator and starts a new one
+  (`internal/agent/reconcile.go:161-165`). The legacy Go supervisor instead compared target info
+  on every keepalive and tore down the subscription when it had changed
   (`legacy/go/pkg/initiator/subscriptions.go:233`).
-- The `provider` inside the blob must be compatible with the initiator's configured
-  `provider`.
+- The `provider` in the blob must be compatible with the initiator's configured `provider`.
 
 ---
 
@@ -288,113 +301,128 @@ mappings**. Consequences the supervisor must respect:
 
 `src/target.cpp:28-56`
 
-1. `mxlCreateInstance(domain)`. The domain directory must exist and be a directory; the
-   worker does **not** create it. (The Go layer `MkdirAll`s it first —
-   `legacy/go/pkg/target/target.go:237`.)
-2. Fabrics instance created.
-3. `Metrics` constructed → **metrics socket is bound and listening.**
-4. `createFlow(flow_def)` → creates (or attaches to) the local flow. Discrete/continuous
-   decided here.
-5. Fabric target created and bound to `node:service`.
-6. **`target_info` file written.** ← the supervisor's signal that the target is ready.
-7. `sched_prio` applied (if set), scoped to the transfer loop.
-8. Receive loop forever.
+1. `mxlCreateInstance(domain)`. The domain directory must already exist and be a directory; the
+   worker does **not** create it. (The current agent creates it with `os.MkdirAll` before every
+   start — `internal/agent/unit.go:197-202`.)
+2. The fabrics instance is created.
+3. `Metrics` is constructed → **the metrics socket is bound and listening.**
+4. `createFlow(flow_def)` creates (or attaches to) the local flow. This step decides between
+   discrete and continuous.
+5. The fabric target is created and bound to `node:service`.
+6. **The `target_info` file is written.** ← This is the supervisor's signal that the target is
+   ready.
+7. `sched_prio` is applied (if set) for the duration of the transfer loop.
+8. The receive loop runs until shutdown.
 
-Steps 1–3 are the constructor, and run in **member declaration order**
-(`src/target.hpp:44-47`), not the order written in the initialiser list. The practical
-consequence: a bad `domain` kills the worker *before* the metrics socket exists, so a
-supervisor polling for the socket must also handle the process simply dying.
+Steps 1–3 happen in the constructor. C++ initialises members in **declaration order**
+(`src/target.hpp:44-47`), not in the order the initialiser list is written. In practice this means
+a bad `domain` kills the worker *before* the metrics socket exists, so a supervisor waiting for
+the socket must also handle the process simply exiting.
 
-There is no "wait for connection" step on the target — it is passive.
+The target has no "wait for connection" step. It is passive.
 
 ### 5.2 Initiator (sender)
 
-`src/initiator.cpp:14-46`
+`src/initiator.cpp:84-114`
 
-1. `mxlCreateInstance(domain)`, fabrics instance, then `Metrics` — same declaration-order
-   caveat as above (`src/initiator.hpp:45-48`).
-2. `openFlow(flow_id)` → **fails if the flow does not exist yet**. This is a common startup
-   race; the supervisor restart loop is what papers over it.
-3. If latency measurement is on: open a *writer* on the same flow (see §5.3).
-4. Create fabric initiator on `node:service`, `addTarget(parse(target_info))`.
-5. **Connect loop** — `makeProgress(500ms)` until connected, bounded by
-   `connect_timeout_ms` (default 60 s, `0` = forever — `src/initiator.cpp:17-40`). On
-   expiry it throws `MXL_ERR_TIMEOUT: timed out waiting to connect to the target` and exits
-   1, so a stuck initiator reports rather than hangs.
-6. `sched_prio` applied, transfer loop forever.
+1. `mxlCreateInstance(domain)`, then the fabrics instance, then `Metrics`. The same
+   declaration-order caveat applies (`src/initiator.hpp:48-51`).
+2. `openFlow(flow_id)` **fails if the flow does not exist yet**. This is a common startup race;
+   the supervisor's restart loop is what gets past it.
+3. The fabric initiator is created on `node:service`, and `addTarget(parse(target_info))` is
+   called. (If latency measurement is on, the writer described in §5.3 is not opened here but
+   by the transfer loop, on the first grain it reads.)
+4. **Connect loop:** calls `makeProgress(500ms)` until connected, bounded by `connect_timeout_ms`
+   (default 60 s, `0` = no limit — `src/initiator.cpp:16-37`). When the timeout expires it throws
+   `MXL_ERR_TIMEOUT: timed out waiting to connect to the target` and exits 1, so an initiator that
+   cannot reach its target reports an error instead of hanging.
+5. `sched_prio` is applied, and the transfer loop runs until shutdown.
 
 ### 5.3 The tx-timestamp mechanism (`no_network_latency_measurement`)
 
-Worth understanding before you carry it forward, because it is invasive.
+Understand this mechanism before carrying it forward, because it writes into memory the
+initiator does not own.
 
-When enabled (the default), the initiator opens a `DiscreteFlowWriter` on **the very flow
-it is reading** — `createFlow(reader.getFlowDefinition())` returns a writer attached to the
-existing flow, not a new one (`src/initiator.cpp:48-57`). For each grain it is about to
-send, it writes a nanosecond timestamp into the **last 8 bytes of the grain header's
-reserved area**, then `cancel()`s the write access so nothing is committed
-(`src/initiator.cpp:126-130`). Because the header lives in shared memory and the RDMA
-transfer copies header + payload, the target reads the value back out of its own copy
-(`src/target.cpp:100-102`) and derives `mxl_network_latency_ns`.
+When measurement is enabled (the default), the initiator opens a `DiscreteFlowWriter` on **the
+same flow it is reading**. `createFlow(reader.getFlowDefinition())` attaches a writer to the
+existing flow rather than creating a new one (`src/initiator.cpp:116-125`). For each grain it is
+about to send, the initiator writes a nanosecond timestamp into the **last 8 bytes of the grain
+header's reserved area**, then calls `cancel()` on the write access so nothing is committed
+(`src/initiator.cpp:178-183`). The header is in shared memory, and the RDMA transfer copies header
+and payload, so the target reads the timestamp from its own copy (`src/target.cpp:101-104`) and
+computes `mxl_network_latency_ns` from it.
 
-The header comment in `src/mxl.hpp:125` calls this out as `(Bad!)`. Implications:
+The writer is opened in the transfer loop on the first grain read, not at startup, and is
+released after 1 s without a grain (`LATENCY_WRITER_GRACE` in `src/initiator.cpp`). It is reopened
+on the next grain, and that grain is still stamped. The writer holds a shared lock on the flow's
+files while open, and releasing it during a pause lets the flow's real owner delete the flow when
+it shuts down. The 1 s grace period is not configurable.
 
-- The initiator **mutates shared memory owned by the real producer**, in place, on the live
-  flow. Benign today only because the reserved bytes are unused.
-- It requires the initiator to hold a writer on a flow it does not own.
-- The setting **must match on both ends**. If the initiator writes timestamps and the target
-  has measurement off, the target simply won't read them (no error). If the initiator has it
-  off and the target has it on, the target reads whatever garbage is in those bytes and
-  reports nonsense latency. The supervisor is responsible for keeping the two in sync — the
-  current Go code does this by shipping the flag in the subscription request
-  (`legacy/go/pkg/target/target.go:341`).
-- Discrete flows only. Continuous flows never measure network latency (§6).
+The header comment in `src/mxl.hpp:125` marks this mechanism as `(Bad!)`. Implications:
+
+- The initiator **modifies shared memory owned by the real producer**, in place, on the live
+  flow. This is harmless today only because the reserved bytes are otherwise unused.
+- The initiator must hold a writer on a flow it does not own.
+- The setting **must match on both ends**. If the initiator writes timestamps and the target has
+  measurement off, the target ignores them (no error). If the initiator has it off and the target
+  has it on, the target reads whatever happens to be in those bytes and reports meaningless
+  latency. The supervisor must keep the two settings in sync. The current server takes the value
+  from one server-wide setting and writes it into both ends' assignments
+  (`internal/server/reconcile/reconcile.go:1361`). The legacy Go supervisor sent it in the
+  subscription request (`legacy/go/pkg/target/target.go:341`).
+- It applies to discrete flows only. Continuous flows never measure network latency (§6).
 
 ### 5.4 Signals and shutdown
 
-`src/main.cpp:202-204`. `SIGTERM` and `SIGINT` set a `volatile sig_atomic_t` flag; every loop
-polls it via `utils::ExitSignal` at its top and returns cleanly. Worst-case latency to
-notice a signal is bounded by the inner blocking call: **500 ms** in the connect and target
-receive loops, **1000 ms** in the initiator's `makeProgress` drain.
+`src/main.cpp:203-204`. `SIGTERM` and `SIGINT` set a `volatile sig_atomic_t` flag. Every loop
+checks it through `utils::ExitSignal` at the top of each iteration and returns cleanly. The
+longest delay before a signal is noticed is the timeout of the inner blocking call: **500 ms** in
+the connect loop and the target receive loops, **1000 ms** in the initiator's `makeProgress`
+drain.
 
-No other signal is handled. `SIGKILL` leaves the metrics socket file behind (the
-destructor `remove_all`s it on a clean exit — `src/metrics.cpp:95`).
+No other signals are handled. `SIGKILL` leaves the metrics socket file behind, because only the
+destructor removes it (`remove_all` on a clean exit — `src/metrics.cpp:130`).
 
-The current supervisor sends `SIGTERM` and allows 5 s before escalating
-(`legacy/go/pkg/worker/exec.go:189-190`). That is a reasonable floor; keep it.
+The current supervisor sends `SIGTERM`, waits 5 s, then sends `SIGKILL`
+(`internal/worker/exec/exec.go:43`, `internal/worker/exec/handle.go:232-260`). The legacy Go
+supervisor used the same 5 s (`legacy/go/pkg/worker/exec.go:189-190`). Treat 5 s as a minimum
+and keep it.
 
 ---
 
 ## 6. Metrics socket
 
-The worker's only runtime output channel besides logs. `src/metrics.cpp`.
+Apart from logs, this socket is the worker's only runtime output (`src/metrics.cpp`).
 
-**Protocol** — deliberately trivial:
+**Protocol** (intentionally minimal):
 
-1. Worker `bind()`s + `listen()`s on the `metrics_socket` path at construction.
-2. Client connects. **Send nothing.**
-3. On `accept()`, the worker snapshots all metrics into a string
-   (`src/metrics.cpp:164`) and writes it non-blocking.
-4. Worker closes the connection when the buffer is drained. **Read to EOF.**
+1. At construction the worker calls `bind()` and `listen()` on the `metrics_socket` path.
+2. The client connects. **The client sends nothing.**
+3. On `accept()`, the worker renders a snapshot of all metrics into a string
+   (`src/metrics.cpp:213`) and writes it without blocking.
+4. The worker closes the connection once the buffer is written. **The client reads to EOF.**
 
-One connection = one point-in-time scrape. Backlog is 16, and the epoll loop handles
-multiple concurrent scrapers.
+Each connection is one point-in-time scrape. The listen backlog is 16, and the epoll loop serves
+several concurrent scrapers.
 
 **Hard constraints:**
 
-- The worker `unlink()`s the socket path before binding (`src/metrics.cpp:57`), so a
-  leftover file from a `SIGKILL` is no longer a fatal `EADDRINUSE`. Give each worker
-  instance a **fresh directory** anyway — it is what keeps `target-info.json` from a
-  previous incarnation out of the way, and the current Go code already does it with
-  `os.MkdirTemp` per restart (`legacy/go/pkg/worker/exec.go:163`).
-- **Keep the full path under 108 bytes** — the `sockaddr_un.sun_path` limit. An over-long
-  path is now a fatal `ENAMETOOLONG` naming the actual length (`src/metrics.cpp:44`)
-  rather than a silent truncation that binds a different path than the one configured. Two
-  workers whose long paths shared a prefix used to collide on a path neither asked for and
-  report `EADDRINUSE` from an unrelated instance.
+- The worker calls `unlink()` on the socket path before binding (`src/metrics.cpp:64`), so a file
+  left behind by `SIGKILL` no longer causes a fatal `EADDRINUSE`. Still give each worker instance
+  a **fresh directory**: it keeps an old `target-info.json` from a previous run out of the way.
+  The current supervisor creates one with `os.MkdirTemp` under its work root on every start
+  (`internal/worker/exec/handle.go:44`) and removes it when the worker is stopped (`:223`). The
+  legacy Go supervisor also used `os.MkdirTemp` on every restart
+  (`legacy/go/pkg/worker/exec.go:163`).
+- **Keep the full path under 108 bytes**, the size of `sockaddr_un.sun_path`. A path that is too
+  long is now a fatal `ENAMETOOLONG` that states the actual length (`src/metrics.cpp:51`).
+  Previously the path was silently truncated and the worker bound a different path from the one
+  configured. Two workers with long paths sharing a prefix then collided on a path neither had
+  asked for, and one reported `EADDRINUSE` caused by an unrelated instance.
 
 ### Wire format
 
-Line-oriented text, `\n`-terminated, `%.15g`-ish precision:
+Line-oriented text, each line `\n`-terminated, values printed with roughly `%.15g` precision:
 
 ```
 mxl_octets_total 1234567
@@ -407,63 +435,65 @@ mxl_source_latency_ns[0.5] 498000
 mxl_network_latency_ns[0.5] 121000
 ```
 
-Counters are `name value`. Summary quantiles are `name[quantile] value`. Parse by splitting
-on the first space, then checking for a `[...]` suffix on the name
-(`legacy/go/pkg/worker/metrics.go:39-62`).
+Counters are `name value`. Summary quantiles are `name[quantile] value`. To parse, split on the
+first space, then check the name for a `[...]` suffix (`internal/worker/metrics/metrics.go:68-91`).
 
 ### Metrics reference
 
 | Name | Type | Emitted by | Meaning |
 |---|---|---|---|
-| `mxl_octets_total` | counter | both | Sum of grain payload sizes. For continuous flows this is **sample count**, not octets. |
-| `mxl_payload_octets_total` | counter | both | `mxl_octets_total + 4096` per grain — a rough on-wire estimate including header. **The naming is inverted from what you'd expect**: the "payload" counter is the larger one. |
+| `mxl_octets_total` | counter | both | Sum of grain payload sizes. For continuous flows this is the **sample count**, not octets. |
+| `mxl_payload_octets_total` | counter | both | `mxl_octets_total + 4096` per grain — a rough estimate of bytes on the wire, including the header. **The names are the reverse of what you would expect**: the "payload" counter is the larger one. |
 | `mxl_grains_total` | counter | both | Grains (discrete) or sample batches (continuous). |
-| `mxl_grains_lost` | counter | both | Index gap since last grain. See caveat below. |
-| `mxl_source_latency_ns` | summary | both | `now - indexToTimestamp(index)` — age of the media at this hop. |
-| `mxl_network_latency_ns` | summary | **target only** | `rx_time - tx_time` from §5.3. Only emitted when `no_network_latency_measurement` is false. Never emitted for continuous flows. |
-| `mxl_last_grain` | counter | both | **Always 0.** Declared at `src/metrics.hpp:44`, never updated. Dead. |
+| `mxl_grains_lost` | counter | both | Index gap since the previous grain. See the note below. |
+| `mxl_source_latency_ns` | summary | both | `now - indexToTimestamp(index)` — how old the media is at this hop. |
+| `mxl_network_latency_ns` | summary | **target only** | `rx_time - tx_time` from §5.3. Emitted only when `no_network_latency_measurement` is false. Never emitted for continuous flows. |
+| `mxl_last_grain` | counter | both | **Always 0.** Declared at `src/metrics.hpp:44` and never updated. Unused. |
 
-Summaries are CKMS quantile estimates over a **sliding 30 s window** (3 buckets rotating
-every 10 s), quantiles `0.01, 0.1, 0.5, 0.9, 0.99`, target error 0.05
-(`src/summary.cpp:10-13`, `src/metrics.hpp:45-48`). A summary with no observations in the
-window emits `nan`.
+Summaries are CKMS quantile estimates over a **sliding 30 s window** (3 buckets, rotated every
+10 s), for quantiles `0.01, 0.1, 0.5, 0.9, 0.99`, with target error 0.05
+(`src/summary.cpp:10-13`, `src/metrics.hpp:45-48`). A summary with no observations in the window
+prints `nan`.
 
-The supervisor is expected to add labels and Prometheus `# TYPE` lines itself — the worker
-emits neither. The current Go layer attaches `direction`, `domain`, `flowID` plus
-user-configured labels, and adds three supervisor-level counters that the worker knows
-nothing about: `mxl_worker_restarts`, `mxl_writer_active`, `mxl_reader_active`
+The worker emits no labels and no Prometheus `# TYPE` lines; the supervisor adds both. The
+current agent attaches `direction`, `domain`, `flow_id`, `session`, `namespace`, `format` and
+`media_type`, plus the user labels from the request (`internal/metrics/metrics.go:154-156`,
+`internal/agent/metrics.go:299-309`). It also adds three supervisor-level series that the worker
+knows nothing about: the counter `mxl_worker_restarts` and the gauges `mxl_writer_active` and
+`mxl_reader_active` (`internal/agent/metrics.go:360-374`). The legacy Go supervisor attached
+`direction`, `domain`, `flowID` and user-configured labels, and added the same three series
 (`legacy/go/pkg/worker/metrics.go:84-107`).
 
-`mxl_grains_lost` used to be permanently 0 on the *initiator* side — an inner-scope
-redeclaration of `skipped` shadowed the variable that gets reported. Fixed
-(`src/initiator.cpp:157`); the target-side calculation (`src/target.cpp:106-113`) always
-was correct. A supervisor that learned to ignore the initiator's value should stop.
+`mxl_grains_lost` used to be permanently 0 on the *initiator*, because an inner-scope
+redeclaration of `skipped` shadowed the variable that was reported. This is fixed
+(`src/initiator.cpp:199-207`). The target-side calculation (`src/target.cpp:108-115`) was always
+correct. A supervisor that learned to ignore the initiator's value should stop ignoring it.
 
 ---
 
 ## 7. Logging
 
-- Destination: **stdout**. Not stderr — that's only used for `-v`/`-h`.
-- The mxl library installs a `spdlog` colour logger **named `console`** as the default
-  logger and calls `spdlog::cfg::load_env_levels("MXL_LOG_LEVEL")`
-  (mxl `lib/internal/src/Instance.cpp:44`). The worker itself never configures a logger or
-  a pattern.
-- **Log level is controlled by the `MXL_LOG_LEVEL` environment variable**, inherited from
-  the parent. It was not exercised by the legacy Go layer — `spdlog::debug` calls in the
-  transfer loops are compiled in but silent at the default `info` level. A supervisor should
-  plumb it through.
-- **`FI_LOG_LEVEL` is a second environment knob**, read by mxl's own libfabric log bridge
-  (`lib/fabrics/ofi/src/internal/FILogging.cpp`), accepting `trace|debug|info|warn`. It
-  routes libfabric's diagnostics **into the same spdlog logger**, not to a separate stream.
-  At `debug` a single failed startup emits ~160 extra lines on stdout. Unset, libfabric is
-  quiet.
+- Logs go to **stdout**, not stderr. stderr is used only for `-v`/`-h`.
+- The mxl library installs a `spdlog` colour logger **named `console`** as the default logger and
+  calls `spdlog::cfg::load_env_levels("MXL_LOG_LEVEL")` (mxl `lib/internal/src/Instance.cpp:44`).
+  The worker itself never configures a logger or a pattern.
+- **The `MXL_LOG_LEVEL` environment variable sets the log level**, inherited from the parent
+  process. The legacy Go supervisor never set it, so the `spdlog::debug` calls in the transfer
+  loops, although compiled in, were silent at the default `info` level. The current launcher sets
+  it from the agent's own log level (`internal/worker/exec/exec.go:155-163`). A supervisor should
+  pass it through.
+- **`FI_LOG_LEVEL` is a second environment variable.** mxl's own libfabric log bridge reads it
+  (`lib/fabrics/ofi/src/internal/FILogging.cpp`) and accepts `trace|debug|info|warn`. It sends
+  libfabric's diagnostics **into the same spdlog logger**, not to a separate stream. At `debug`, a
+  single failed startup produces about 160 extra lines on stdout. When it is unset, libfabric
+  logs nothing.
 
 ### Line format
 
-The format varies more than "spdlog's default pattern" suggests. What follows is measured,
-not inferred — captured from mxl 1.2.0-dev / libfabric 2.6 across a bad domain path, a
-malformed flow definition, a missing config key, an unparseable provider, an idle-source
-timeout, and a run with `FI_LOG_LEVEL=debug`:
+The format varies more than "spdlog's default pattern" suggests. The examples below were captured,
+not inferred, from mxl 1.2.0-dev / libfabric 2.6 across these cases: a bad domain path, a malformed
+flow definition, a missing config key, an unparseable provider, an idle-source timeout, and a run
+with `FI_LOG_LEVEL=debug`:
 
 ```
 [2026-08-27 22:47:02.625] [error] fatal: unknown error: failed to create flow writer
@@ -472,34 +502,36 @@ timeout, and a run with `FI_LOG_LEVEL=debug`:
 [2026-08-27 22:45:22.285] [info] [libfabric:core:core:372] variable prefer_sysconfig=<not set>
 ```
 
-Three things a parser has to be built around, each of which the legacy translator gets wrong:
+A parser must handle three things. The legacy translator gets each of them wrong. The current
+translator (`internal/worker/logs/logs.go:50-89`) handles all three.
 
-1. **The logger name is optional and varies within a single run.** The first two lines above
-   came out of the same process. A line logged before the mxl instance installs its named
-   default logger (`Instance.cpp:44`) carries no name; one logged after carries `[console]`.
-   A parser that requires either spelling drops half of a failing worker's output.
-2. **libfabric's diagnostics arrive through this logger**, formatted as
-   `[libfabric:<subsys>:<provider>:<line>]` in the source-location position. Splitting that
-   token on the *first* colon reads `libfabric` as the file and `core:core:372` as the line
-   number, so it stays in the message. Split on the last colon.
-3. **The source-location bracket is optional**, and a message can itself begin with `[` — a
-   real one ends `… Not a directory [/nonexistent/domain]`. Consuming every leading bracket,
-   as the legacy parser does (`legacy/go/pkg/worker/exec.go:301-376`), eats the first token
-   of such a message and files it as a source location.
+1. **The logger name is optional, and changes within a single run.** The first two lines above
+   came from the same process. Lines logged before the mxl instance installs its named default
+   logger (`Instance.cpp:44`) have no name; lines logged after it have `[console]`. A parser that
+   requires one form or the other drops half of a failing worker's output.
+2. **libfabric's diagnostics come through this logger**, with
+   `[libfabric:<subsys>:<provider>:<line>]` in the source-location position. Splitting that token
+   on the *first* colon yields `libfabric` as the file and `core:core:372` as the line number,
+   which is not a number, so the token stays in the message. Split on the last colon instead.
+3. **The source-location bracket is optional, and a message can itself start with `[`.** For
+   example, a real message ends `… Not a directory [/nonexistent/domain]`. The legacy parser
+   consumes every leading bracket (`legacy/go/pkg/worker/exec.go:301-376`), so it takes the first
+   token of such a message and records it as the source location.
 
-Levels seen: `trace|debug|info|warning|error|critical`. Timestamps are local time in
+Levels seen: `trace|debug|info|warning|error|critical`. Timestamps are local time, in the format
 `2006-01-02 15:04:05.000`.
 
-Colour codes: the logger is a `stdout_color_mt` sink, which suppresses ANSI escapes when
-stdout is not a TTY, so a supervisor that pipes stdout (as it must, to read the stream at
-all) gets clean text. Worth knowing what the other case looks like, because it is not what
-you would guess — the escapes wrap the **level token itself**,
-`[<esc>[31m<esc>[1merror<esc>[m]`, so a parser that does not strip them fails to recognise
-the level rather than merely rendering oddly.
+Colour codes: the logger uses a `stdout_color_mt` sink, which omits ANSI escapes when stdout is not
+a TTY. A supervisor pipes stdout (it has to, to read it), so it receives plain text. The TTY case
+is still worth knowing because the escapes are not where you would expect: they wrap the **level
+token itself**, as in `[<esc>[31m<esc>[1merror<esc>[m]`. A parser that does not strip them fails
+to recognise the level at all, rather than just displaying it oddly.
 
-A supervisor must also **emit lines it cannot parse** rather than dropping them. Nothing
-guarantees every line on stdout is spdlog's, and the legacy translator's silent `continue`
-on a parse failure is an efficient way to lose the one message explaining a failure.
+A supervisor must also **pass through lines it cannot parse** instead of dropping them. Nothing
+guarantees that every line on stdout comes from spdlog. The legacy translator silently skips
+(`continue`) any line it fails to parse, which can discard the one message that explains a
+failure. The current supervisor logs such lines unchanged at warning level
+(`internal/worker/exec/handle.go:302-310`).
 
 ---
 
@@ -515,56 +547,59 @@ on a parse failure is an efficient way to lose the one message explaining a fail
 | Any other `mxl::Exception` | `fatal: <msg>` | 1 |
 | Any other `std::exception` | `fatal: <msg>` | 1 |
 
-**Do not use the exit code to classify *why* a worker died.** It now distinguishes success
-from failure, which is all it was ever going to do: `mxl::Exception` covers invalid config
-and unusable providers (permanent) alongside timeouts and the flow-not-found startup race
-(transient), so both land in the same non-zero bucket. Meaningful classification would need
-distinct exit codes per error class. The signals that work are behavioural — restart rate
-over a window, time to death, and source liveness — and a supervisor can compute all of
-them without the worker's help.
+**Do not use the exit code to classify why a worker died.** It separates success from failure
+and nothing more. `mxl::Exception` covers both permanent errors (invalid config, unusable
+provider) and transient ones (timeouts, the flow-not-found startup race), and all of them exit 1.
+Classifying them would need a distinct exit code per error class. What does work is behavioural:
+restart rate over a time window, time from start to exit, and whether the source is live. A
+supervisor can compute all of these without help from the worker.
 
-One diagnostic gap worth knowing: if the `domain` path is missing or not a directory,
-`mxlCreateInstance` returns `nullptr` and the worker throws the generic
-`std::runtime_error{"failed to create mxl instance"}` (`src/mxl.cpp:113-117`) → exit 1. The
-actual cause (`Path does not exist or is not a directory`) is only visible in the mxl
-library's own log line, not in the worker's `fatal:` message.
+One diagnostic gap: if the `domain` path is missing or not a directory, `mxlCreateInstance`
+returns `nullptr` and the worker throws the generic
+`std::runtime_error{"failed to create mxl instance"}` (`src/mxl.cpp:119-124`) → exit 1. The actual
+cause (`Path does not exist or is not a directory`) appears only in the mxl library's own log line,
+not in the worker's `fatal:` message.
 
 ### Self-terminating conditions
 
-Both of these exit the process — they are not retried internally. Both are governed by
-`idle_timeout_ms` (default 10 s, `0` = never):
+Both of the following exit the process; neither is retried inside the worker. Both are controlled
+by `idle_timeout_ms` (default 10 s, `0` = never):
 
-- **Initiator, discrete**: no successfully read grain within the timeout →
+- **Initiator, discrete:** no grain read successfully within the timeout →
   `MXL_ERR_TIMEOUT: timed out waiting for a grain to be published to the flow`
-  (`src/initiator.cpp:179`). Note the per-attempt read timeout is 100 ms and
-  `TOO_EARLY`/`TOO_LATE` are handled by resyncing to `getHeadIndex() + 1`, so this fires
-  only on a genuinely dead source.
-- **Target, discrete and continuous**: no grain/sample batch received within the timeout →
-  `MXL_ERR_TIMEOUT: timed out waiting for a grain` (`src/target.cpp:146`,
-  `src/target.cpp:202`). Per-attempt timeout 500 ms.
+  (`src/initiator.cpp:239-244`). Each read attempt times out after 100 ms, and `TOO_EARLY`/`TOO_LATE`
+  are handled by resyncing to `getHeadIndex() + 1`, so this only fires when the source has
+  actually stopped.
+- **Target, discrete and continuous:** no grain or sample batch received within the timeout →
+  `MXL_ERR_TIMEOUT: timed out waiting for a grain` (discrete, `src/target.cpp:146-148`) or
+  `MXL_ERR_TIMEOUT: timed out waiting for samples` (continuous, `src/target.cpp:202-204`).
+  Each receive attempt times out after 500 ms.
 
-Set `idle_timeout_ms: 0` when a paused session should stay up. With the default, a source
-that is simply not producing puts its workers into a permanent restart cycle — and since a
-target restart invalidates its `target_info` (§4), that cycle costs a re-pairing every time,
-not just a process start. The initiator, continuous variant has no idle timeout in any case:
-it sleeps to the next batch interval and never self-terminates on an idle source.
+Set `idle_timeout_ms: 0` if a paused session should stay up. With the default, a source that is
+simply not producing puts its workers into a permanent restart cycle. Because a target restart
+invalidates its `target_info` (§4), each cycle costs a full re-pairing, not just a process start.
+The continuous initiator has no idle timeout at all: it sleeps until the next batch interval and
+never exits because the source is idle.
 
-The initiator's **connect** phase is bounded separately by `connect_timeout_ms` (§5.2).
+`connect_timeout_ms` bounds the initiator's **connect** phase separately (§5.2).
 
-Everything else — remote peer vanishing, fabric errors, source flow being deleted — surfaces
-as an `mxl::Exception` and exits.
+All other failures (remote peer disappearing, fabric errors, source flow deleted) are raised as an
+`mxl::Exception` and the worker exits.
 
-**Design consequence: restart is the only recovery mechanism.** The worker has no reconnect
-logic. Any supervisor must implement a restart loop; the current one uses a flat 3 s delay
-(`legacy/go/pkg/worker/exec.go:139`).
+**Consequence for the design: restarting is the only way to recover.** The worker has no
+reconnect logic, so every supervisor needs a restart loop. The current agent backs off
+exponentially: it waits 1 s after the first death and doubles the wait after each further death,
+up to 2 min. If a worker ran for at least 1 min before it died, the wait goes back to 1 s
+(`internal/agent/agent.go:41-53`, `internal/agent/unit.go:137-173`). The legacy Go supervisor
+waited a flat 3 s between restarts (`legacy/go/pkg/worker/exec.go:139`).
 
 ---
 
 ## 9. Host and deployment requirements
 
 Runtime shared libraries: `libmxl`, `libmxl-fabrics`, `libfabric`, `libspdlog`, `libuuid`
-(`CMakeLists.txt:5-22`). The published image installs `libspdlog1.15`, `libuuid1`
-(`Dockerfile.legacy:40-45`).
+(`CMakeLists.txt:5-22`). The runtime image installs `libspdlog1.15` and `libuuid1`
+(`Dockerfile:77-82`), as the legacy image did (`Dockerfile.legacy:40-45`).
 
 | Requirement | Why | Needed for |
 |---|---|---|
@@ -576,43 +611,61 @@ Runtime shared libraries: `libmxl`, `libmxl-fabrics`, `libfabric`, `libspdlog`, 
 | `CAP_SYS_NICE` or `RLIMIT_RTPRIO` | `sched_setscheduler(SCHED_FIFO)` | `sched_prio` set |
 | Host networking / routable `node` address | the fabric endpoint binds `node:service` | always |
 
-The reference DaemonSet runs `privileged: true` plus `IPC_LOCK` and `SYS_RESOURCE`
-(`deployment/mxl-fabrics-proxy.yaml:158-163`).
+The reference DaemonSet runs with `privileged: true` plus `IPC_LOCK` and `SYS_RESOURCE`. The
+legacy manifest `deployment/mxl-fabrics-proxy.yaml` no longer exists. The current Helm chart sets
+this in `deployment/mxl-replicator/templates/agent.yaml:254-268`, with the defaults in
+`deployment/mxl-replicator/values.yaml:363-369`.
 
-**`sched_prio` fails hard**: `ScopedRTScheduling` throws `std::system_error` if
-`sched_setscheduler` fails (`src/rt.cpp:33`), which kills the worker with exit 1 *after* the
-connection is established. There is no graceful degradation. Either verify the capability
-before setting `sched_prio`, or don't set it.
+**A `sched_prio` failure is fatal.** `ScopedRTScheduling` throws `std::system_error` if
+`sched_setscheduler` fails (`src/rt.cpp:33`). The worker then exits 1, *after* the connection has
+been established. It does not fall back to normal scheduling. Either check the capability before
+setting `sched_prio`, or leave it unset.
 
-**Port allocation is the supervisor's job.** The worker binds whatever `service` says and
-has no fallback. The current Go code picks `rand.Intn(20000) + 20000` with **no collision
-detection and no retry** (`legacy/go/pkg/worker/exec.go:171`) — a collision produces a bind failure
-and a restart loop that eventually rolls a different number. A replication manager should
-own an explicit port range and allocate deterministically.
+**The supervisor allocates ports.** The worker binds whatever `service` says and has no fallback.
+The legacy Go supervisor picked `rand.Intn(20000) + 20000` with **no collision detection and no
+retry** (`legacy/go/pkg/worker/exec.go:171`). A collision caused a bind failure and a restart loop
+that continued until a later restart happened to pick a free number. The current agent allocates
+from an operator-configured range (`--port-range`, default `24000-24999`,
+`cmd/mxl-replicator/agent.go:91`) in `internal/agent/ports/alloc.go:65-94`. It keys each port by
+session and role, so a restarted worker gets the same port back, and releases it only when the
+session is no longer assigned to the node (`internal/agent/reconcile.go:170-177`). It skips ports it
+has already handed out, and for `tcp` it also test-binds each candidate port to skip ports another
+process holds (`internal/agent/ports/alloc.go:154-179`).
 
-This holds for `shm` too, even though nothing there is a port. `shm` endpoints are named
-within the host, and the probe's reported `service` is not usable as that name (§2), so the
-supervisor allocates from the same range and gets host-wide uniqueness from the same
-mechanism. One allocator, one collision domain, no per-provider special case.
+This applies to `shm` too, even though an `shm` service is not a port. `shm` endpoint names must be
+unique within the host, and the `service` the probe reports cannot be used as that name (§2). So
+the supervisor allocates `shm` services from the same range, which gives host-wide uniqueness
+through the same mechanism. There is one allocator and one collision domain, with no special case
+per provider. The current allocator does this (`internal/agent/ports/range.go:9-12`).
 
 ---
 
 ## 10. What the supervisor must provide
 
-Everything the Go tree does *around* the worker, i.e. what needs reimplementing:
+These are the things any supervisor must do around the worker. Each item says how the current
+supervisor in `internal/` does it, and where the legacy Go tree did it differently.
 
-1. **Per-instance working directory.** Fresh dir per start (not per logical worker), holding
-   `config.json`, `metrics.sock`, and — for targets — `target-info.json`. Must be removed on
-   teardown. Required because of the socket-rebind constraint (§6).
-2. **Config generation.** The JSON in §3, written before exec.
-3. **Interface discovery and capability agreement.** Run `--interfaces` (§2) at startup to
-   learn what libfabric actually offers on this host, and agree one `(provider, caps_flags,
-   max_message_size)` per session across both nodes — the library does none of this itself
-   (§3). Nothing in the Go tree does this today: it configures `provider` per side and
-   leaves the capabilities at the worker's built-in default.
+1. **Per-instance working directory.** A fresh directory for each start (not for each logical
+   worker), holding `config.json`, `metrics.sock` and, for targets, `target-info.json`. It must be
+   removed on teardown. It is needed because of the socket-rebind constraint (§6). Today:
+   `os.MkdirTemp` under `/run/mxl-replicator` on each start, removed when the worker is stopped
+   (`internal/worker/exec/handle.go:40-53`, `:223`), and any directories left by a previous agent
+   process are removed at startup (`internal/worker/exec/exec.go:182-206`).
+2. **Config generation.** Write the JSON described in §3 before exec. Today:
+   `internal/worker/exec/config.go:63-88`.
+3. **Interface discovery and capability agreement.** Run `--interfaces` (§2) at startup to learn
+   what libfabric actually offers on this host. Then agree one
+   `(provider, caps_flags, max_message_size)` per session across both nodes; the library does none
+   of this (§3). The legacy Go tree did none of this: it configured `provider` on each side and
+   left the capabilities at the worker's built-in default. Today the agent runs the probe at
+   startup and on re-registration (`cmd/mxl-replicator/agent.go:404-415`) and reports the
+   matching attachments to the server. The server intersects the two nodes' capability flags,
+   takes the smaller `max_message_size` (`internal/server/negotiate/negotiate.go:88-128`), and
+   writes the result into both assignments.
 
-   Joining the probe output against operator configuration needs care, because the probe
-   names no interface (§2). Four *naming* selectors, at most one per configured attachment:
+   Matching the probe output against operator configuration needs care, because the probe does
+   not name interfaces (§2). There are four *naming* selectors, and each configured attachment
+   uses at most one:
 
    | Configured | Match against | Works for |
    |---|---|---|
@@ -621,66 +674,100 @@ Everything the Go tree does *around* the worker, i.e. what needs reimplementing:
    | `device:` | probe `attr.device_name`, exactly | wherever the library reports one |
    | nothing | the provider alone, which **must** match exactly one entry | the common case |
 
-   The last row is the one that makes `efa` and `shm` configurable at all: neither can be
-   named by netdev, and a node almost always has exactly one of each, so requiring no
-   selector is both the simplest config and an unambiguous one. When it *is* ambiguous the
-   supervisor cannot guess — refuse the attachment and log every candidate entry, which
-   hands the operator the exact strings they could have written.
+   The last row is what makes `efa` and `shm` configurable at all. Neither can be named by netdev,
+   and a node almost always has exactly one of each, so using no selector is both the simplest
+   config and an unambiguous one. When it *is* ambiguous, the supervisor must not guess: it
+   refuses the attachment and logs every candidate entry, which gives the operator the exact
+   strings they could have configured.
 
-   The probe printing one entry per `(interface, address, provider)` is also why a name is
-   often not enough: one device with a v4 address and a link-local v6 one is two entries
-   under one `attr.device_name`. Two *narrowing* selectors conjoin with a name and with each
-   other, and the exactly-one-entry rule applies to the conjunction — `network:` (probe
-   `node` parsed, tested for containment in a CIDR prefix) and `ip_version:` (probe `node`
-   parsed, 4 or 6). Both are decided entirely from the probe's `node` field, so neither adds
-   anything to what the worker must report.
+   Because the probe prints one entry per `(interface, address, provider)`, a name alone is often
+   not enough: one device with an IPv4 address and a link-local IPv6 address is two entries with
+   the same `attr.device_name`. Two *narrowing* selectors can be combined with a naming selector
+   and with each other, and the exactly-one-entry rule applies to the combination:
+   `network:` (probe `node` parsed and tested for membership in a CIDR prefix) and `ip_version:`
+   (probe `node` parsed, 4 or 6). Both work entirely from the probe's `node` field, so neither
+   requires the worker to report anything more.
 
-   A configured attachment matching nothing is a configuration error and must be loud. It is
-   the difference between "this node has no verbs" and "someone typo'd `ib0`".
-4. **Port allocation** for `service` (§9), for every provider including `shm`.
-5. **Flow definition transport.** A target cannot create its local flow without the *remote*
-   flow's definition JSON. Today this is fetched over HTTP from the peer proxy
-   (`GET /v1/flows{domain}?id={flowID}` → `legacy/go/pkg/target/target.go:265-281`) and re-encoded
-   into `flow_def`.
-6. **Target-info transport.** Poll for the target's `target_info` file to appear, then get it
-   to the peer's initiator. Today: a `POST /v1/subscriptions` carrying the blob
-   (`legacy/go/pkg/target/target.go:330-351`). Polling starts at 200 ms and backs off to 2 s.
-7. **Pairing liveness.** Both ends must be torn down together, and target info must be
-   re-delivered whenever the target restarts (§4). Today: 9 s `PATCH` keepalive, 20 s
-   expiry on the initiator side, plus a target-info-changed check that force-terminates
-   the pairing (`legacy/go/pkg/initiator/subscriptions.go:120`, `:233`).
-8. **Restart supervision.** 3 s delay, `SIGTERM` with a 5 s grace period, restart counter.
-9. **Metrics scraping and labelling** (§6). Note the current implementation scrapes *every*
-   worker on each `/metrics` request with a 3 s budget — worth reconsidering at scale.
-10. **Log translation** (§7).
-11. **Flow liveness observation.** Independent of the worker: the Go layer mmaps the flow's
-    `data` file and reads `headIndex` / `lastReadTime` at fixed offsets to derive
-    `mxl_writer_active` / `mxl_reader_active` (`legacy/go/pkg/mxl/mxl.go`). This depends on the
-    MXL on-disk layout and will break if that layout changes — treat it as a candidate for
-    replacement with a supported API rather than a straight port.
+   A configured attachment that matches nothing is a configuration error and must be reported
+   loudly, so the operator can tell "this node has no verbs" apart from "someone mistyped `ib0`".
+
+   The agent implements these rules in `probe.Join` (`internal/agent/probe/probe.go:254`).
+4. **Port allocation** for `service` (§9), for every provider including `shm`. Today:
+   `internal/agent/ports`, from an operator-configured range.
+5. **Flow definition transport.** A target cannot create its local flow without the definition
+   JSON of the *remote* flow. Today the source node's agent reports each flow's `flow_def.json`
+   bytes in its inventory (`internal/agent/inventory/inventory.go:1-6`), and the server copies them
+   into the target's assignment (`internal/server/reconcile/reconcile.go:1376`). There is no
+   agent-to-agent traffic. The legacy target fetched the definition over HTTP from the peer proxy
+   (`GET /v1/flows{domain}?id={flowID}` → `legacy/go/pkg/target/target.go:265-281`) and
+   re-encoded it into `flow_def`.
+6. **Target-info transport.** Wait until the target's `target_info` file appears, then deliver it
+   to the peer's initiator. Today the launcher watches the work directory with inotify instead of
+   polling (`internal/worker/exec/handle.go:318-364`), the agent waits up to 30 s for the file
+   (`internal/agent/agent.go:55-58`) and reports the blob and its epoch in the worker's status,
+   and the server copies both into the initiator's assignment
+   (`internal/server/reconcile/reconcile.go:1403-1405`). The legacy target sent the blob to the
+   peer in a `POST /v1/subscriptions` (`legacy/go/pkg/target/target.go:330-351`) after polling for
+   the file, starting at 200 ms and backing off to 2 s.
+7. **Pairing liveness.** Both ends must be torn down together, and target info must be delivered
+   again whenever the target restarts (§4). Today the server drives this through assignments.
+   When a target worker dies, its agent clears the reported epoch and blob
+   (`internal/agent/unit.go:409-412`). The server then withdraws the initiator's assignment until
+   the target reports ready with a new epoch
+   (`internal/server/reconcile/reconcile.go:1379-1390`), and the new epoch restarts the initiator
+   (§4). The legacy Go supervisor used a `PATCH` keepalive every 9 s, 20 s expiry on the initiator
+   side, and a check for changed target info that forcibly ended the pairing
+   (`legacy/go/pkg/initiator/subscriptions.go:120`, `:233`).
+8. **Restart supervision.** Restart delay, `SIGTERM` with a grace period, restart counter. Today:
+   exponential backoff from 1 s to 2 min (§8), `SIGTERM` with a 5 s grace period then `SIGKILL`
+   (§5.4), and a restart count reported to the server over a 5 min window
+   (`internal/agent/agent.go:37-39`) and exported as `mxl_worker_restarts`. The legacy Go
+   supervisor used a flat 3 s delay and the same 5 s grace period.
+9. **Metrics scraping and labelling** (§6). The current agent still scrapes *every* worker on
+   each `/metrics` request, but reads at most 8 sockets at once, with 1 s per worker and 5 s for
+   the whole collection (`internal/agent/metrics.go:19-40`). The legacy Go supervisor had no
+   concurrency limit and a 3 s budget (`legacy/go/pkg/metrics/metrics.go:123`).
+10. **Log translation** (§7). Today: `internal/worker/logs/logs.go`.
+11. **Flow liveness observation.** This is independent of the worker. The legacy Go supervisor
+    mmaps the flow's `data` file and reads `headIndex` / `lastReadTime` at fixed offsets to derive
+    `mxl_writer_active` / `mxl_reader_active` (`legacy/go/pkg/mxl/mxl.go`). The current agent reads
+    the same two fields through the `pkg/mxl` package of the external `mxl-utils` module
+    (`internal/agent/inventory/inventory.go:654-661`), which also mmaps the flow's data file. It
+    still depends on the MXL on-disk layout and will break if that layout changes, so it should be
+    replaced with a supported API.
 
 ---
 
-## 11. Quirks to carry forward knowingly
+## 11. Known quirks to carry forward
 
-Collected from the sections above, in rough order of how likely they are to bite:
+Collected from the sections above, roughly ordered by how likely they are to cause trouble:
 
 | # | Issue | Location |
 |---|---|---|
 | 1 | `mxl_last_grain` declared but never updated; always 0 | `src/metrics.hpp:44` |
-| 2 | `mxl_payload_octets_total` / `mxl_octets_total` naming is inverted | `src/metrics.cpp:74` |
-| 3 | `sun_path` is 108 bytes; an over-long path is now a clear error, but it is still a hard limit on the work directory | `src/metrics.cpp:44` |
-| 4 | tx-timestamp measurement writes into another writer's grain headers | `src/initiator.cpp:134-138` |
+| 2 | `mxl_payload_octets_total` / `mxl_octets_total` naming is inverted | `src/metrics.hpp:40-41`, `src/initiator.cpp:219`, `src/target.cpp:129` |
+| 3 | `sun_path` is 108 bytes; an over-long path is now a clear error, but it is still a hard limit on the work directory | `src/metrics.cpp:51` |
+| 4 | tx-timestamp measurement writes into another writer's grain headers | `src/initiator.cpp:178-183` |
 | 5 | `sched_prio` failure is fatal, post-connection | `src/rt.cpp:33` |
-| 6 | `~Metrics` closes the epoll fd to unblock its thread and leaks the listen fd | `src/metrics.cpp:88-96` |
-| 7 | Config keys `proxy_id`, `efa_use_wait`, `labels` are written by Go and ignored by C++ | `legacy/go/pkg/worker/config.go:7-18` |
-| 8 | The initiator's continuous path has no idle timeout at all, so `idle_timeout_ms` does not apply to it | `src/initiator.cpp:196-246` |
+| 6 | Config keys `proxy_id`, `efa_use_wait`, `labels` were written by the legacy Go supervisor and are ignored by C++; the current supervisor does not write them | `legacy/go/pkg/worker/config.go:3-20` |
+| 7 | The initiator's continuous path has no idle timeout at all, so `idle_timeout_ms` does not apply to it | `src/initiator.cpp:256-306` |
 
-None of these are blockers for reuse.
+None of these prevent reusing the worker.
 
-**Fixed since the first version of this document**, listed because a supervisor written
-against it may still be working around them: the non-interrupt `mxl::Exception` path now
-exits 1 rather than 0 (§8); `mxl_grains_lost` is no longer always 0 on the initiator
-(a shadowed variable, `src/initiator.cpp:157`); the connect loop has a timeout (§5.2); the
-metrics socket is unlinked before bind (§6); and `target-info.json` no longer carries a
-trailing NUL byte (§4).
+**Fixed since the first version of this document.** These are listed because a supervisor written
+against the earlier version may still work around them:
+
+- The non-interrupt `mxl::Exception` path now exits 1 rather than 0 (§8).
+- `mxl_grains_lost` is no longer always 0 on the initiator (a shadowed variable,
+  `src/initiator.cpp:199-207`).
+- The connect loop has a timeout (§5.2).
+- The metrics socket path is unlinked before bind (§6).
+- `target-info.json` no longer ends in a NUL byte (§4).
+- `~Metrics` no longer aborts the worker during teardown. It used to close the epoll fd to stop
+  its thread, but that does not wake a blocked `epoll_wait`. A scrape arriving in that window was
+  accepted onto the descriptor number just freed, `epoll_ctl` failed (`EINVAL`, or `EBADF`), and
+  the throw from the thread called `std::terminate`. The worker died with `signal: aborted`
+  instead of logging its real `fatal:` reason, because `Metrics` is destroyed while the exception
+  that ends the worker is still unwinding. The destructor now wakes the thread through an
+  `eventfd`, joins it, and only then closes the descriptors, including the listen fd it used to
+  leak (`src/metrics.cpp:109-131`).

@@ -172,7 +172,7 @@ export const useStagingStore = defineStore('staging', () => {
    *
    * *Reasoned from the reconciler's rules rather than observed.* The fake fleet cannot tell the two
    * orders apart: a session id is a deterministic hash of the path identity and the flow definition
-   * (`state.SessionID`), so it survives a rebuild unchanged, and nothing in `ui/prototype/devfleet.sh`
+   * (`state.SessionID`), so it survives a rebuild unchanged, and nothing in the fake fleet
    * runs a worker whose restart count would show.
    */
   const staged = computed<StagedRequest[]>(() => {

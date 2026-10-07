@@ -1,6 +1,6 @@
 <script setup lang="ts">
 /**
- * A `shared` namespace is a ledger, not a board (`ui.md` §7c).
+ * A `shared` namespace view: the ledger of claims (`ui.md` §7c).
  *
  * The matrix renders **intents**, deduplicated by nothing. This renders **claims** — the triple
  * `(request, source entry, path)` — over the path list the server has already deduplicated. All

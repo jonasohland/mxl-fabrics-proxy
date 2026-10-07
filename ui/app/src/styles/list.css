@@ -4,7 +4,7 @@
  * views share one shape, a `<style scoped>` cannot be shared, and a scoped sheet scopes a
  * *component* rather than the class names inside it — a bare `.head` in one of these would collide
  * with the page header of whichever view imported it, which has cost this app a ragged column edge
- * once already (`ui-plan.md` §4).
+ * once already.
  *
  * These are the tables the CLI's `get` prints, with the one thing a terminal cannot do: every
  * identifier is a link, and the facets above them are addressable. */

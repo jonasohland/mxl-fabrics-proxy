@@ -32,7 +32,7 @@ export interface Domain {
  * A domain rendered as `<area>/<elements>` — what identifies a domain that already exists.
  *
  * Branded, so it cannot be passed where a {@link Domain} is wanted. The rule it enforces is
- * `ui.md` §3 trap 1 and §10.6's "parsed at exactly one boundary": the manifest parser is the only
+ * `ui.md` §5 trap 1 and §10.6's "parsed at exactly one boundary": the manifest parser is the only
  * thing in the system that turns a domain string into an area and elements, and a UI text box that
  * split one would make the UI the second parser. Rendering is one-way here by construction —
  * {@link renderDomain} exists and its inverse deliberately does not.

@@ -114,7 +114,7 @@ export interface Unrouted {
  * What the source editor opens on when a strip entry is clicked.
  *
  * The domain is the **rendered** name and is used for a lookup by rendered equality against the
- * node's own domain list, exactly as a domain's URL is (`ui-plan.md` §2). Nothing reconstructs an
+ * node's own domain list, exactly as a domain's URL is. Nothing reconstructs an
  * `{area, elements}` from it: the structured domain the editor puts in a selector is always the
  * server's own, so the one thing the design forbids outright — splitting a rendered domain to send
  * it — stays off the page rather than being a rule somebody has to remember.

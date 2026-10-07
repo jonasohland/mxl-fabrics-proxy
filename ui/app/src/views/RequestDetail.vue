@@ -17,7 +17,7 @@
  *   refused during validation, which produce no path at all — so a request whose every materialised
  *   path is `ACTIVE` beside one invalid pairing is `PARTIAL` on the wire and would fold to `ACTIVE`
  *   here. Those failures are absent from `status.paths[]` and there is nothing to recompute them
- *   from (`ui-plan.md` §4).
+ *   from.
  * - **A request can list a path it does not hold.** `ui.md` §5 trap 14, and this is the one screen
  *   where it is worth *rendering* rather than merely defending against: the loser of a namespace
  *   overlap goes `INVALID` and still lists the contested path with the incumbent's state, so a

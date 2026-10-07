@@ -3,9 +3,11 @@ package e2e
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	osexec "os/exec"
@@ -55,23 +57,100 @@ import (
 // Skips when the binaries are not built, following the same rule as the etcd tests: a machine
 // that has not built the C++ side should still be able to run `go test ./...`.
 func TestLoopbackOverSHM(t *testing.T) {
-	runLoopback(t, api.ProviderSHM, probe.Attachment{Provider: api.ProviderSHM})
+	runLoopback(t, api.ProviderSHM, shmAttachment, videoLoopback)
 }
 
 func TestLoopbackOverTCP(t *testing.T) {
-	runLoopback(t, api.ProviderTCP, probe.Attachment{
+	runLoopback(t, api.ProviderTCP, tcpAttachment, videoLoopback)
+}
+
+// The audio cases replicate a continuous flow, which the initiator moves in a different loop
+// from a discrete one: it reads batches of samples rather than grains, and it is the loop that
+// paces itself rather than being paced by a blocking read on a grain.
+//
+// That loop used to pace itself with a timer restarted after every read, so each 10 ms batch took
+// 10 ms plus the wake-up latency, and the replica fell behind the source by about 5.5 ms per
+// second. Nothing was lost or corrupted until the lag reached half the source's ring buffer, about
+// 35 s in, when the initiator got TOO_LATE and skipped ~200 ms of audio to catch up
+// (docs/audio-issue.md). A run long enough to see the skip is too long for this suite, so the
+// test measures the cause instead: the sink's latency behind the source must be the same at the
+// end of the run as at the start.
+func TestAudioLoopbackOverSHM(t *testing.T) {
+	summary := runLoopback(t, api.ProviderSHM, shmAttachment, audioLoopback)
+	assertNoLatencyDrift(t, summary)
+}
+
+func TestAudioLoopbackOverTCP(t *testing.T) {
+	summary := runLoopback(t, api.ProviderTCP, tcpAttachment, audioLoopback)
+	assertNoLatencyDrift(t, summary)
+}
+
+var (
+	shmAttachment = probe.Attachment{Provider: api.ProviderSHM}
+	tcpAttachment = probe.Attachment{
 		Provider: api.ProviderTCP,
 		Fabric:   "loopback",
 		Address:  "127.0.0.1",
-	})
+	}
+)
+
+// loopbackMedia is what a loopback case replicates, and how much of it the sink must verify.
+type loopbackMedia struct {
+	format     string
+	definition func(t *testing.T, groupName string) flowDefinition
+	// count is how many grains, or sample batches, the sink must read and check byte-for-byte.
+	count int
 }
 
-// grainsToVerify is how many grains the sink must read and check byte-for-byte. At 24000/1001
-// that is a little under a second of video, which is long enough to be past establishment and
-// short enough that a failing run reports promptly.
-const grainsToVerify = 20
+var (
+	// 20 grains at 24000/1001 is a little under a second of video, which is long enough to be
+	// past establishment and short enough that a failing run reports promptly.
+	videoLoopback = loopbackMedia{format: "video", definition: writeFlowDefinition, count: 20}
 
-func runLoopback(t *testing.T, provider api.Provider, attachment probe.Attachment) {
+	// 1000 batches of 480 samples at 48 kHz is 10 s of audio. Longer than video needs for the
+	// payload check, because the drift check needs time for a lag to build up: at the rate the
+	// timer-paced loop drifted, 10 s is ~50 ms, well clear of the jitter in a mean of 50 reads.
+	audioLoopback = loopbackMedia{format: "audio", definition: writeAudioFlowDefinition, count: 1000}
+)
+
+// sinkSummary is mxl-mock-sink's JSON report.
+type sinkSummary struct {
+	OK         bool   `json:"ok"`
+	Read       int    `json:"read"`
+	Verified   int    `json:"verified"`
+	Mismatched int    `json:"mismatched"`
+	Gaps       int    `json:"gaps"`
+	Failure    string `json:"failure"`
+	LatencyNs  struct {
+		Min             uint64 `json:"min"`
+		Max             uint64 `json:"max"`
+		Mean            uint64 `json:"mean"`
+		FirstWindowMean uint64 `json:"first_window_mean"`
+		LastWindowMean  uint64 `json:"last_window_mean"`
+	} `json:"latency_ns"`
+}
+
+// maxLatencyDrift is how far the sink's latency may move between the start and the end of an
+// audio run. Each side is a mean of 50 reads, so scheduling jitter mostly averages out; what is
+// left is a few milliseconds at most. A loop that drifts at the rate seen on the cluster moves
+// ~50 ms over the run.
+const maxLatencyDrift = 15 * time.Millisecond
+
+func assertNoLatencyDrift(t *testing.T, summary sinkSummary) {
+	t.Helper()
+
+	first := time.Duration(summary.LatencyNs.FirstWindowMean)
+	last := time.Duration(summary.LatencyNs.LastWindowMean)
+	t.Logf("latency behind the source: %s at the start, %s at the end (min %s, max %s)",
+		first, last, time.Duration(summary.LatencyNs.Min), time.Duration(summary.LatencyNs.Max))
+
+	require.NotZero(t, first, "the sink reported no latency")
+	assert.Less(t, (last - first).Abs(), maxLatencyDrift,
+		"the replica's latency behind the source moved from %s to %s over the run; "+
+			"the initiator is not keeping pace with the source", first, last)
+}
+
+func runLoopback(t *testing.T, provider api.Provider, attachment probe.Attachment, media loopbackMedia) sinkSummary {
 	workerBinary := locate(t, "mxl-replicator-worker", "MXL_REPLICATOR_TEST_WORKER_BINARY")
 	producer := locate(t, "mxl-mock-src", "MXL_REPLICATOR_TEST_MOCK_SRC")
 	consumer := locate(t, "mxl-mock-sink", "MXL_REPLICATOR_TEST_MOCK_SINK")
@@ -103,7 +182,7 @@ func runLoopback(t *testing.T, provider api.Provider, attachment probe.Attachmen
 
 	// The producer writes into the source domain the agent just created. It runs until the test
 	// stops it, so the flow keeps being produced for as long as anything is looking at it.
-	definition := writeFlowDefinition(t, "E2E Camera 1")
+	definition := media.definition(t, "E2E Source 1")
 	source := start(t, producer,
 		"--domain", node.path("src"),
 		"--flow-def", definition.path,
@@ -123,7 +202,7 @@ func runLoopback(t *testing.T, provider api.Provider, attachment probe.Attachmen
 	// pin is honoured or the request fails — it is never substituted (§10.4), so a tcp run that
 	// quietly landed on shm would report a pass for something it did not test.
 	request := f.request(api.RequestSpec{
-		Name:         "loopback-" + string(provider),
+		Name:         "loopback-" + media.format + "-" + string(provider),
 		Sources:      []api.Source{{Node: "loopback", Domain: node.source("src"), Select: api.Selector{Flow: definition.id}}},
 		Destinations: []api.Destination{{Node: "loopback", Domain: api.Domain{Area: "fast", Elements: []string{"dst"}}}},
 		Provider:     api.ProviderPin{provider},
@@ -159,27 +238,27 @@ func runLoopback(t *testing.T, provider api.Provider, attachment probe.Attachmen
 		"--flow-id", definition.id,
 		"--verify",
 		"--seed", "7",
-		"--count", fmt.Sprint(grainsToVerify),
+		"--count", fmt.Sprint(media.count),
 		"--wait-for-flow", "30000",
 		"--idle-timeout", "30000",
 		"--json")
 
-	var summary struct {
-		OK         bool   `json:"ok"`
-		Read       int    `json:"read"`
-		Verified   int    `json:"verified"`
-		Mismatched int    `json:"mismatched"`
-		Gaps       int    `json:"gaps"`
-		Failure    string `json:"failure"`
-	}
+	var summary sinkSummary
 	require.NoError(t, json.Unmarshal([]byte(sink.stdout), &summary), "sink stdout: %s", sink.stdout)
 
 	assert.Zero(t, sink.code, "mxl-mock-sink failed: %s\n%s", summary.Failure, sink.stderr)
 	assert.True(t, summary.OK, "sink reported failure: %s", summary.Failure)
-	assert.Equal(t, grainsToVerify, summary.Read)
-	assert.Equal(t, grainsToVerify, summary.Verified, "every grain read must verify against the pattern")
+	assert.Equal(t, media.count, summary.Read)
+	assert.Equal(t, media.count, summary.Verified, "every grain read must verify against the pattern")
 	assert.Zero(t, summary.Mismatched, "a mismatch is a grain that arrived at the wrong offset or corrupted")
 	assert.Zero(t, summary.Gaps, "a gap is a grain that never arrived")
+
+	// The sink above reads the destination, so it says nothing about what the initiator leaves
+	// behind in the source. shm only: the stamp is local to the source node and does not depend
+	// on the fabric. Video only: only a discrete initiator stamps the source.
+	if provider == api.ProviderSHM && media.format == "video" {
+		assertSourceGrainsIntact(t, filepath.Join(node.path("src"), definition.id+".mxl-flow"))
+	}
 
 	// Cancelling the request stops both workers. Real processes this time, so the assertion is
 	// that they are gone rather than that a struct was marked dead.
@@ -192,6 +271,7 @@ func runLoopback(t *testing.T, provider api.Provider, attachment probe.Attachmen
 	})
 
 	source.stop()
+	return summary
 }
 
 // M7.12: an initiator must not strand the flow it reads.
@@ -290,6 +370,100 @@ func TestInitiatorReleasesTheSourceFlowWhenItStopsProducing(t *testing.T) {
 		"both workers must still be running — the session is hot, only the writer was given up")
 }
 
+// --- the source ring -----------------------------------------------------------------------------
+
+// assertSourceGrainsIntact checks that the initiator's latency stamp left the source flow's
+// committed grains readable.
+//
+// The initiator stamps each grain through a writer it opens on a flow it does not own. Since
+// libmxl 1.2, openGrain sets the slot's validSlices to 0 and clears MXL_GRAIN_FLAG_INVALID in
+// shared memory, and cancelling does not put them back (docs/validslices-reset-fix.md). Every
+// grain the initiator had stamped then stayed incomplete for good, and any other local reader of
+// the source waited on it forever. The destination was fine, which is why the sink above could
+// not see it.
+//
+// The check reads the headers straight from the grain files instead of running a second reader,
+// because a reader that happens to get to each grain before the initiator does passes either way.
+// Every slot behind the newest one has been committed by the producer and stamped by the
+// initiator, so each must read complete, or be flagged invalid by the producer (libmxl marks the
+// slots a writer skips). The newest slot is left out: the producer may be writing it.
+//
+// Polled, because with the fix there is still a window of microseconds between openGrain and the
+// restore in which a stamped slot reads 0. Without the fix it never recovers, so the poll is
+// short.
+func assertSourceGrainsIntact(t *testing.T, flowDir string) {
+	t.Helper()
+
+	// mxlGrainInfo, at the start of each grain file (mxl/flow.h).
+	const (
+		offIndex       = 8
+		offFlags       = 16
+		offTotalSlices = 24
+		offValidSlices = 26
+		headerSize     = 28
+		flagInvalid    = 0x1
+	)
+
+	type slot struct {
+		file         string
+		index        uint64
+		flags        uint32
+		total, valid uint16
+	}
+
+	read := func() []slot {
+		files, err := filepath.Glob(filepath.Join(flowDir, "grains", "data.*"))
+		require.NoError(t, err)
+		require.NotEmpty(t, files, "no grain files under %s", flowDir)
+
+		slots := make([]slot, 0, len(files))
+		header := make([]byte, headerSize)
+		for _, file := range files {
+			f, err := os.Open(file)
+			require.NoError(t, err)
+			_, err = io.ReadFull(f, header)
+			_ = f.Close()
+			require.NoError(t, err, "read grain header of %s", file)
+
+			slots = append(slots, slot{
+				file:  filepath.Base(file),
+				index: binary.LittleEndian.Uint64(header[offIndex:]),
+				flags: binary.LittleEndian.Uint32(header[offFlags:]),
+				total: binary.LittleEndian.Uint16(header[offTotalSlices:]),
+				valid: binary.LittleEndian.Uint16(header[offValidSlices:]),
+			})
+		}
+		return slots
+	}
+
+	broken := func(slots []slot) []string {
+		var newest uint64
+		for _, s := range slots {
+			newest = max(newest, s.index)
+		}
+		var out []string
+		for _, s := range slots {
+			if s.index == newest || s.valid == s.total || s.flags&flagInvalid != 0 {
+				continue
+			}
+			out = append(out, fmt.Sprintf("%s index=%d flags=%#x validSlices=%d/%d",
+				s.file, s.index, s.flags, s.valid, s.total))
+		}
+		return out
+	}
+
+	var last []string
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if last = broken(read()); len(last) == 0 {
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	t.Errorf("source grains left incomplete behind the producer, so no local reader can read them:\n  %s",
+		strings.Join(last, "\n  "))
+}
+
 // --- the real launcher and probe -------------------------------------------------------------
 
 // realLauncher builds the launcher that execs worker processes, and returns the work root it was
@@ -378,6 +552,33 @@ func writeFlowDefinition(t *testing.T, groupName string) flowDefinition {
 		"frame_width":    1920,
 		"frame_height":   1080,
 		"grain_rate":     map[string]int{"numerator": 24000, "denominator": 1001},
+	}
+
+	encoded, err := json.MarshalIndent(body, "", "  ")
+	require.NoError(t, err)
+
+	path := filepath.Join(t.TempDir(), "flow-def.json")
+	require.NoError(t, os.WriteFile(path, encoded, 0o600))
+	return flowDefinition{id: id, path: path}
+}
+
+// writeAudioFlowDefinition is writeFlowDefinition for audio: 48 kHz float32, as
+// mxl-gst-testsrc produces. mxl-mock-src writes it in the library's default batch of 480 samples.
+func writeAudioFlowDefinition(t *testing.T, groupName string) flowDefinition {
+	t.Helper()
+
+	id := testutil.NewVideoFlowDef(testutil.FlowSize1080, testutil.FlowRate23).ID
+
+	body := map[string]any{
+		"id":            id,
+		"label":         "e2e " + groupName,
+		"description":   "mxl-replicator end-to-end test flow",
+		"format":        "urn:x-nmos:format:audio",
+		"media_type":    "audio/float32",
+		"tags":          map[string][]string{"urn:x-nmos:tag:grouphint/v1.0": {groupName + ":audio"}},
+		"sample_rate":   map[string]int{"numerator": 48000},
+		"channel_count": 2,
+		"bit_depth":     32,
 	}
 
 	encoded, err := json.MarshalIndent(body, "", "  ")

@@ -12,7 +12,8 @@
     "check": "vue-tsc --build",
     "test": "vitest run",
     "test:watch": "vitest",
-    "test:live": "vitest run --config vitest.live.config.ts"
+    "test:live": "vitest run --config vitest.live.config.ts",
+    "devfleet": "scripts/devfleet.sh"
   },
   "dependencies": {
     "pinia": "^3.0.3",

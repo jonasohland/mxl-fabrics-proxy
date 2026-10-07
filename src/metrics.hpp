@@ -28,6 +28,7 @@ class Metrics {
   private:
     [[nodiscard]] std::string scrape() const noexcept;
     void run();
+    void serve();
     void accept();
     void createSession(int);
     void removeSession(std::uint64_t);
@@ -52,7 +53,11 @@ class Metrics {
     std::uint64_t _sessionCounter = 0;
     std::map<std::uint64_t, Session> _sessions = {};
 
-    int _listenFd = 0;
-    int _epollfd = 0;
+    int _listenFd = -1;
+    int _epollfd = -1;
+    // Written by the destructor to stop run(). Closing _epollfd cannot do it:
+    // a thread blocked in epoll_wait keeps the instance alive, and the freed
+    // descriptor number is handed straight to the next accept().
+    int _wakeFd = -1;
 };
 } // namespace mxl::proxy

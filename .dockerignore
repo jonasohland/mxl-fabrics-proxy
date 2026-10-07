@@ -11,7 +11,6 @@ build
 node_modules
 ui/node_modules
 ui/app/node_modules
-ui/prototype
 # The image builds the app itself, in its own stage. Excluding a local build here is what keeps a
 # stale `npm run build` on somebody's laptop from being what ships.
 ui/app/dist

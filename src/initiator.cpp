@@ -180,6 +180,12 @@ void Initiator::transferGrains(::mxl::DiscreteFlowReader reader,
         }
         auto writeAccess = writer->openGrain(index);
         writeAccess.writeTxTimestamp(::mxlGetTime());
+        // libmxl >= 1.2 sets validSlices to 0 and clears the invalid flag in
+        // openGrain. Restore both from the reader's copy, taken before
+        // openGrain. Committing instead would move the source's headIndex
+        // back to this grain, behind the producer.
+        writeAccess.restoreHeader(grainAccess.validSlices(),
+                                  grainAccess.flags());
         writeAccess.cancel();
       }
       spdlog::debug("transmitting grain index={} fromSlice={} toSlice={}",
@@ -256,36 +262,35 @@ void Initiator::transferGrains(::mxl::DiscreteFlowReader reader,
 void Initiator::transferSamples(
     ::mxl::ContinuousFlowReader reader,
     ::mxl::fabrics::ContinuousFlowInitiator initiator, utils::ExitSignal sig) {
-  auto lastReadTime = ::mxlGetTime();
   auto headIndex = reader.getHeadIndex();
   auto batchSize = reader.getBatchSize();
-  auto rate = reader.getRate();
-  auto interval =
-      static_cast<std::uint64_t>(((static_cast<double>(rate.denominator) /
-                                   static_cast<double>(rate.numerator)) *
-                                  static_cast<double>(batchSize)) *
-                                 std::nano::den);
   for (;;) {
     if (sig.shouldExit()) {
       return;
     }
 
     try {
-      // Return value discarded: data is in shared memory; we only call
-      // this to verify availability before the RDMA transfer.
-      (void)reader.getSamplesNonBlocking(headIndex, batchSize);
+      // Blocks until the writer has committed the batch ending at headIndex,
+      // the same way transferGrains blocks in getGrain. Pacing on the
+      // writer's commits keeps the loop on the flow's timeline; a timer
+      // restarted after every read falls behind by its wake-up latency on
+      // each iteration (docs/audio-issue.md). Return value discarded: data
+      // is in shared memory; we only need it to be available before the
+      // RDMA transfer.
+      (void)reader.getSamples(headIndex, batchSize,
+                              std::chrono::milliseconds(100));
     } catch (::mxl::Exception const &ex) {
       if (ex.isTooLate()) {
         headIndex = reader.getHeadIndex();
         continue;
       }
+      // libmxl reports a timeout as TOO_EARLY. The read already waited, so
+      // retrying does not spin.
       if (ex.isTooEarly()) {
         continue;
       }
       throw;
     }
-    lastReadTime = ::mxlGetTime();
-    auto rxTime = lastReadTime;
 
     spdlog::debug("transferring samples headIndex={} count={}", headIndex,
                   batchSize);
@@ -301,7 +306,6 @@ void Initiator::transferSamples(
     }
 
     headIndex += batchSize;
-    ::mxlSleepUntil(lastReadTime + interval);
   }
 }
 

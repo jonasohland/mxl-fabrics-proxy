@@ -25,8 +25,11 @@ const (
 // metadata edit. Keeping identity fixed makes relabelling free — and it turns naming into
 // *selection*, which is the same move §9.1 already made one layer down for flows.
 //
-//	"domain": { "name": "media/cameras" }
+//	"domain": { "name": { "area": "media", "elements": ["cameras"] } }
 //	"domain": { "labels": { "role": "cameras" } }
+//
+// On the wire the name is the structured [Domain] object; `media/cameras` is only how a manifest
+// spells it (see Name below).
 //
 // # Exactly one kind
 //

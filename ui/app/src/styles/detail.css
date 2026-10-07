@@ -4,8 +4,7 @@
  * editors: six views share one shape and a `<style scoped>` cannot be shared. The prefix is what
  * keeps that from being a hazard — a scoped stylesheet scopes a *component*, not the classes inside
  * it, and a bare `.head` in one of these would collide with the page header of whichever view
- * imported it. That collision cost a ragged column edge in the matrix once already (`ui-plan.md`
- * §4); a name no container wants is the cheap way not to pay it twice.
+ * imported it. That collision cost a ragged column edge in the matrix once already; a name no container wants is the cheap way not to pay it twice.
  *
  * The shape is the CLI's, because the CLI's is right: a title naming the kind and the thing, a block
  * of label/value fields, then sections. What a UI adds is that every identifier in it is a link. */

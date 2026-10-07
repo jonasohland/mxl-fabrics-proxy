@@ -2,8 +2,8 @@
  *
  * Dark by default: this is a control surface that sits open all day.
  *
- * The state palette is ported from `ui/prototype/style.css` rather than re-picked, because the
- * colour assignments carry design decisions rather than taste — see each note below. */
+ * The colour assignments in the state palette carry design decisions rather than taste — see each
+ * note below. */
 
 :root {
   --bg:        #14161a;

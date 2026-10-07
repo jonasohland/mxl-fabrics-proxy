@@ -42,7 +42,7 @@ type config struct {
 
 	MetricsSocket string `json:"metrics_socket"`
 
-	// TargetInfo is two different things by role, which is the sharpest asymmetry in the
+	// TargetInfo means different things per role, which is the sharpest asymmetry in the
 	// worker's interface (WRS §3): an **output file path** for a target, which writes its blob
 	// there once the fabric endpoint is up, and the blob itself **inline** for an initiator.
 	TargetInfo string `json:"target_info"`

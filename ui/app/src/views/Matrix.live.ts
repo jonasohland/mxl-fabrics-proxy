@@ -3,7 +3,7 @@
  *
  * The matrix against an `exclusive` namespace, seeded here rather than inherited.
  *
- * `reset()` writes its own preconditions for the same reason the prototype's harness did: a fixture
+ * `reset()` writes its own preconditions because a fixture
  * left behind by an earlier run makes the assertions a statement about the store's history rather
  * than about the rule. The four requests are the shapes §7a has to draw —
  *
@@ -158,9 +158,9 @@ describe('the matrix over an exclusive namespace', () => {
     expect(cell.find('.line.dim').text()).toBe('·')
   })
 
-  // Geometry is a correctness property, not styling: cells in a row share a height, so prose in one
-  // resizes the whole grid under the pointer. The reason is in the tooltip, where length costs
-  // nothing — and the tooltip is where it must be found.
+  // Cell and grid sizes must not depend on content (`ui.md` §7a): cells in a row share a height, so
+  // prose in one resizes the whole grid under the pointer. The reason is in the tooltip, where
+  // length costs nothing — and the tooltip is where it must be found.
   it('gives every cell two fixed-shape lines and no prose', () => {
     for (const cell of wrapper.findAll('.cell')) {
       expect(cell.findAll('.line').length).toBeLessThanOrEqual(2)

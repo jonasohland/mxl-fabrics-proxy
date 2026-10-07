@@ -3,10 +3,9 @@
  *
  * The two editors, end to end: name an axis, route it, apply, and the server agreeing.
  *
- * This is the sequence the live harness exists for and the one a unit test cannot reach. The
- * prototype's own list of what its harness caught is a list of *sequences* — a dialog showing the
- * previous node's domains, two per-node reads landing out of order, a selection carried across a
- * reopen — and every one of them is a bug in the same place this file drives: a form whose contents
+ * This is the sequence the live harness exists for and the one a unit test cannot reach. What a
+ * live harness catches is a list of *sequences* — a dialog showing the previous node's domains, two
+ * per-node reads landing out of order, a selection carried across a reopen — and every one of them is a bug in the same place this file drives: a form whose contents
  * come from a read that is not the poll.
  *
  * It writes its own namespace and deletes it again, for the reason the other live suites do: a
@@ -136,7 +135,7 @@ describe('the editors', () => {
     await panel().find('.ed-x').trigger('click')
   })
 
-  // The finding the prototype's harness paid for: a list belonging to a node the operator is no
+  // The finding a live harness paid for: a list belonging to a node the operator is no
   // longer looking at is not even obviously stale, because domain names repeat across nodes.
   it('reads one node\'s domains and does not carry them onto another', async () => {
     await open('source')

@@ -182,8 +182,8 @@ export function effectiveSources(request: Request, edits: readonly Edit[]): Sour
  *
  * **A parked entry is not removed**, which is the whole of why `disabled` exists: the entry stays in
  * the spec, expands to nothing, and keeps its column on the axis. Removing it would delete the column
- * it lived on and rearrange the board under the pointer (`ui.md` §7a, "Off is a value, not an
- * absence").
+ * it lived on and rearrange the board under the pointer (`ui.md` §7a, "Switching a route off:
+ * parked destinations keep their row and column").
  *
  * **`gone` is the one thing here that does remove it**, and it is the `×` rather than the cell: `×`
  * only ever removes something already dark, so by the time this runs the leg is parked and carrying

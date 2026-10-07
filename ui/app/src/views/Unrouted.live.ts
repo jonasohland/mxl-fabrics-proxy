@@ -12,7 +12,7 @@
  *
  * The fixture is the *fleet's* inventory rather than a namespace's, which is inherent — the strip's
  * subject is what exists, and only the question asked of it is namespace-scoped. So this writes an
- * empty namespace of its own and reads the devfleet's flows through it. It routes `edge-01
+ * empty namespace of its own and reads the fake fleet's flows through it. It routes `edge-01
  * media/local`, which nothing else in `ui.md` §9's fixture takes as a source: `nab` and `k8s` both
  * read the studios and write into `fast/*`, so the one genuinely unclaimed entry stays unclaimed
  * whichever other suites have run.

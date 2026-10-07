@@ -93,6 +93,10 @@ void Target::transferGrains(::mxl::DiscreteFlowWriter writer,
         }
         {
             auto access = writer.openGrain(index);
+            // libmxl >= 1.2 sets validSlices to 0 in openGrain. The grain was
+            // filled completely by RDMA, because the initiator only sends
+            // complete grains.
+            access.validSlices(access.totalSlices());
             grainSize = access.size();
             spdlog::debug(
                 "comitting grain validSlices={} totalSlices={} index={}",

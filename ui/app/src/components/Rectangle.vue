@@ -6,7 +6,7 @@
  * as, and a view built only from `/v1/paths` would render a switched-off leg identically to one
  * that was never written. The rectangle is where `disabled` is drawable.
  *
- * **Geometry is a correctness property here, not styling** (`ui.md` §7a). A cell is always exactly
+ * **Cell and grid sizes must not depend on content** (`ui.md` §7a). A cell is always exactly
  * two lines — a state word and a count — and nothing of variable length ever goes in the box. The
  * reason is prose of any length, cells in a row share a height, and a grid that reflows when one
  * leg starts explaining itself has stopped being a grid. The reason goes in the tooltip, where its
